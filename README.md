@@ -34,7 +34,7 @@ The two shader cards track one instruction, `v_med3_f32`. Each card links to its
 </p>
 <!-- verification:end -->
 
-**Windows regression run** · 130 passed and one upstream GPU-library test was ignored. The native loader probe ran separately and returned its expected exit marker of `73`. The hardware run matched all 13 `v_med3_f32` cases on an NVIDIA GeForce RTX 4060 with driver `32.0.16.2114`. [Test breakdown](docs/engineering-review.md#reproduced-on-this-revision)
+**Windows regression run** · 131 passed and one upstream GPU-library benchmark was ignored. The native loader probe ran separately and returned its expected exit marker of `73`. The hardware run matched all 13 `v_med3_f32` cases on an NVIDIA GeForce RTX 4060 with driver `32.0.16.2114`. [Test breakdown](docs/engineering-review.md#reproduced-on-this-revision)
 
 **Frame pacing** · The first scene benchmark needs paired 120-second captures with cold and warm caches. Stable 30 FPS remains unmeasured. [Capture protocol](docs/engineering-review.md#measuring-a-30-fps-target)
 
@@ -90,7 +90,7 @@ The `engine` submodule pins the upstream revision. `prepare` prints the path of 
 
 ```powershell
 $source = python portvi.py prepare
-$patchPath = Join-Path $PWD 'patches/0006-description.patch'
+$patchPath = Join-Path $PWD 'patches/0007-description.patch'
 git -C $source diff --output=$patchPath
 python portvi.py test
 ```
