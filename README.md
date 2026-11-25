@@ -26,7 +26,9 @@ The cards show the results of individual tests. The mesh draw checks all four co
 
 <!-- verification:start -->
 <p align="center">
-  <a href="probes/runtime.rs"><img src="docs/assets/progress-loader.svg" width="366" alt="Native loader probe — 2 / 2 runtime imports bound (100%)"></a>
+  <a href="probes/runtime.rs"><img src="docs/assets/progress-loader.svg" width="366" alt="Native loader probe — 4 / 4 runtime imports bound (100%)"></a>
+  <a href="docs/engineering-review.md#component-tests"><img src="docs/assets/progress-upscaler.svg" width="366" alt="Upscaler compute · RTX 4060 — 25 / 29 D3D12 pipelines created (86%)"></a>
+  <a href="docs/engineering-review.md#bcpack-entropy"><img src="docs/assets/progress-bcpack.svg" width="366" alt="BCPack · independent encoder — 128 / 128 synthetic streams decoded exactly (100%)"></a>
   <a href="docs/engineering-review.md#reproduced-on-this-revision"><img src="docs/assets/progress-shader.svg" width="366" alt="Median shader · RTX 4060 — 13 / 13 test vectors matched (100%)"></a>
   <a href="docs/engineering-review.md#loop-carried-masks-and-scalar-joins"><img src="docs/assets/progress-joins.svg" width="366" alt="Compute joins · DXIL validation — 46 / 46 previously blocked programs validated (100%)"></a>
   <a href="docs/engineering-review.md#loop-carried-masks-and-scalar-joins"><img src="docs/assets/progress-join_pipelines.svg" width="366" alt="Compute joins · RTX 4060 — 45 / 46 D3D12 pipelines created (98%)"></a>
@@ -41,7 +43,11 @@ The cards show the results of individual tests. The mesh draw checks all four co
 </p>
 <!-- verification:end -->
 
-**Windows regression run** · On Windows x64, 848 distinct Rust workspace tests and two frame-time analyzer tests passed. A source-built x64 probe bound both imports and returned exit status 73. [Test breakdown](docs/engineering-review.md#reproduced-on-this-revision)
+**Windows regression run** · On Windows x64, 864 distinct Rust workspace tests and two frame-time analyzer tests passed. A source-built x64 probe bound four imports, allocated and freed a Windows Automation string containing an embedded zero, and returned 73. [Test breakdown](docs/engineering-review.md#reproduced-on-this-revision)
+
+**Component tests** · Microsoft’s validator accepted 26 of 29 compute shaders from an upscaler library. The RTX 4060 created 25 pipelines, up from 24. PortVI also resolved all 611 distinct static imports across 16 local libraries. [Before and after](docs/engineering-review.md#component-tests)
+
+**Texture decoding** · PortVI now decodes all 128 synthetic streams from Ahmet Dedeler’s bcpack-rs encoder. All 126,336 entropy symbols matched the generator. [Reproduction and two-block interoperability case](docs/engineering-review.md#bcpack-entropy)
 
 **Compute shaders** · All 46 programs blocked by loop or branch masks now pass Microsoft’s DXIL validator. The RTX 4060 created 45 of their D3D12 pipelines. The remaining program requests a 64-lane wave. [Before-and-after results and GPU tests](docs/engineering-review.md#loop-carried-masks-and-scalar-joins)
 
@@ -111,7 +117,7 @@ The `engine` submodule pins the upstream revision. `prepare` prints the path of 
 
 ```powershell
 $source = python portvi.py prepare
-$patchPath = Join-Path $PWD 'patches/0018-description.patch'
+$patchPath = Join-Path $PWD 'patches/0024-description.patch'
 git -C $source diff --output=$patchPath
 python portvi.py test
 ```

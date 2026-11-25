@@ -1,0 +1,145 @@
+diff --git a/crates/victory-formats/src/bcpack.rs b/crates/victory-formats/src/bcpack.rs
+index 360dce12d5d43dc63b16fc959861fc3b3894eb48..c54d627180c2be6348d089106bd6486d2950cf60 100644
+--- a/crates/victory-formats/src/bcpack.rs
++++ b/crates/victory-formats/src/bcpack.rs
+@@ -293,8 +293,13 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
+ struct Lane {
+     /// Symbol bits - 1 at the full alphabet.
+     width: u8,
+-    /// 0 header, 1 length (low byte), 2 length high byte, 3 payload.
++    /// 0 header, 1 length (low byte), 2 length high byte, 3 payload,
++    /// 4 finished (every symbol decoded and the fragment spent).
+     phase: u8,
++    /// Symbols the lane has still to decode. A lane at 0 decodes nothing
++    /// more, and once its fragment is spent it asks for no further byte: the
++    /// next header in the stream belongs to another lane.
++    wanted: usize,
+     long: bool,
+     reset: bool,
+     model: u8,
+@@ -310,6 +315,9 @@ impl Lane {
+     /// One step: take the latched byte (header, length or payload) and
+     /// decode at most one symbol.
+     fn step(&mut self, t: &Tables) -> Result<(), Error> {
++        if self.phase == 4 {
++            return Ok(());
++        }
+         if self.phase != 3 {
+             let Some(b) = self.latch.take() else {
+                 return Ok(());
+@@ -348,7 +356,8 @@ impl Lane {
+             x = x << 8 | u32::from(b);
+         }
+         self.need = self.left != 0 && self.latch.is_none();
+-        if x > LOW {
++        if x > LOW && self.wanted != 0 {
++            self.wanted -= 1;
+             let freq = &t.freq[usize::from(self.model)];
+             let start = &t.start[usize::from(self.model)];
+             let slot = x & 0xffff;
+@@ -368,9 +377,16 @@ impl Lane {
+             self.x = (x >> 16).wrapping_mul(f).wrapping_add(rem);
+             self.out = Some(sym as u8);
+         } else if self.left != 0 {
+-            // At exactly 2^24 the lane neither reads nor decodes again; only a
+-            // lane that has delivered its symbols may end up there.
++            // At 2^24 or above with nothing left to decode the lane neither
++            // reads nor decodes again (it may still hold one latched byte);
++            // only a lane that has delivered its symbols may end up there.
+             self.x = x;
++        } else if self.wanted == 0 {
++            // Last symbol out and fragment spent (the state is one of the
++            // legal ends 2^24, 2^16, 2^8): the lane is finished.
++            self.x = x;
++            self.phase = 4;
++            self.need = false;
+         } else {
+             // The fragment ends; a byte read in this step does not reach the carried state.
+             self.phase = 0;
+@@ -415,6 +431,7 @@ fn lanes(
+     let lanes = &mut lanes[..widths.len()];
+     for (lane, &width) in lanes.iter_mut().zip(widths) {
+         lane.width = width;
++        lane.wanted = blocks * per;
+         lane.need = true;
+     }
+     let stride = widths.len() * per;
+@@ -432,7 +449,8 @@ fn lanes(
+             }
+             let waiting = lane.out.is_some() && done & bit != 0;
+             if lane.need && !waiting && taken < ROUND_BYTES {
+-                // Past the end nothing arrives; in a valid stream only finished lanes ask there.
++                // Past the end nothing arrives; a valid stream never runs out
++                // under a lane that asks (finished lanes stop asking).
+                 if let Some(b) = fetch(j) {
+                     lane.latch = Some(b);
+                     taken += 1;
+@@ -1224,9 +1242,7 @@ mod tests {
+         out
+     }
+ 
+-    /// Interleaves per-lane fragments the way the decoder takes bytes. A lane
+-    /// that has finished still asks: a filler fragment (two payload bytes)
+-    /// brings its state to 2^24 with a byte latched, which parks it for good.
++    /// Each lane supplies exactly its fragment while the shared feeder interleaves them.
+     fn stream(t: &Tables, widths: &[u8], per: usize, records: &[Vec<u8>]) -> Vec<u8> {
+         let stride = widths.len() * per;
+         let mut queues: Vec<std::collections::VecDeque<u8>> = (0..widths.len())
+@@ -1235,9 +1251,7 @@ mod tests {
+                     .iter()
+                     .flat_map(|r| r[j * per..j * per + per].to_vec())
+                     .collect();
+-                let mut bytes = fragment(widths[j], &syms);
+-                bytes.extend([0, 1, 0, 0]);
+-                bytes.into()
++                fragment(widths[j], &syms).into()
+             })
+             .collect();
+         let mut out = Vec::new();
+@@ -1245,15 +1259,37 @@ mod tests {
+         let fetch = |j: usize| {
+             let b = queues[j]
+                 .pop_front()
+-                .expect("a parked lane asked for input");
++                .expect("a finished lane asked past its fragment");
+             out.push(b);
+             Some(b)
+         };
+         lanes(t, widths, per, records.len(), fetch, &mut check).unwrap();
+         assert_eq!(check, records.concat());
++        assert!(queues.iter().all(|q| q.is_empty()));
+         out
+     }
+ 
++    /// bcpack-rs f5145dd, encode::synthetic_bc1(1, 1, 1). Its encoder supplies
++    /// both the interleaved bytes and the twelve expected symbols.
++    #[test]
++    fn finished_lanes_do_not_take_another_lanes_bytes() {
++        let packed = [
++            0x17, 0x11, 0x1e, 0x11, 0x18, 0x1a, 0x97, 0x53, 0x03, 0x03, 0x03, 0x03,
++            0x03, 0x03, 0x03, 0x03, 0x28, 0xcf, 0x01, 0x3b, 0x05, 0x04, 0x02, 0x09,
++            0x9a, 0x64, 0x00, 0xa1, 0x0f, 0x03, 0xab, 0x97, 0x27, 0x40, 0x20, 0x7d,
++            0x74, 0x9d, 0x10, 0x4f, 0xba, 0xcc, 0x01, 0x28, 0xd0, 0x24, 0x07, 0xd3,
++            0x17, 0x1b, 0x11, 0x10, 0x03, 0x03, 0x03, 0x03, 0x86, 0x10, 0xee, 0x01,
++            0x4b, 0xd6, 0x50, 0x00, 0xb7, 0x9b, 0x6b, 0x23, 0xb8, 0x84, 0x85, 0x00,
++        ];
++        let expected = [5, 49, 0, 25, 1, 1, 0, 2, 46, 7, 87, 35];
++        let widths = [7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7];
++        let mut symbols = [0; 12];
++        let mut stream = packed.into_iter();
++        lanes(&Tables::builtin().unwrap(), &widths, 1, 1, |_| stream.next(), &mut symbols).unwrap();
++        assert_eq!(symbols, expected);
++        assert_eq!(stream.len(), 0);
++    }
++
+     const BC4_LANES: [u8; 12] = [7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5];
+ 
+     fn zigzag(v: i32) -> u8 {
+@@ -1465,6 +1501,7 @@ mod tests {
+                         }
+                         let mut lane = Lane {
+                             phase: 3,
++                            wanted: 1,
+                             model,
+                             x,
+                             left: 1,
