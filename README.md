@@ -28,6 +28,8 @@ The cards show the results of individual tests. The mesh draw checks all four co
 <p align="center">
   <a href="probes/runtime.rs"><img src="docs/assets/progress-loader.svg" width="366" alt="Native loader probe — 2 / 2 runtime imports bound (100%)"></a>
   <a href="docs/engineering-review.md#reproduced-on-this-revision"><img src="docs/assets/progress-shader.svg" width="366" alt="Median shader · RTX 4060 — 13 / 13 test vectors matched (100%)"></a>
+  <a href="docs/engineering-review.md#loop-carried-masks-and-scalar-joins"><img src="docs/assets/progress-joins.svg" width="366" alt="Compute joins · DXIL validation — 46 / 46 previously blocked programs validated (100%)"></a>
+  <a href="docs/engineering-review.md#loop-carried-masks-and-scalar-joins"><img src="docs/assets/progress-join_pipelines.svg" width="366" alt="Compute joins · RTX 4060 — 45 / 46 D3D12 pipelines created (98%)"></a>
   <a href="docs/engineering-review.md#floating-point-conversion"><img src="docs/assets/progress-fp64.svg" width="366" alt="FP64 to FP32 · RTX 4060 — 14 / 14 register-pair conversions matched (100%)"></a>
   <a href="docs/engineering-review.md#linked-mesh-and-pixel-shaders"><img src="docs/assets/progress-mesh.svg" width="366" alt="Linked mesh draw · RTX 4060 — 256 / 256 pixels matched all four channels (100%)"></a>
   <a href="docs/engineering-review.md#bc4-storage-and-gpu-readback"><img src="docs/assets/progress-texture.svg" width="366" alt="BC4 readback · RTX 4060 — 32 / 32 streamed texels matched (100%)"></a>
@@ -37,7 +39,9 @@ The cards show the results of individual tests. The mesh draw checks all four co
 </p>
 <!-- verification:end -->
 
-**Windows regression run** · On Windows x64, 748 Rust workspace tests and two frame-time analyzer tests passed. A source-built x64 probe bound both imports and returned exit status 73. [Test breakdown](docs/engineering-review.md#reproduced-on-this-revision)
+**Windows regression run** · On Windows x64, 762 Rust workspace tests and two frame-time analyzer tests passed. A source-built x64 probe bound both imports and returned exit status 73. [Test breakdown](docs/engineering-review.md#reproduced-on-this-revision)
+
+**Compute shaders** · All 46 programs blocked by loop or branch masks now pass Microsoft’s DXIL validator. The RTX 4060 created 45 of their D3D12 pipelines. The remaining program requests a 64-lane wave. [Before-and-after results and GPU tests](docs/engineering-review.md#loop-carried-masks-and-scalar-joins)
 
 **Texture streaming** · A DirectStorage request decoded two BC4 blocks directly into a console texture. The RTX 4060 matched all 32 texels after upload and detected all 32 stale texels when the upload was deliberately skipped. [Run the fixture](docs/engineering-review.md#bc4-storage-and-gpu-readback)
 

@@ -1,10 +1,10 @@
 # Native runtime engineering review
 
-25 November 2026. PortVI pins the original `Marvisak/VIctory` main revision `940d32f` and applies fourteen patches. The last three cover floating-point conversion, linked mesh rendering and compute lane masks. [Current engine](https://github.com/Marvisak/VIctory/commit/940d32f69b22265690a0b5a15d6ded572ba33baf) · [Previous PortVI revision](https://github.com/tyr0nsur/PortVI/tree/20d4174eef8c77e89ba4664b83be2ef11a2f9a22)
+25 November 2026. PortVI pins the original `Marvisak/VIctory` main revision `940d32f` and applies fifteen patches. The latest handles compute masks carried across branches and loops. [Current engine](https://github.com/Marvisak/VIctory/commit/940d32f69b22265690a0b5a15d6ded572ba33baf) · [Previous PortVI revision](https://github.com/tyr0nsur/PortVI/tree/27aa4bc5f32346fac9da16aad236a5beaf583f6b)
 
 ## Reproduced on this revision
 
-On Windows x64, 748 Rust workspace tests passed and 11 were marked ignored. One of the passing tests also ran in an isolated child process, bringing the total to 749 executions. Both Python frame-time tests passed. The physical-adapter median and texture probes ran separately. The open x64 program returned 73. Clippy passed for all targets and features with warnings treated as errors.
+On Windows x64, 762 Rust workspace tests passed and 11 were marked ignored. One of the passing tests also ran in an isolated child process, bringing the total to 763 executions. Both Python frame-time tests passed. The physical-adapter median and texture probes ran separately. The open x64 program returned 73. Clippy passed for all targets and features with warnings treated as errors.
 
 | Area | Reproduction and result |
 | --- | --- |
@@ -39,12 +39,28 @@ A compute shader can save its active lanes, use the resulting scalar condition t
 
 On the RTX 4060 the tests checked 32-lane outputs against a CPU reference, including an empty mask, a mask with only lane 31 and a branch joining a mask with a constant. The 64-lane programs passed the DXIL validator. The RTX 4060 reported 32 lanes and WARP reported four, so hardware readback of the 64-lane cases is open. An AMD hardware report can run the two `wave64` tests in `emit::synthetic_tests` and include the reported lane range. This work builds on Xvania7’s data-flow changes. [Upstream proposal](https://github.com/Marvisak/VIctory/pull/2289) · [Translator and readback tests](../patches/0014-compute-mask-values.patch)
 
+### Loop-carried masks and scalar joins
+
+A comparison produces one bit per lane. A loop can accumulate those bits into a mask, and a later branch can choose between that mask and an ordinary 32-bit word. Building the scalar word can uncover another mask dependency. PortVI fills both kinds of join until every live input has a value. In a 64-lane wave the two 32-bit halves identify the mask together. A high half written after a join is read where it exists. The implementation builds on nathanbzrr’s predecessor tracking in VIctory. Claude Code helped develop the loop readbacks. [Upstream change](https://github.com/Marvisak/VIctory/pull/385) · [Implementation and source-authored tests](../patches/0015-compute-mask-joins.patch)
+
+The same 46 compute programs went through the Windows SDK DXIL validator at each step. All 46 originally stopped at a lane-mask join. With upstream’s tracking on the PortVI base, 33 emitted programs contained a boolean phi with no incoming value. A small public test reproduces that specific validator error and checks the returned word and lane bit on the GPU.
+
+| Same 46 programs | DXIL emitted | Microsoft validator passed |
+| --- | ---: | ---: |
+| PortVI before this patch | 0 | 0 |
+| VIctory PR 385 on that base | 46 | 13 |
+| PortVI with the completed joins | 46 | 46 |
+
+The desktop RTX 4060 (driver 32.0.16.2114) created 45 of the 46 D3D12 compute pipelines. The remaining program declares a fixed wave size of 64 and this adapter reports 32. Five authored Wave32 cases also checked two output words per lane over 20 GPU dispatches, matching all 1,280 reference words. The Wave64 loop readbacks still need a native 64-lane device. Across the full sample, 25,570 programs passed standalone DXIL validation, up from 25,524. These are translation and device measurements. Scene frame times have their own capture protocol below.
+
 ## Latest checks against Leonida and XCL
 
 Leonida also merged a draw test for dual-source blending. XCL added parallel compilation for pieces of large direct compute dispatches and identified active pipelines in its device-removal reports. The XCL dispatch change targets pipeline creation time. It has a separate fallback for indirect dispatches and large loops. [Leonida draw test](https://github.com/ubiquitarianism/leonida/pull/1703) · [XCL compute dispatches](https://github.com/xcl-dev/xcl/pull/2080) · [XCL device-removal reports](https://github.com/xcl-dev/xcl/pull/1592)
 
 | Project | Recent change and relevance to PortVI |
 | --- | --- |
+| Leonida | Its Vulkan runtime merged fixes for sizing a ReBAR arena, staging texture uploads and preserving offsets when importing host buffers. The parked-mask change is a separate open PR. With its parent’s translator our 12 authored dispatches matched 98 of 384 lane values. The PR matched all 384 on the same RTX 4060. [Merged runtime changes](https://github.com/ubiquitarianism/leonida/compare/71a769d7d85208f86c6e2e50263aca7df1becce9...3d4f661238f72fbc2133cf80649be1b258c2db91) · [Lane-slot PR](https://github.com/ubiquitarianism/leonida/pull/1803) · [Runnable Vulkan probe](../probes/leonida_lane_slots.py) |
+| XCL | Its permlane tests passed on the RTX 4060. A further 42 native-wave32 and split-wave64 dispatches checked inactive rows and halves, all four instruction flag combinations and in-place writes. All 18,144 lane/register values matched XCL’s independent expected-value function. [Original tests and hardware report](https://github.com/xcl-dev/xcl/pull/478) |
 | Leonida | Its Vulkan translator now unpacks compressed FP16 mesh exports and exports layer and viewport indices per primitive. Its maintainers report reaching the world phase after story loading and are still working towards a first confirmed world frame. These are useful cases for testing per-primitive outputs on Direct3D 12. [Compressed exports](https://github.com/ubiquitarianism/leonida/commit/d6efad1bbcf44d12ae2946adeb5081e27753be6f) · [Layer and viewport](https://github.com/ubiquitarianism/leonida/commit/c48cc2353abddb82a81e5cbac342ca81bac6fadf) · [Maintainer status](https://github.com/ubiquitarianism/leonida/blob/384abe5b06d08e349f4b4e4394c68f036da47dc7/README.md) |
 | XCL | Its D3D12 backend corrected mesh triangle indices to nine bits and the index guard for a million-descriptor heap. Its NVIDIA integration branch reports about 5 FPS in a partially drawn world on an RTX 5090. The 14 FPS average also includes menus and loading. [Mesh index fix](https://github.com/xcl-dev/xcl/commit/3eab40a4bb48c15d4b79ed3f756deba52eb89bdb) · [Heap guard](https://github.com/xcl-dev/xcl/commit/19bef421e6f974fec2aa8289b228c78ab92f3013) · [Measurement and hardware](https://github.com/xcl-dev/xcl/blob/f0e1b2f149cc61231d04b838482f2fd5ec05b391/README.md) |
 | Leonida | Its Vulkan backend changed the order of mesh-shader interface declarations after one AMD Windows driver failed on the old order. PortVI emits DXIL for D3D12. The cross-project check worth repeating is creating a real mesh pipeline on each driver after bytecode validation. [Merged change and hardware scope](https://github.com/ubiquitarianism/leonida/pull/802) |

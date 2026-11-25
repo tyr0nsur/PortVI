@@ -13,6 +13,20 @@ verified = 13
 total = 13
 evidence = "docs/engineering-review.md#reproduced-on-this-revision"
 
+[joins]
+title = "Compute joins · DXIL validation"
+unit = "previously blocked programs validated"
+verified = 46
+total = 46
+evidence = "docs/engineering-review.md#loop-carried-masks-and-scalar-joins"
+
+[join_pipelines]
+title = "Compute joins · RTX 4060"
+unit = "D3D12 pipelines created"
+verified = 45
+total = 46
+evidence = "docs/engineering-review.md#loop-carried-masks-and-scalar-joins"
+
 [fp64]
 title = "FP64 to FP32 · RTX 4060"
 unit = "register-pair conversions matched"
