@@ -10,6 +10,7 @@ PortVI is an experimental Windows x64 compatibility runtime built on Marvisak’
 | DXIL validation | At revision `134b1bf`, 25,613 of 26,084 programs passed Microsoft’s validator. This added one success to the previous 25,612. All earlier successes remained valid. |
 | D3D12 pipeline creation | The RTX 4060 created all 36 previously blocked descriptor-read pipelines. |
 | Buffer view readback | The RTX 4060 and WARP each matched the expected address, element count and format in all 24 rewritten buffer views. |
+| Placed texture writes | The RTX 4060 and WARP matched both texels after dispatching through a placed UAV. [Fixture and results](engineering-review.md#native-engine-refresh) |
 | Wave64 on the RTX 4060 | The split-wave first-lane fixture returned the expected thread ID in groups of 64 and 128 threads. Native and split-wave row shuffles matched 143,360 lane results. [Device tests](engineering-review.md#wave64-on-a-32-lane-gpu) |
 | Scene capture | PortVI has yet to publish a measured scene capture. Scene FPS and stability are unmeasured. |
 

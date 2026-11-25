@@ -1,6 +1,6 @@
 diff --git a/crates/victory-shader/src/emit/g16_tests.rs b/crates/victory-shader/src/emit/g16_tests.rs
 new file mode 100644
-index 0000000..568bda0
+index 0000000000000000000000000000000000000000..568bda0112230edb9b6ad63128571b07a10ef77e
 --- /dev/null
 +++ b/crates/victory-shader/src/emit/g16_tests.rs
 @@ -0,0 +1,466 @@
@@ -471,12 +471,35 @@ index 0000000..568bda0
 +    }
 +}
 diff --git a/crates/victory-shader/src/emit/host.rs b/crates/victory-shader/src/emit/host.rs
-index 76f2455..d9ce5a2 100644
+index da16ad7d2cfc0db920626e2c31919a1092f0e650..51e0edfffe50ab8065c61d2d8e207940c32f668f 100644
 --- a/crates/victory-shader/src/emit/host.rs
 +++ b/crates/victory-shader/src/emit/host.rs
-@@ -92,4 +92,24 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
- }
-
+@@ -87,6 +87,21 @@ fn create_device(warp: bool) -> Result<ID3D12Device, String> {
+         };
+         D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+         let device = device.ok_or("no device")?;
++        if !warp {
++            // The adapter the device was actually made on, by its LUID:
++            // never the software rasteriser, whatever was enumerated.
++            let made: IDXGIAdapter1 = factory
++                .EnumAdapterByLuid(device.GetAdapterLuid())
++                .map_err(err)?;
++            let desc = made.GetDesc1().map_err(err)?;
++            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
++                || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
++            {
++                return Err("the hardware device is the software adapter".to_owned());
++            }
++            #[cfg(test)]
++            eprintln!("physical adapter: {}", adapter_report(&desc));
++        }
+         let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+             HighestShaderModel: D3D_SHADER_MODEL_6_6,
+         };
+@@ -158,6 +173,26 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
+ /// WARP pipeline compiles / dispatches crash with `0xC0000005` on Windows 11.
+ static WARP_LOCK: Mutex<()> = Mutex::new(());
+ 
 +/// An adapter's model and PCI IDs, as the physical-adapter tests print them.
 +#[cfg(test)]
 +fn adapter_report(desc: &DXGI_ADAPTER_DESC1) -> String {
@@ -498,32 +521,14 @@ index 76f2455..d9ce5a2 100644
 +}
 +
  impl Host {
-     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
-@@ -110,4 +130,19 @@ impl Host {
-             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-             let device = device.ok_or("no device")?;
-+            if !warp {
-+                // The adapter the device was actually made on, by its LUID:
-+                // never the software rasteriser, whatever was enumerated.
-+                let made: IDXGIAdapter1 = factory
-+                    .EnumAdapterByLuid(device.GetAdapterLuid())
-+                    .map_err(err)?;
-+                let desc = made.GetDesc1().map_err(err)?;
-+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
-+                    || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
-+                {
-+                    return Err("the hardware device is the software adapter".to_owned());
-+                }
-+                #[cfg(test)]
-+                eprintln!("physical adapter: {}", adapter_report(&desc));
-+            }
-             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
-                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
+     fn lock_warp(&self) -> Option<MutexGuard<'static, ()>> {
+         self.warp
 diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
-index caab7ea..6c878d8 100644
+index 7238a871feb6ff17b2b3f1789f908eae1399889b..ca5594f87f4dd6225c568e78eebda571fbe6cd73 100644
 --- a/crates/victory-shader/src/emit/lower.rs
 +++ b/crates/victory-shader/src/emit/lower.rs
-@@ -7701,16 +7701,57 @@ impl<'a> Lower<'a> {
+@@ -8144,18 +8144,59 @@ impl<'a> Lower<'a> {
+                     .filter(|t| matches!(*t, "o" | "b" | "c"))
                      .count()
              });
 +        // Explicit gradients (`_d`, `_cd`) follow: per direction, one VGPR
@@ -588,7 +593,9 @@ index caab7ea..6c878d8 100644
 -            let half = (k - extra) as u32 % 2;
              let (sh, mask) = (l.s.m.i32(16 * half), l.s.m.i32(0xFFFF));
              let x = l.s.m.bin(c, Bin::LShr, x, sh);
-@@ -7910,4 +7951,7 @@ impl<'a> Lower<'a> {
+             Ok(l.s.m.bin(c, Bin::And, x, mask))
+@@ -8353,6 +8394,9 @@ impl<'a> Lower<'a> {
+             "image_sample_b" => (61, true),
              "image_sample_c_lz" => (65, true),
              "image_sample_d" | "image_sample_d_cl" => (63, true),
 +            // Only these two of the `_g16` forms: the comparison and offset
@@ -596,7 +603,9 @@ index caab7ea..6c878d8 100644
 +            "image_sample_d_g16" | "image_sample_d_cl_g16" => (63, true),
              "image_get_lod" if self.s.pixel => (81, true),
              // Implicit derivatives: pixel shaders only.
-@@ -7919,4 +7963,11 @@ impl<'a> Lower<'a> {
+             "image_sample_c" if self.s.pixel => (64, true),
+@@ -8362,6 +8406,13 @@ impl<'a> Lower<'a> {
+             "image_get_resinfo" => (72, false),
              _ => return Err(name),
          };
 +        if g16 && kind == 5 {
@@ -608,7 +617,9 @@ index caab7ea..6c878d8 100644
 +        let has_cl = name.strip_suffix("_g16").unwrap_or(name).ends_with("_cl");
          if op == 72 {
              // Width, height, depth or layers, levels (per dmask) of the level
-@@ -8009,4 +8060,15 @@ impl<'a> Lower<'a> {
+             // in the first address: DXIL's dimensions; a channel DXIL leaves
+@@ -8452,6 +8503,17 @@ impl<'a> Lower<'a> {
+                     l.as_float(x)
                  }
              };
 +            // Gradient component `k` (as `addr_val` numbers it) as a float:
@@ -624,7 +635,9 @@ index caab7ea..6c878d8 100644
 +            };
              // A level query takes no array slice (the code may pass anything
              // there, e.g. an unwritten register).
-@@ -8122,6 +8184,5 @@ impl<'a> Lower<'a> {
+             let read = if op == 81 { spatial } else { coords };
+@@ -8565,8 +8627,7 @@ impl<'a> Lower<'a> {
+                     // a biased sampler meets a binding clamp.
                      let mut g = [fu; 4];
                      for (k, x) in g.iter_mut().enumerate() {
 -                        let v = addr_val(self, first + k)?;
@@ -632,14 +645,18 @@ index caab7ea..6c878d8 100644
 +                        *x = grad(self, first + k)?;
                      }
                      let i32t = self.s.t.i32;
-@@ -8146,5 +8207,5 @@ impl<'a> Lower<'a> {
+                     let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+@@ -8589,7 +8650,7 @@ impl<'a> Lower<'a> {
+                     let half = self.s.m.f32(0.5f32.to_bits());
                      let l = self.unary(23, m);
                      let mut lod = self.s.m.bin(c, Bin::Mul, l, half);
 -                    if name.ends_with("_cl") {
 +                    if has_cl {
                          let x = addr_val(self, first + grads + coords)?;
                          let clamp = to_float(self, x);
-@@ -8163,19 +8224,15 @@ impl<'a> Lower<'a> {
+                         lod = self.binary(35, lod, clamp);
+@@ -8606,21 +8667,17 @@ impl<'a> Lower<'a> {
+                     )
                  }
                  63 => {
 -                    // With a16 each direction's gradients start a VGPR.
@@ -664,36 +681,44 @@ index caab7ea..6c878d8 100644
 +                    let clamp = if has_cl {
                          let x = addr_val(self, first + grads + coords)?;
                          to_float(self, x)
+                     } else {
 diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
-index 4e1fb2f..ac8917c 100644
+index 786b13c08f0f5989dfdfc816041f8ca56871d227..913c508d1ccc3ce22d31917e64fc4bb2efaf0db3 100644
 --- a/crates/victory-shader/src/emit/mod.rs
 +++ b/crates/victory-shader/src/emit/mod.rs
-@@ -191,4 +191,6 @@ mod diff_tests;
+@@ -203,6 +203,8 @@ mod container;
+ mod diff_tests;
  #[cfg(all(test, windows))]
  mod flow_tests;
 +#[cfg(all(test, windows))]
 +mod g16_tests;
  #[cfg(all(windows, any(test, feature = "host")))]
  pub mod host;
+ mod lower;
 diff --git a/crates/victory-shader/src/emit/synthetic_tests.rs b/crates/victory-shader/src/emit/synthetic_tests.rs
-index 990a3e5..e8eaf27 100644
+index e91b7ce7bfcffe8340a0f3932d0415e0872386b9..004097ff3afe4b2966d1092218718de3a7b7c479 100644
 --- a/crates/victory-shader/src/emit/synthetic_tests.rs
 +++ b/crates/victory-shader/src/emit/synthetic_tests.rs
-@@ -17,5 +17,5 @@ use crate::{io, ir, resource, structure};
+@@ -16,7 +16,7 @@ use crate::{io, ir, resource, structure};
+ /// Per lane (32, wave32): the record [offset word, u, v, level] at entry 1
  /// of the table at s0 (a 2D texture at entry 0, a raw UAV at entry 2); the
  /// level converted from an integer (so it is whole). Gathers red at the
 -/// level, with the offset, and at level 0 (`lz`) into 12 dwords at lane × 48.
 +/// level, with the offset, and at level 0 (`lz`) into 12 dwords at lane Ã— 48.
  fn program(whole: bool) -> Vec<u32> {
      let mut w = vec![
-@@ -149,5 +149,5 @@ fn first(u: f32, size: u32) -> i64 {
+         0xBE84_0300, // s_mov_b32 s4, s0
+@@ -153,7 +153,7 @@ fn first(u: f32, size: u32) -> i64 {
+ 
  #[test]
  fn gathers_at_a_level_match_the_hardware() {
 -    // 24×16 then 12×8, 6×4, 3×2; red = level × 1000 + y × 32 + x + 1.
 +    // 24Ã—16 then 12Ã—8, 6Ã—4, 3Ã—2; red = level Ã— 1000 + y Ã— 32 + x + 1.
      let mut texels = Vec::new();
      for l in 0..4 {
-@@ -208,7 +208,8 @@ fn gathers_at_a_level_match_the_hardware() {
+         let (w, h) = (24 >> l, 16 >> l);
+@@ -212,9 +212,10 @@ fn gathers_at_a_level_match_the_hardware() {
+     }
      let views = [
          View::Mipped(24, 16, 4, &texels),
 +        // The program reads these dwords by byte offset through a raw handle.
@@ -703,18 +728,22 @@ index 990a3e5..e8eaf27 100644
 +            stride: Stride::Raw,
          },
          View::RawUav(32 * 12),
-@@ -286,5 +287,5 @@ fn gathers_at_a_level_that_may_be_a_fraction_stop() {
+     ];
+@@ -290,7 +291,7 @@ fn gathers_at_a_level_that_may_be_a_fraction_stop() {
+ 
  #[test]
  fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
 -    // Lanes below 24 run the permute; each reads lane (13 × lane + 5) mod 32
 +    // Lanes below 24 run the permute; each reads lane (13 Ã— lane + 5) mod 32
      // (its address in dwords, offset 20 bytes) of 1000 + lane.
      let shader = build(&[
+         0xBE84_0300, // s_mov_b32 s4, s0
 diff --git a/crates/victory-shader/src/emit/valu_tests.rs b/crates/victory-shader/src/emit/valu_tests.rs
-index 3bf9d61..2cb6b1c 100644
+index 201acdbc63025fb1f560511053e8799272c29e11..0434641191831d57c022d72909ddfec85a1c453a 100644
 --- a/crates/victory-shader/src/emit/valu_tests.rs
 +++ b/crates/victory-shader/src/emit/valu_tests.rs
-@@ -183,9 +183,19 @@ fn run_cases(
+@@ -182,11 +182,21 @@ pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(()
+ fn run_cases(
      shader: &HostShader,
      cases: &[[u32; 4]],
 +    check: impl FnMut(&str, usize, [u32; 4], u32),
@@ -735,14 +764,18 @@ index 3bf9d61..2cb6b1c 100644
 +    for &(label, warp) in devices {
          let host = match Host::new(warp) {
              Ok(host) => host,
-@@ -223,5 +233,5 @@ fn run_cases(
+             Err(e) => {
+@@ -222,7 +232,7 @@ fn run_cases(
+         }
          ran += 1;
      }
 -    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 +    assert!(ran > 0, "no SM 6.6 device of {devices:?} available");
  }
-
-@@ -402,4 +412,21 @@ fn packed_add_selects_halves_of_inline_constants() {
+ 
+ #[test]
+@@ -461,6 +471,23 @@ fn packed_add_selects_halves_of_inline_constants() {
+ 
  #[test]
  fn v_med3_f32_matches_rdna2_with_nan() {
 +    check_med3_f32(&[("hardware", false), ("warp", true)]);
@@ -764,9 +797,11 @@ index 3bf9d61..2cb6b1c 100644
 +fn check_med3_f32(devices: &[(&str, bool)]) {
      // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
      let shader = build_valu_cs(&vop3(0x157, 0, vgpr(1), vgpr(2), vgpr(3)));
-@@ -427,6 +454,9 @@ fn v_med3_f32_matches_rdna2_with_nan() {
+     let nan = f32::NAN.to_bits();
+@@ -486,8 +513,11 @@ fn v_med3_f32_matches_rdna2_with_nan() {
+         ([nan, nan, nan, 0], None),
      ];
-
+ 
 +    assert_eq!(cases.len(), 13);
      let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
 -    run_cases(&shader, &inputs, |backend, i, inp, got| {
@@ -775,19 +810,23 @@ index 3bf9d61..2cb6b1c 100644
 +        checked += 1;
          let expect = cases[i].1;
          let got_f = f32::from_bits(got);
-@@ -446,4 +476,6 @@ fn v_med3_f32_matches_rdna2_with_nan() {
+         match expect {
+@@ -505,6 +535,8 @@ fn v_med3_f32_matches_rdna2_with_nan() {
+             ),
          }
      });
 +    assert_eq!(checked % cases.len(), 0, "a device ran only some cases");
 +    assert!(checked > 0, "no case ran");
  }
-
+ 
+ /// RDNA2 orders -0 below +0 in its maximums and minimums; DXIL's FMax and
 diff --git a/crates/victory-shader/src/emit/waterfall_tests.rs b/crates/victory-shader/src/emit/waterfall_tests.rs
-index a226d59..f82234a 100644
+index a226d5994b5b3f3f9cfa6a2e990b7d81c39df351..f82234a99865bf3778f37a4c2384473ecab77fea 100644
 --- a/crates/victory-shader/src/emit/waterfall_tests.rs
 +++ b/crates/victory-shader/src/emit/waterfall_tests.rs
-@@ -102,7 +102,8 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
-
+@@ -101,9 +101,10 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
+ }
+ 
  /// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
 -/// hardware GPU and on WARP, returning the UAV's 32 dwords for each device
 -/// that ran. At least one device must produce a readback.
@@ -798,11 +837,13 @@ index a226d59..f82234a 100644
 +pub(super) fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
      let samplers = [D3D12_SAMPLER_DESC {
          Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
 diff --git a/crates/victory-shader/src/gfx10/fields.rs b/crates/victory-shader/src/gfx10/fields.rs
-index 7420242..a31dab4 100644
+index 74202422ce8effb4aa8feb3531151c2e4a38bbd9..a31dab40b185a101b4080b4d4709ab1e08c284b4 100644
 --- a/crates/victory-shader/src/gfx10/fields.rs
 +++ b/crates/victory-shader/src/gfx10/fields.rs
-@@ -785,4 +785,10 @@ fn data_dwords(name: &str) -> u8 {
+@@ -784,6 +784,12 @@ fn data_dwords(name: &str) -> u8 {
+ 
  /// Address dwords of an image opcode: offset, bias, compare, derivatives,
  /// coordinates, then LOD/clamp/mip, packed in pairs with `a16`.
 +///
@@ -813,19 +854,24 @@ index 7420242..a31dab4 100644
 +/// them). Only coordinates and LOD/clamp/mip follow `a16`.
  fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
      // (coordinates, derivatives per direction) for 1D 2D 3D CUBE 1D_ARRAY
-@@ -806,4 +812,5 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
+     // 2D_ARRAY 2D_MSAA 2D_MSAA_ARRAY.
+@@ -805,6 +811,7 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
+         _ => {}
      }
      let (mut whole, mut derivs, mut packed): (u8, u8, u8) = (0, 0, coords);
 +    let mut g16 = false;
      if let Some(rest) = name
          .strip_prefix("image_sample")
-@@ -815,4 +822,5 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
+         .or_else(|| name.strip_prefix("image_gather4"))
+@@ -814,15 +821,175 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
+                 "o" | "b" | "c" => whole += 1,
                  "d" | "cd" => derivs = grads,
                  "l" | "cl" => packed += 1,
 +                "g16" => g16 = true,
                  _ => {}
              }
-@@ -821,8 +829,167 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
+         }
+     } else if name.contains("_mip") {
          packed += 1;
      }
 -    if a16 {

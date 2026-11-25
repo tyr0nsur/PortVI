@@ -1,5 +1,5 @@
 diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
-index 3b92841..cb39ad9 100644
+index 189d84a39ab6158e6badcd8a09e85aa607787f0c..57611e99038d5a2f9b54cc4615aa57a4d41c3257 100644
 --- a/crates/victory-gpu/src/descriptor/host.rs
 +++ b/crates/victory-gpu/src/descriptor/host.rs
 @@ -19,9 +19,15 @@ pub(crate) struct HostHeap {
@@ -186,7 +186,7 @@ index 3b92841..cb39ad9 100644
              }
              return None;
          }
-@@ -2149,7 +2194,7 @@ mod tests {
+@@ -2193,7 +2238,7 @@ mod tests {
          assert_eq!(total, views, "capped at what shaders index");
          let null = victory_shader::emit::null_buffer_view();
          // The null UAV (at `null - 1`) is the first slot past the dynamic ones.
@@ -195,7 +195,7 @@ index 3b92841..cb39ad9 100644
          assert_eq!(heap.pairs_end, null - 1, "host copies' pairs stop below them");
          assert_eq!(null + 2, views, "the clamped index past them");
      }
-@@ -2207,7 +2252,7 @@ mod tests {
+@@ -2251,7 +2296,7 @@ mod tests {
                  ((**unknown).AddRef)(raw);
                  ((**unknown).Release)(raw)
              };
@@ -204,7 +204,7 @@ index 3b92841..cb39ad9 100644
              heap.raw_view_at(slot, Some(&buffer), 0, 256, false);
              assert_eq!(references(&buffer), 2, "ours and the slot's");
              heap.make_null(slot);
-@@ -2222,12 +2267,12 @@ mod tests {
+@@ -2266,12 +2311,12 @@ mod tests {
          }
          let a = heap.dynamic(heap.dynamic - 100).unwrap();
          let b = heap.dynamic(60).unwrap();
@@ -220,7 +220,7 @@ index 3b92841..cb39ad9 100644
      }
  
      /// A heap on a host that makes none larger (as NVIDIA's 1,000,000
-@@ -2265,16 +2310,16 @@ mod tests {
+@@ -2309,16 +2354,16 @@ mod tests {
          // SAFETY: dwords of the mapped table, which covers these indices.
          let stride = |index: u32| unsafe { (*strides as *const u32).add(index as usize).read_volatile() };
          assert_eq!([stride(views - 3), stride(views - 2), stride(views - 1)], [4, 4, 0]);
@@ -243,7 +243,7 @@ index 3b92841..cb39ad9 100644
          // SAFETY: a plain device query.
          assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
      }
-@@ -2289,7 +2334,7 @@ mod tests {
+@@ -2333,7 +2378,7 @@ mod tests {
          let left = heap.dynamic(2).unwrap();
          let right = heap.dynamic(2).unwrap();
          let rest = heap.dynamic(heap.dynamic - 5).unwrap();
@@ -253,7 +253,7 @@ index 3b92841..cb39ad9 100644
          // Reallocating the left half puts the cursor back in the middle.
          heap.release(left, 2);
 diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
-index fd952ab..3e8e0ef 100644
+index 0aaa3086b3ba04102b28b7206f3f63a6f944fc7b..64c8c762dbb20ca583d2ed3235f1699d75915cf6 100644
 --- a/crates/victory-gpu/src/draw.rs
 +++ b/crates/victory-gpu/src/draw.rs
 @@ -72,7 +72,7 @@ pub(crate) struct State {
@@ -336,7 +336,7 @@ index fd952ab..3e8e0ef 100644
          }
          made
      }
-@@ -1967,6 +1970,14 @@ const LINE_LOOP: u32 = 18;
+@@ -1965,6 +1968,14 @@ const LINE_LOOP: u32 = 18;
  const QUADS: u32 = 19;
  const QUAD_STRIP: u32 = 20;
  
@@ -351,9 +351,9 @@ index fd952ab..3e8e0ef 100644
  #[cfg(test)]
  mod tests {
      use super::*;
-@@ -2990,4 +3001,23 @@ void main(uint3 id : SV_DispatchThreadID) {
-         slots.make_null(0);
-         assert!(shown.upgrade().is_none(), "released with the slot");
+@@ -3263,4 +3274,23 @@ void main(uint3 id : SV_DispatchThreadID) {
+             let _ = kept_obj;
+         }
      }
 +
 +    /// A table made afresh takes dynamic slots from its first used entry
@@ -376,10 +376,10 @@ index fd952ab..3e8e0ef 100644
 +    }
  }
 diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
-index 5868136..6c80aa7 100644
+index c33f350d37f30cdeb9f466c1ee128b0a4433c557..7f3a5d133f6ad44827b65ed01106eaaca8a694c3 100644
 --- a/crates/victory-gpu/src/host.rs
 +++ b/crates/victory-gpu/src/host.rs
-@@ -238,7 +238,7 @@ fn create() -> windows::core::Result<Host> {
+@@ -236,7 +236,7 @@ fn create() -> windows::core::Result<Host> {
                  "the host caps shader-visible view heaps: shaders are translated for heaps of that size"
              );
          }
@@ -389,7 +389,7 @@ index 5868136..6c80aa7 100644
          // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
          // host chooses (the RX 6700 XT does, WARP does not).
 diff --git a/crates/victory-gpu/src/pipeline/library.rs b/crates/victory-gpu/src/pipeline/library.rs
-index d9a923b..02da86d 100644
+index d9a923bac3a4c629fcfaf40b1cd31a4cf555ff17..02da86d7d3eb4008d32e6f5ed5f94b962d5a5da6 100644
 --- a/crates/victory-gpu/src/pipeline/library.rs
 +++ b/crates/victory-gpu/src/pipeline/library.rs
 @@ -183,7 +183,7 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
@@ -412,7 +412,7 @@ index d9a923b..02da86d 100644
          include_bytes!("library.rs"),
      ] {
 diff --git a/crates/victory-gpu/src/shader_cache.rs b/crates/victory-gpu/src/shader_cache.rs
-index 812bcaa..ad87b97 100644
+index 812bcaac121fae20eb16176d6ca19dd62c4c8e14..ad87b97195c4aa82439885d698413349eceed3cd 100644
 --- a/crates/victory-gpu/src/shader_cache.rs
 +++ b/crates/victory-gpu/src/shader_cache.rs
 @@ -88,10 +88,11 @@ fn key(translator: &str, encoding: &[u8], limit: u32, options: Options) -> [u8;
@@ -463,10 +463,10 @@ index 812bcaa..ad87b97 100644
          assert!(
              std::str::from_utf8(ENCODING)
 diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
-index 6c9905b..1b4ce8c 100644
+index 89159554198db630e0fd68dd82b2a3827a8809ac..51cd8af8d62f5cdea1ac819e212bab8baac42faa 100644
 --- a/crates/victory-shader/src/emit/lower.rs
 +++ b/crates/victory-shader/src/emit/lower.rs
-@@ -5048,7 +5048,7 @@ impl<'a> Lower<'a> {
+@@ -5068,7 +5068,7 @@ impl<'a> Lower<'a> {
          let index = match src {
              Source::Loaded { load, first } => self.heap_index(*load, *first, false)?,
              Source::Phi { .. } => return Err(WHY),
@@ -475,7 +475,7 @@ index 6c9905b..1b4ce8c 100644
          };
          let c = self.cur;
          let four = self.s.m.i32(4);
-@@ -5158,6 +5158,7 @@ impl<'a> Lower<'a> {
+@@ -5178,6 +5178,7 @@ impl<'a> Lower<'a> {
                  }
                  let here = std::mem::replace(&mut self.cur, self.s.entry);
                  let index = self.entry_heap_index(address, *first, sampler);
@@ -483,7 +483,7 @@ index 6c9905b..1b4ce8c 100644
                  let index = self.buffer_guard(src, index, sampler, props);
                  let h = self.s.heap_handle(self.cur, index, sampler, false, props);
                  self.cur = here;
-@@ -5170,6 +5171,7 @@ impl<'a> Lower<'a> {
+@@ -5190,6 +5191,7 @@ impl<'a> Lower<'a> {
                      return Ok(h);
                  }
                  let index = self.heap_index(*load, *first, sampler)?;
@@ -491,7 +491,7 @@ index 6c9905b..1b4ce8c 100644
                  let index = self.buffer_guard(src, index, sampler, props);
                  // A waterfall loop's load at the first lane's offset reads
                  // each lane's own entry (see `resource::Waterfall`).
-@@ -5304,7 +5306,9 @@ impl<'a> Lower<'a> {
+@@ -5324,7 +5326,9 @@ impl<'a> Lower<'a> {
                      _ => return Err("SCC without a value"),
                  };
                  let set = self.heap_index(a, fa, sampler)?;
@@ -501,7 +501,7 @@ index 6c9905b..1b4ce8c 100644
                  let index = self.s.m.select(self.cur, cond, set, clear);
                  let index = self.buffer_guard(src, index, sampler, props);
                  Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
-@@ -5313,7 +5317,7 @@ impl<'a> Lower<'a> {
+@@ -5333,7 +5337,7 @@ impl<'a> Lower<'a> {
                  // A descriptor each lane has its own of (a waterfall loop
                  // reads it from the first active lane): each lane's heap
                  // index, non-uniform.
@@ -510,7 +510,7 @@ index 6c9905b..1b4ce8c 100644
                  let index = self.buffer_guard(src, index, sampler, props);
                  Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
              }
-@@ -5395,7 +5399,10 @@ impl<'a> Lower<'a> {
+@@ -5415,7 +5419,10 @@ impl<'a> Lower<'a> {
      /// join's (nested if/else).
      fn uniform_heap_index(&mut self, src: &Source, sampler: bool) -> Result<V, Why> {
          match src {
@@ -522,7 +522,7 @@ index 6c9905b..1b4ce8c 100644
              Source::Phi { block, args } => {
                  let mut incoming = Vec::new();
                  for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
-@@ -5424,13 +5431,47 @@ impl<'a> Lower<'a> {
+@@ -5444,13 +5451,47 @@ impl<'a> Lower<'a> {
          }
      }
  
@@ -574,7 +574,7 @@ index 6c9905b..1b4ce8c 100644
              Source::Lanes { mask, args } | Source::Select { scc: mask, args } => {
                  let [a, b] = &args[..] else {
                      return Err("a descriptor chosen per lane");
-@@ -5449,8 +5490,8 @@ impl<'a> Lower<'a> {
+@@ -5469,8 +5510,8 @@ impl<'a> Lower<'a> {
                          _ => return Err("SCC without a value"),
                      }
                  };
@@ -585,7 +585,7 @@ index 6c9905b..1b4ce8c 100644
                  Ok(self.s.m.select(self.cur, cond, set, clear))
              }
              Source::LanePhi { block, args } => {
-@@ -5471,7 +5512,7 @@ impl<'a> Lower<'a> {
+@@ -5491,7 +5532,7 @@ impl<'a> Lower<'a> {
                      let index = match arg {
                          Some(arg) => {
                              let here = std::mem::replace(&mut self.cur, at);
@@ -595,7 +595,7 @@ index 6c9905b..1b4ce8c 100644
                              index?
                          }
 diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
-index 3b6a701..ae7d3d2 100644
+index 3b6a701a3321338f8e7905d0511fb5310ba596ad..ae7d3d2403dc34aa8ee419b5fa2def7b59e2ac30 100644
 --- a/crates/victory-shader/src/emit/mod.rs
 +++ b/crates/victory-shader/src/emit/mod.rs
 @@ -97,6 +97,16 @@
@@ -625,7 +625,7 @@ index 3b6a701..ae7d3d2 100644
  
  /// The loop limit without an override: 2^20.
 diff --git a/crates/victory-shader/src/emit/shader.rs b/crates/victory-shader/src/emit/shader.rs
-index cd70394..45c5dd0 100644
+index cd70394b87ac89d0a58ec61e8bf6dcdca25c8efe..45c5dd0a5d0b3e83f299b3913ce669bdfa9952b5 100644
 --- a/crates/victory-shader/src/emit/shader.rs
 +++ b/crates/victory-shader/src/emit/shader.rs
 @@ -38,13 +38,15 @@ pub const HEAP_VIEWS_PORTABLE: u32 = 1_000_000;
@@ -730,7 +730,7 @@ index cd70394..45c5dd0 100644
  }
  
 diff --git a/crates/victory-shader/src/emit/stride_tests.rs b/crates/victory-shader/src/emit/stride_tests.rs
-index 33892d6..017b2f3 100644
+index 33892d605b294244f21f0c5ed24f01b7137e1329..017b2f3398bb134666a07fc1827a3ddfe8982cdc 100644
 --- a/crates/victory-shader/src/emit/stride_tests.rs
 +++ b/crates/victory-shader/src/emit/stride_tests.rs
 @@ -106,7 +106,7 @@ const HEAP_CONSTANT_WAVE32: &[u32] = &[
