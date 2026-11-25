@@ -4,6 +4,8 @@
 
 ## Reproduced on this revision
 
+On Windows x64 the full workspace finished with 731 Rust tests passing and 11 marked ignored. Two Python frame-time tests passed. The physical-adapter median test was then run explicitly, alongside the physical texture probe. The open x64 program returned 73, and the workspace also passed Clippy with all targets and features and warnings treated as errors.
+
 | Area | Reproduction and result |
 | --- | --- |
 | Native loader and CLI | The source-built x64 probe bound both platform imports. The CLI printed the title’s exit status and returned 73 to Windows. The smoke test checks both values. [Probe source](../probes/runtime.rs) |
@@ -20,6 +22,13 @@ The desktop RTX 4060 accepted 1,000,000 shader-visible view descriptors. Windows
 For structured shader-resource views, the translator emits byte-addressed loads. The runtime preserves the original byte range and records the console stride so element indexing still advances by the correct number of bytes. A snapshot is aligned for both D3D12 raw views and the console element size. On hardware and WARP a 12-byte-stride fixture read the expected elements and a missing buffer read back zeros. The gather fixture now binds its byte-addressed input using the matching raw descriptor. [View conversion and regressions](../patches/0010-structured-buffer-reads.patch) · [Gather fixture](../patches/0003-rdna2-gradients-and-adapter.patch)
 
 The emitter sets the DXIL module and container feature flags when a vertex or mesh stage declares an unordered-access view. Compute shaders that use derivatives select validator 1.8 and emit the matching pipeline-state metadata. The tests also check a vertex shader without the declared view, rejection under the earlier derivative profile and a compute dot product that still validates under 1.6. [BastienRodz’s UAV change](https://github.com/Marvisak/VIctory/pull/1989) · [Halfect’s compute derivative change](https://github.com/Marvisak/VIctory/pull/1065) · [Imported code and tests](../patches/0008-dxil-stage-flags-and-validator.patch)
+
+## Latest checks against Leonida and XCL
+
+| Project | Recent change and relevance to PortVI |
+| --- | --- |
+| Leonida | Its Vulkan backend changed the order of mesh-shader interface declarations after one AMD Windows driver failed on the old order. PortVI emits DXIL for D3D12. The cross-project check worth repeating is creating a real mesh pipeline on each driver after bytecode validation. [Merged change and hardware scope](https://github.com/ubiquitarianism/leonida/pull/802) |
+| XCL | When a driver refuses a large compute pipeline, XCL now records the driver error, compile time, bytecode size and cache identity. These are useful fields when correlating PortVI’s pipeline failures with its offline shader results. Our driver checks here use small source-authored programs. [Merged D3D12 diagnostics](https://github.com/xcl-dev/xcl/pull/1918) |
 
 ## How the previous patches map to this engine
 

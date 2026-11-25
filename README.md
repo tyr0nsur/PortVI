@@ -35,7 +35,7 @@ The shader cards track one instruction, `v_med3_f32`. The texture cards track on
 </p>
 <!-- verification:end -->
 
-**Windows regression run** · The complete Rust workspace and the frame-time analyzer run in CI. A separate source-built x64 probe binds both imports and returns exit status 73. [Test breakdown](docs/engineering-review.md#reproduced-on-this-revision)
+**Windows regression run** · On Windows x64, 731 Rust workspace tests and two frame-time analyzer tests passed on this engine revision. A separate source-built x64 probe binds both imports and returns exit status 73. [Test breakdown](docs/engineering-review.md#reproduced-on-this-revision)
 
 **Texture streaming** · A DirectStorage request decoded two BC4 blocks directly into a console texture. The RTX 4060 matched all 32 texels after upload and detected all 32 stale texels when the upload was deliberately skipped. [Run the fixture](docs/engineering-review.md#bc4-storage-and-gpu-readback)
 
@@ -72,9 +72,12 @@ Set the path to an x64 console program you built or have permission to test. Ins
 ```powershell
 $program = 'D:\samples\sample.exe'
 .\target\release\portvi.exe inspect $program --imports
+.\target\release\portvi.exe census $program --missing
 .\target\release\portvi.exe run $program
 .\target\release\portvi.exe run $program --execute
 ```
+
+The census counts runtime and Windows exports. For functions provided by a DLL alongside the program, use `inspect <library.dll> --exports` to compare its export table.
 
 </details>
 
