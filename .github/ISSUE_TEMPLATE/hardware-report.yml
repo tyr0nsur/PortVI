@@ -1,0 +1,35 @@
+name: Hardware result or regression
+description: Share a reproducible result from PortVI on Windows x64.
+title: "[Hardware] "
+body:
+  - type: markdown
+    attributes:
+      value: Share original or redistributable inputs and sanitized text logs. Use the existing tracking issues for repeat runs of the median shader, BC4, frame timing or fences.
+  - type: input
+    id: revision
+    attributes:
+      label: PortVI commit
+      description: Output of git rev-parse HEAD
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Windows build, GPU and driver
+      description: Include the adapter model, exact driver and whether you used a physical GPU or WARP.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Command and steps
+      placeholder: python portvi.py gpu
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: Expected and observed result
+      description: Include matched cases, failures or a short sanitized log excerpt.
+    validations:
+      required: true

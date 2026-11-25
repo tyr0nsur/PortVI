@@ -12,13 +12,17 @@
 </p>
 
 <p align="center">
+  <a href="https://portvi-runtime.round-gnat-8815.chatgpt.site/">Project site</a> ·
+  <a href="docs/project-status.md">Project status</a> ·
   <a href="#development-dashboard">Dashboard</a> ·
   <a href="#build-and-run">Build and run</a> ·
   <a href="#contribute">Contribute</a> ·
   <a href="docs/engineering-review.md">Engineering notes</a>
 </p>
 
-PortVI runs x86-64 console code directly on the Windows host CPU. It builds on Marvisak’s VIctory, binds platform calls and translates console shaders to DXIL for Direct3D 12. We verify selected results on physical hardware. [Pinned engine](https://github.com/Marvisak/VIctory/commit/13f91caee25f2fdf2c062be5f7a27f058e51cbca)
+PortVI is an experimental Windows x64 runtime for GTA VI compatibility research. It runs x86-64 console code directly on the Windows host CPU. It builds on Marvisak’s VIctory, binds platform calls and translates console shaders to DXIL for Direct3D 12. We verify selected results on physical hardware. [Pinned engine](https://github.com/Marvisak/VIctory/commit/13f91caee25f2fdf2c062be5f7a27f058e51cbca)
+
+**Current status.** PortVI has verified native loader and Direct3D 12 test fixtures, including hardware results on the NVIDIA GeForce RTX 4060. A measured GTA VI scene capture is pending. [Project status and evidence](docs/project-status.md) · [Contribute hardware results](CONTRIBUTING.md)
 
 ## Development dashboard
 
@@ -102,7 +106,7 @@ The census counts runtime and Windows exports. For functions provided by a DLL a
 | Frame pacing | Capture the same interactive scene twice and report displayed FPS and frame-time percentiles. | [Scene benchmark](https://github.com/tyr0nsur/PortVI/issues/3) |
 | Synchronization | Verify fence wakeups on the pinned engine for CPU signals, GPU writes and direct memory writes. | [Fence waits](https://github.com/tyr0nsur/PortVI/issues/4) |
 
-Public reproductions should use source and assets you can redistribute. For a hardware report, a comment on the tracking issue is enough.
+Public reproductions use source and assets you can redistribute. Repeat runs belong on the corresponding tracking issue. Read the [contribution and community guide](CONTRIBUTING.md) before submitting a new report.
 
 <details>
 <summary><strong>Work on an engine patch</strong></summary>
