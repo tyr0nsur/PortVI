@@ -1,0 +1,625 @@
+diff --git a/crates/victory-shader/src/emit/container.rs b/crates/victory-shader/src/emit/container.rs
+index 222deb7..08d6dc8 100644
+--- a/crates/victory-shader/src/emit/container.rs
++++ b/crates/victory-shader/src/emit/container.rs
+@@ -1,6 +1,6 @@
+ //! The PC container around emitted DXIL: feature flags (`SFI0`), the
+ //! signatures (`ISG1`, `OSG1`), pipeline state validation (`PSV0`) and the
+-//! program (`DXIL`), laid out as validator version 1.6 lays them out, plus
+-//! the container hash that D3D12 checks.
++//! program (`DXIL`), laid out as validator versions 1.6 and 1.8 lay them out,
++//! plus the container hash that D3D12 checks.
+
+ /// One signature element: one row (D3D12 links stages by semantic).
+@@ -167,7 +167,9 @@ pub(crate) struct Psv<'a> {
+     pub threads: [u32; 3],
+     pub wave_size: Option<u32>,
++    /// Validator 1.8: runtime info 3 and the entry-point name.
++    pub validator18: bool,
+ }
+
+-/// `PSV0` with runtime info version 2 (validator 1.6).
++/// `PSV0` with runtime info version 2, or 3 for validator 1.8.
+ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
+     let vectors = |els: &[SigElement]| {
+@@ -185,6 +187,7 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
+         }
+     };
+-    u32s(&mut out, &[48]);
+-    let mut info = [0u8; 48];
++    let info_size = if p.validator18 { 52 } else { 48 };
++    u32s(&mut out, &[info_size]);
++    let mut info = [0u8; 52];
+     info[0] = u8::from(p.flag);
+     if p.stage == 0 {
+@@ -225,5 +228,9 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
+         info[26..28].copy_from_slice(&(max as u16).to_le_bytes());
+     }
+-    out.extend(info);
++    if p.validator18 {
++        // Runtime info 3 names the entry point at offset 1 in the strings.
++        info[48..52].copy_from_slice(&1u32.to_le_bytes());
++    }
++    out.extend(&info[..info_size as usize]);
+     u32s(&mut out, &[p.bindings.len() as u32]);
+     if !p.bindings.is_empty() {
+@@ -236,6 +243,11 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
+         }
+     }
+-    // Names of arbitrary semantics (system values use ""), then indices.
+-    let mut strings = vec![0u8];
++    // The optional entry point and arbitrary semantics (system values use ""),
++    // then indices.
++    let mut strings = if p.validator18 {
++        b"\0main\0".to_vec()
++    } else {
++        vec![0]
++    };
+     let mut indices: Vec<u32> = Vec::new();
+     let mut elements = Vec::new();
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index ac8917c..a0c9800 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -699,4 +699,361 @@ mod tests {
+     }
+
++    /// Reads the `ShaderFlags` word (entry property tag 0) from `dx.entryPoints`
++    /// in a DXIL container emitted by [`bitcode::Module`].
++    fn module_shader_flags(dxil_container: &[u8]) -> u64 {
++        let host = Container::parse(dxil_container).unwrap();
++        let bitcode = &host.part(FourCC::DXIL).unwrap().data[24..];
++        assert_eq!(&bitcode[..4], b"BC\xc0\xde");
++        let words: Vec<u32> = bitcode[4..]
++            .as_chunks::<4>()
++            .0
++            .iter()
++            .map(|&c| u32::from_le_bytes(c))
++            .collect();
++        struct Reader<'a> {
++            words: &'a [u32],
++            pos: usize,
++        }
++        impl Reader<'_> {
++            fn read(&mut self, width: u32) -> u64 {
++                let mut out = 0u64;
++                for i in 0..width {
++                    let word = self.words[self.pos / 32];
++                    let bit = (word >> (self.pos % 32)) & 1;
++                    out |= u64::from(bit) << i;
++                    self.pos += 1;
++                }
++                out
++            }
++            fn vbr(&mut self, width: u32) -> u64 {
++                let mut out = 0u64;
++                let mut shift = 0u32;
++                let mask = (1u64 << (width - 1)) - 1;
++                loop {
++                    let chunk = self.read(width);
++                    out |= (chunk & mask) << shift;
++                    if chunk >> (width - 1) == 0 {
++                        return out;
++                    }
++                    shift += width - 1;
++                }
++            }
++            fn align32(&mut self) {
++                self.pos = (self.pos + 31) & !31;
++            }
++        }
++        enum Md {
++            Val(u64),
++            Node(Vec<u64>),
++            Other,
++        }
++        let mut r = Reader {
++            words: &words,
++            pos: 0,
++        };
++        let mut stack: Vec<(u64, u32)> = Vec::new();
++        let mut num_values = 0u64;
++        let mut consts = std::collections::HashMap::<u64, u64>::new();
++        let mut mds: Vec<Md> = Vec::new();
++        let mut last_name: Vec<u8> = Vec::new();
++        let mut entry_node = None;
++        let total_bits = words.len() * 32;
++        while r.pos < total_bits {
++            let width = stack.last().map_or(2, |b| b.1);
++            let id = r.read(width);
++            match id {
++                0 => {
++                    r.align32();
++                    stack.pop();
++                    if stack.is_empty() {
++                        break;
++                    }
++                }
++                1 => {
++                    let block = r.vbr(8);
++                    let new_width = r.vbr(4) as u32;
++                    r.align32();
++                    let len_words = r.read(32) as usize;
++                    if matches!(block, 8 | 11 | 15) {
++                        stack.push((block, new_width));
++                    } else {
++                        r.pos += len_words * 32;
++                    }
++                }
++                3 => {
++                    let code = r.vbr(6);
++                    let nops = r.vbr(6) as usize;
++                    let ops: Vec<u64> = (0..nops).map(|_| r.vbr(6)).collect();
++                    match stack.last().map(|b| b.0) {
++                        Some(8) if matches!(code, 7 | 8) => num_values += 1,
++                        Some(11) if code != 1 => {
++                            if code == 4 {
++                                let v = ops[0];
++                                let decoded = if v & 1 != 0 {
++                                    (v >> 1).wrapping_neg()
++                                } else {
++                                    v >> 1
++                                };
++                                consts.insert(num_values, decoded);
++                            }
++                            num_values += 1;
++                        }
++                        Some(15) => match code {
++                            1 => mds.push(Md::Other),
++                            2 => mds.push(Md::Val(ops[1])),
++                            3 => mds.push(Md::Node(ops)),
++                            4 => last_name = ops.iter().map(|&c| c as u8).collect(),
++                            10 if last_name == b"dx.entryPoints" => entry_node = Some(ops[0]),
++                            _ => {}
++                        },
++                        _ => {}
++                    }
++                }
++                other => panic!("unexpected bitstream entry id {other}"),
++            }
++        }
++        let Md::Node(entry) = &mds[entry_node.expect("dx.entryPoints") as usize] else {
++            panic!("dx.entryPoints[0] is not a node");
++        };
++        let props_id = entry[4];
++        if props_id == 0 {
++            return 0;
++        }
++        let Md::Node(props) = &mds[(props_id - 1) as usize] else {
++            panic!("entry properties is not a node");
++        };
++        for &[tag_md, val_md] in props.as_chunks::<2>().0 {
++            let Md::Val(tag_id) = mds[(tag_md - 1) as usize] else {
++                continue;
++            };
++            if consts.get(&tag_id) == Some(&0) {
++                let Md::Val(flags_id) = mds[(val_md - 1) as usize] else {
++                    panic!("shader flags property is not a value");
++                };
++                return consts[&flags_id];
++            }
++        }
++        0
++    }
++
++    /// A vertex (or mesh) program that declares a UAV — such as the
++    /// written-pages bitmap `cd94d35` emits when `Options::view_marks` is set
++    /// for a store through an unordered view — must declare
++    /// `UAVsAtEveryStage` (ShaderFlags bit 16) and the matching SFI0 feature
++    /// bit `0x4`. Compute and pixel programs must not set it.
++    #[test]
++    fn vertex_uav_writes_declare_uavs_at_every_stage() {
++        let store_uav = |stage: HwStage, tail: &[u32]| {
++            let base = stage.user_sgpr(0);
++            let mut w = vec![
++                0xBE80_0380u32 | (u32::from(base + 1) << 16), // s_mov_b32 s[base+1], 0
++                0xF408_0300 | (u32::from(base) >> 1),
++                0xFA00_0000, // s_load_dwordx4 s[12:15], s[base:base+1], null
++                0xBF8C_0000, // s_waitcnt all
++                0x7E00_02F2, // v_mov_b32 v0, 1.0
++                0xE070_0000,
++                0x8003_0000, // buffer_store_dword v0, off, s[12:15], 0
++            ];
++            w.extend_from_slice(tail);
++            w.push(0xBF81_0000); // s_endpgm
++            w
++        };
++        let translate_stage = |stage: HwStage, options: Options| {
++            let (words, io, osg1) = match stage {
++                HwStage::Vs => {
++                    let pos = SigElement {
++                        name: "SV_Position".into(),
++                        index: 0,
++                        kind: 3,
++                        comp: 9,
++                        interp: 0,
++                        row: Some(0),
++                        col: 0,
++                        cols: 4,
++                        usage: 0xF,
++                        half: false,
++                    };
++                    (
++                        store_uav(stage, &[0xF800_08CF, 0x0000_0000]), // exp pos0 v0..v0 done
++                        StageIo::Vs {
++                            inputs: vec![],
++                            outputs: vec![],
++                        },
++                        Some(container::signature(&[pos], false)),
++                    )
++                }
++                HwStage::Ps => {
++                    let target = SigElement {
++                        name: "SV_Target".into(),
++                        index: 0,
++                        kind: 16,
++                        comp: 9,
++                        interp: 0,
++                        row: Some(0),
++                        col: 0,
++                        cols: 4,
++                        usage: 0xF,
++                        half: false,
++                    };
++                    (
++                        store_uav(stage, &[0xF800_180F, 0x0000_0000]), // exp mrt0 v0..v0 done vm
++                        StageIo::Ps {
++                            inputs: vec![],
++                            input_addr: 0,
++                            db_shader_control: 0,
++                            patches: vec![],
++                        },
++                        Some(container::signature(&[target], false)),
++                    )
++                }
++                HwStage::Cs => (
++                    store_uav(stage, &[]),
++                    StageIo::Cs(ComputeIo {
++                        rsrc2: 1 << 1,
++                        threads: [1, 1, 1],
++                    }),
++                    None,
++                ),
++                HwStage::Ms => {
++                    let pos = SigElement {
++                        name: "SV_Position".into(),
++                        index: 0,
++                        kind: 3,
++                        comp: 9,
++                        interp: 0,
++                        row: Some(0),
++                        col: 0,
++                        cols: 4,
++                        usage: 0xF,
++                        half: false,
++                    };
++                    (
++                        store_uav(
++                            stage,
++                            &[
++                                0x7E02_02FF,
++                                TRIANGLE, // v_mov_b32 v1, TRIANGLE
++                                0xF800_0941,
++                                0x0000_0001, // exp prim v1, off, off, off done
++                                0xF800_08CF,
++                                0x0000_0000, // exp pos0 v0..v0 done
++                            ],
++                        ),
++                        StageIo::Ms(crate::native::MeshIo {
++                            outputs: vec![],
++                            clip_cntl: 0,
++                            threads: 32,
++                            max_vertices: 32,
++                            max_primitives: 32,
++                            topology: 2,
++                            lds_bytes: 0,
++                        }),
++                        Some(container::signature(&[pos], false)),
++                    )
++                }
++                _ => unreachable!(),
++            };
++            let native = NativeProgram {
++                stage,
++                wave64: false,
++                vgprs: 4,
++                layout: vec![crate::native::RootParam {
++                    root: RootType::Table,
++                    table_offset_dwords: 0,
++                    sgprs: 1,
++                    base_register: 0,
++                    user_data: 0,
++                    slot: 0,
++                }],
++                used: vec![crate::native::UsedResource {
++                    kind: crate::native::ResourceType::Uav,
++                    root: RootType::Table,
++                    table_offset_dwords: 0,
++                    lower_bound: 0,
++                    stride: 0,
++                    dwords: 4,
++                    user_data: 0,
++                    slot: 0,
++                }],
++                io,
++                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
++            };
++            let parts: Vec<_> = osg1
++                .as_deref()
++                .map(|o| (FourCC::OSG1, o))
++                .into_iter()
++                .collect();
++            let bytes = crate::dxbc::build(&parts);
++            let c = Container::parse(&bytes).unwrap();
++            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
++            let st = structure::structure(&p).unwrap();
++            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
++            let io = io::raise(&p, &native).unwrap();
++            let out = emit_with(&c, &native, &p, &st, &io, &res, options).unwrap();
++            #[cfg(windows)]
++            if let Ok(mut v) = super::validator::Validator::load(
++                super::validator::Validator::default_path().as_deref(),
++            ) {
++                v.validate(&mut out.dxil.clone()).unwrap();
++            }
++            let host = Container::parse(&out.dxil).unwrap();
++            let sfi0 = host.part(FourCC::SFI0).unwrap().data;
++            let features = u64::from_le_bytes(sfi0.try_into().unwrap());
++            let flags = module_shader_flags(&out.dxil);
++            (out, features, flags)
++        };
++
++        let marks = Options { view_marks: true };
++        for stage in [HwStage::Vs, HwStage::Ms] {
++            let (out, sfi0, flags) = translate_stage(stage, marks);
++            assert!(
++                out.view_marks,
++                "{stage:?} store must emit the view-mark UAV"
++            );
++            assert_ne!(
++                sfi0 & 0x4,
++                0,
++                "{stage:?} SFI0 {sfi0:#x}: missing UAVsAtEveryStage"
++            );
++            assert_ne!(
++                flags & shader::flags::UAVS_AT_EVERY_STAGE,
++                0,
++                "{stage:?} module flags {flags:#x}: missing UAVsAtEveryStage"
++            );
++        }
++
++        let (vs_no_marks, vs_no_marks_sfi0, vs_no_marks_flags) =
++            translate_stage(HwStage::Vs, Options::default());
++        assert!(!vs_no_marks.view_marks);
++        assert_eq!(
++            vs_no_marks_sfi0 & 0x4,
++            0,
++            "VS without declared UAVs must not set UAVsAtEveryStage in SFI0"
++        );
++        assert_eq!(
++            vs_no_marks_flags & shader::flags::UAVS_AT_EVERY_STAGE,
++            0,
++            "VS without declared UAVs must not set UAVsAtEveryStage in module flags"
++        );
++
++        for stage in [HwStage::Ps, HwStage::Cs] {
++            let (out, sfi0, flags) = translate_stage(stage, marks);
++            assert!(
++                out.view_marks,
++                "{stage:?} store must emit the view-mark UAV"
++            );
++            assert_eq!(
++                sfi0 & 0x4,
++                0,
++                "{stage:?} SFI0 {sfi0:#x}: must not set UAVsAtEveryStage"
++            );
++            assert_eq!(
++                flags & shader::flags::UAVS_AT_EVERY_STAGE,
++                0,
++                "{stage:?} module flags {flags:#x}: must not set UAVsAtEveryStage"
++            );
++        }
++    }
++
+     #[test]
+     fn immediate_sampler_slots_distinguish_comparison_uses() {
+diff --git a/crates/victory-shader/src/emit/shader.rs b/crates/victory-shader/src/emit/shader.rs
+index e68e262..5c93c40 100644
+--- a/crates/victory-shader/src/emit/shader.rs
++++ b/crates/victory-shader/src/emit/shader.rs
+@@ -1,5 +1,6 @@
+ //! A DXIL vertex, pixel, compute or mesh shader under construction: the module,
+ //! the `dx.op` declarations it calls, its signatures and bound resources,
+-//! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
++//! and the metadata and container that wrap it up (SM 6.6; validator 1.6,
++//! or 1.8 for compute derivatives).
+
+ use super::bitcode::{Attr, Md, Module, Ty, V, pred};
+@@ -47,4 +48,5 @@ pub(crate) mod flags {
+     pub const STENCIL_REF: u64 = 1 << 11;
+     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
++    pub const UAVS_AT_EVERY_STAGE: u64 = 1 << 16;
+     pub const ROVS: u64 = 1 << 18;
+     pub const WAVE_OPS: u64 = 1 << 19;
+@@ -126,4 +128,6 @@ pub(crate) struct Shader {
+     /// The wave size a compute shader requires (`WaveSize`).
+     pub wave_size: Option<u32>,
++    /// Compute derivatives require validator 1.8 rather than 1.6 or 1.7.
++    compute_derivatives: bool,
+     /// Thread-group shared memory, in dwords.
+     pub lds_dwords: u32,
+@@ -187,4 +191,5 @@ impl Shader {
+             threads: None,
+             wave_size: None,
++            compute_derivatives: false,
+             lds_dwords: 0,
+             lds: None,
+@@ -216,4 +221,17 @@ impl Shader {
+         args: &[V],
+     ) -> V {
++        // Validators before 1.8 reject gradient operations outside the
++        // pixel stage. This set matches DXC's gradient classification:
++        // the implicit-derivative samples (60/61/64) and the LOD query
++        // (81), plus the explicit derivatives (83..=86). Bfi and the dot
++        // products (53..=56) are arithmetic and stay on 1.6, and
++        // SampleGrad/SampleLevel (62/63) take explicit gradients, so the
++        // validator already accepts them in compute.
++        if self.threads.is_some()
++            && self.mesh.is_none()
++            && matches!(opcode, 60 | 61 | 64 | 81 | 83..=86)
++        {
++            self.compute_derivatives = true;
++        }
+         let mut params = vec![self.t.i32];
+         params.extend(args.iter().map(|&a| self.m.type_of(a)));
+@@ -794,4 +812,11 @@ impl Shader {
+             self.flags |= flags::STENCIL_REF;
+         }
++        // Any non-pixel, non-compute stage with a declared UAV (as DXC collects
++        // it for validator versions below 1.8, including mesh; we declare 1.6).
++        let has_uavs =
++            !self.root_uavs.is_empty() || self.memory_dirty.is_some() || self.view_writes.is_some();
++        if graphics && !self.pixel && has_uavs {
++            self.flags |= flags::UAVS_AT_EVERY_STAGE;
++        }
+         // Entry properties: shader flags (tag 0), thread-group size (4),
+         // wave size (11).
+@@ -855,5 +880,8 @@ impl Shader {
+         let version = self.m.md_node(vec![Some(one), Some(six)]);
+         self.m.named_md("dx.version", vec![version]);
+-        self.m.named_md("dx.valver", vec![version]);
++        let val_minor = if self.compute_derivatives { 8 } else { 6 };
++        let val_minor = i32c(&mut self, val_minor);
++        let val_version = self.m.md_node(vec![Some(one), Some(val_minor)]);
++        self.m.named_md("dx.valver", vec![val_version]);
+         // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
+         let (name, kind) = match (self.threads, self.pixel) {
+@@ -880,4 +908,7 @@ impl Shader {
+
+         let mut features = 0u64;
++        if self.flags & flags::UAVS_AT_EVERY_STAGE != 0 {
++            features |= 0x4;
++        }
+         if self.flags & flags::STENCIL_REF != 0 {
+             features |= 0x200;
+@@ -926,4 +957,5 @@ impl Shader {
+             threads: self.threads.unwrap_or_default(),
+             wave_size: self.wave_size,
++            validator18: self.compute_derivatives,
+         });
+         let hash = [0u8; 20];
+@@ -987,2 +1019,114 @@ impl Shader {
+     }
+ }
++
++#[cfg(all(test, windows))]
++mod tests {
++    use super::super::bitcode::Term;
++    use super::super::validator;
++    use super::*;
++
++    /// Builds a compute shader calling `opcode` and returns its container
++    /// plus the derivative flag as detected by `op`. `Some(v)` overrides
++    /// the flag before the container is written.
++    fn compute_with_op(
++        opcode: u32,
++        name: &str,
++        attr: Attr,
++        args: usize,
++        validator18: Option<bool>,
++    ) -> (Vec<u8>, bool) {
++        let mut s = Shader::new(false);
++        s.threads = Some([32, 1, 1]);
++        s.wave_size = Some(32);
++        let block = s.entry;
++        let zero = s.m.f32(0);
++        let args = vec![zero; args];
++        let ret = s.t.f32;
++        s.op(block, name, attr, ret, opcode, &args);
++        let detected = s.compute_derivatives;
++        if let Some(v) = validator18 {
++            s.compute_derivatives = v;
++        }
++        s.m.terminate(block, Term::Ret);
++        (s.finish(), detected)
++    }
++
++    #[test]
++    fn compute_implicit_sample_validates() {
++        let mut s = Shader::new(false);
++        s.threads = Some([32, 1, 1]);
++        s.wave_size = Some(32);
++        s.samplers = 1;
++        let block = s.entry;
++        let index = s.m.i32(0);
++        let texture = s.heap_handle(block, index, false, false, (2, 1033));
++        let sampler = s.sampler_handle(block, 0);
++        let zero = s.m.f32(0);
++        let fu = s.m.undef(s.t.f32);
++        let iu = s.m.undef(s.t.i32);
++        let args = [texture, sampler, zero, zero, fu, fu, iu, iu, iu, fu];
++        let ret = s.t.res_ret;
++        s.op(block, "sample.f32", Attr::ReadOnly, ret, 60, &args);
++        assert!(s.compute_derivatives);
++        s.m.terminate(block, Term::Ret);
++        let mut dxil = s.finish();
++        let path = validator::Validator::default_path();
++        let Ok(mut validator) = validator::Validator::load(path.as_deref()) else {
++            eprintln!("no dxil.dll; skipped");
++            return;
++        };
++        validator.validate(&mut dxil).unwrap();
++
++        // The same module declared as validator 1.6 must be rejected.
++        let mut legacy = {
++            let mut s = Shader::new(false);
++            s.threads = Some([32, 1, 1]);
++            s.wave_size = Some(32);
++            s.samplers = 1;
++            let block = s.entry;
++            let index = s.m.i32(0);
++            let texture = s.heap_handle(block, index, false, false, (2, 1033));
++            let sampler = s.sampler_handle(block, 0);
++            let zero = s.m.f32(0);
++            let fu = s.m.undef(s.t.f32);
++            let iu = s.m.undef(s.t.i32);
++            let args = [texture, sampler, zero, zero, fu, fu, iu, iu, iu, fu];
++            let ret = s.t.res_ret;
++            s.op(block, "sample.f32", Attr::ReadOnly, ret, 60, &args);
++            s.compute_derivatives = false;
++            s.m.terminate(block, Term::Ret);
++            s.finish()
++        };
++        assert!(validator.validate(&mut legacy).is_err());
++    }
++
++    #[test]
++    fn compute_explicit_derivative_validates() {
++        // DerivCoarseX (83): rejected before validator 1.8 like the
++        // implicit-derivative samples.
++        let (mut dxil, detected) = compute_with_op(83, "unary.f32", Attr::ReadNone, 1, Some(true));
++        assert!(detected);
++        let (mut legacy, _) = compute_with_op(83, "unary.f32", Attr::ReadNone, 1, Some(false));
++        let path = validator::Validator::default_path();
++        let Ok(mut validator) = validator::Validator::load(path.as_deref()) else {
++            eprintln!("no dxil.dll; skipped");
++            return;
++        };
++        validator.validate(&mut dxil).unwrap();
++        assert!(validator.validate(&mut legacy).is_err());
++    }
++
++    #[test]
++    fn compute_dot3_stays_on_validator_1_6() {
++        // Dot3 (55) is arithmetic, not a gradient op: it must not bump the
++        // validator version, and the resulting 1.6 module validates.
++        let (mut dxil, detected) = compute_with_op(55, "dot3.f32", Attr::ReadNone, 6, None);
++        assert!(!detected);
++        let path = validator::Validator::default_path();
++        let Ok(mut validator) = validator::Validator::load(path.as_deref()) else {
++            eprintln!("no dxil.dll; skipped");
++            return;
++        };
++        validator.validate(&mut dxil).unwrap();
++    }
++}

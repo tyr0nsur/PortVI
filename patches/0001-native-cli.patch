@@ -1,0 +1,46 @@
+diff --git a/apps/victory/Cargo.toml b/apps/victory/Cargo.toml
+index b3a0463..618aec0 100644
+--- a/apps/victory/Cargo.toml
++++ b/apps/victory/Cargo.toml
+@@ -7,4 +7,9 @@ rust-version.workspace = true
+ license.workspace = true
+ publish.workspace = true
++autobins = false
++
++[[bin]]
++name = "portvi"
++path = "src/main.rs"
+
+ [dependencies]
+diff --git a/apps/victory/src/main.rs b/apps/victory/src/main.rs
+index 5c8749f..ee3db3f 100644
+--- a/apps/victory/src/main.rs
++++ b/apps/victory/src/main.rs
+@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand, ValueEnum};
+ #[derive(Parser)]
+ #[command(
+-    name = "victory",
++    name = "portvi",
+     version,
+-    about = "Run an Xbox Series title natively on Windows"
++    about = "PortVI runs x86-64 console programs natively on Windows"
+ )]
+ struct Cli {
+diff --git a/apps/victory/tests/census.rs b/apps/victory/tests/census.rs
+index 8a2bdae..5345c36 100644
+--- a/apps/victory/tests/census.rs
++++ b/apps/victory/tests/census.rs
+@@ -8,5 +8,5 @@ fn census_fails_when_a_requested_path_is_missing() {
+     assert!(!missing.exists());
+
+-    let output = Command::new(env!("CARGO_BIN_EXE_victory"))
++    let output = Command::new(env!("CARGO_BIN_EXE_portvi"))
+         .arg("census")
+         .args([&valid, &missing])
+@@ -25,5 +25,5 @@ fn census_fails_when_a_requested_path_is_missing() {
+ fn census_accepts_a_valid_path_with_no_pe_images() {
+     let valid = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+-    let output = Command::new(env!("CARGO_BIN_EXE_victory"))
++    let output = Command::new(env!("CARGO_BIN_EXE_portvi"))
+         .arg("census")
+         .arg(valid)

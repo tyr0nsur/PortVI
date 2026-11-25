@@ -1,9 +1,9 @@
 diff --git a/crates/victory-shader/src/emit/g16_tests.rs b/crates/victory-shader/src/emit/g16_tests.rs
 new file mode 100644
-index 0000000..a3b9ba5
+index 0000000..568bda0
 --- /dev/null
 +++ b/crates/victory-shader/src/emit/g16_tests.rs
-@@ -0,0 +1,454 @@
+@@ -0,0 +1,466 @@
 +//! Explicit-gradient samples with 16-bit gradients (`image_sample_d_g16`,
 +//! `image_sample_d_cl_g16`) end to end, beside their f32 siblings
 +//! (`image_sample_d`, `image_sample_d_cl`), each with and without a16: a
@@ -12,12 +12,14 @@ index 0000000..a3b9ba5
 +//! to DXIL, validated by `dxil.dll` when present, and run on the host GPU
 +//! and WARP.
 +//!
-+//! The gradients pick the level and the clamp raises it; the coordinates
-+//! pick the texel. So a gradient taken as an f32 word, halves swapped, one
-+//! direction read twice, coordinates or clamp read as halves (or from the
-+//! wrong VGPR) each show as another level or texel. The other dimensions
-+//! are lowered and validated only (the host tests have 2D views); the cube,
-+//! comparison and offset forms are refused.
++//! Gradient width follows the `_g16` opcode only; a16 packs only the
++//! coordinates and the clamp (GFX10.3 has G16). The gradients pick the
++//! level and the clamp raises it; the coordinates pick the texel. So a
++//! gradient taken as an f32 word, halves swapped, one direction read twice,
++//! coordinates or clamp read as halves (or from the wrong VGPR) each show as
++//! another level or texel. The other dimensions are lowered and validated
++//! only (the host tests have 2D views); the cube, comparison and offset
++//! forms are refused.
 +
 +use super::host::View;
 +use super::waterfall_tests::run;
@@ -89,7 +91,7 @@ index 0000000..a3b9ba5
 +}
 +
 +/// The address dwords of a 2D sample: dP/dx (s, t), dP/dy (s, t), then the
-+/// coordinates and the clamp. 16-bit gradients (with `g16` or a16) take a
++/// coordinates and the clamp. The `g16` opcode packs gradients into a
 +/// dword per direction; a16 packs the coordinates, and the clamp into the
 +/// low half of the next dword (its high half holds a decoy, 5.0).
 +fn address_2d(form: Form, a16: bool, case: &Case) -> Vec<u32> {
@@ -97,7 +99,7 @@ index 0000000..a3b9ba5
 +        dx, dy, uv, clamp, ..
 +    } = *case;
 +    let mut w = Vec::new();
-+    if form.g16 || a16 {
++    if form.g16 {
 +        w.extend([pair(dx[0], dx[1]), pair(dy[0], dy[1])]);
 +    } else {
 +        w.extend([dx[0], dx[1], dy[0], dy[1]].map(f32::to_bits));
@@ -205,6 +207,7 @@ index 0000000..a3b9ba5
 +        outputs: Vec::new(),
 +        prims: Vec::new(),
 +        mesh_stride: 0,
++        view_marks: false,
 +    })?;
 +    let shader = HostShader {
 +        stage: HwStage::Cs,
@@ -215,7 +218,12 @@ index 0000000..a3b9ba5
 +        root_cbvs: lowered.root_cbvs,
 +        root_srvs: lowered.root_srvs,
 +        root_uavs: lowered.root_uavs,
-+        root_indexed_views: Vec::new(),
++        memory: lowered.memory,
++        memory_writes: lowered.memory_writes,
++        view_addresses: lowered.view_addresses,
++        heap: lowered.heap,
++        heap_writes: lowered.heap_writes,
++        view_marks: lowered.view_marks,
 +    };
 +    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
 +        v.validate(&mut shader.dxil.clone())
@@ -351,6 +359,7 @@ index 0000000..a3b9ba5
 +            assert!(!results.is_empty(), "{at}: no device ran");
 +            let want = expected(case);
 +            for (label, got) in results {
++                assert!(got.len() >= 4 * 32, "{at}, {label}: {} dwords read back", got.len());
 +                for lane in 0..32 {
 +                    let texel = &got[4 * lane..4 * lane + 4];
 +                    assert_eq!(
@@ -368,7 +377,7 @@ index 0000000..a3b9ba5
 +
 +#[test]
 +fn sample_d_selects_the_level_of_its_f32_gradients_on_the_card() {
-+    // The siblings, unchanged: the same cases and texture.
++    // Ordinary opcodes keep full-width gradients with both coordinate widths on RDNA2.
 +    sample_2d(SAMPLE_D);
 +    sample_2d(SAMPLE_D_CL);
 +}
@@ -394,7 +403,7 @@ index 0000000..a3b9ba5
 +        5 => (3, 2),
 +        _ => unreachable!(),
 +    };
-+    let grads = if form.g16 || a16 {
++    let grads = if form.g16 {
 +        2 * grads.div_ceil(2)
 +    } else {
 +        2 * grads
@@ -435,9 +444,12 @@ index 0000000..a3b9ba5
 +    // A cube: the f32 form's level estimate is not taken for 16-bit
 +    // gradients (dim 3: two gradients each way, face coordinates).
 +    for form in [SAMPLE_D_G16, SAMPLE_D_CL_G16] {
-+        let n = 2 + 3 + usize::from(form.clamp);
-+        let words = program(form, 3, false, &vec![0x3C00_3C00; n]);
-+        assert_eq!(refused(&words), "a cube sample with 16-bit gradients");
++        for a16 in [false, true] {
++            let packed = 3 + usize::from(form.clamp);
++            let n = 2 + if a16 { packed.div_ceil(2) } else { packed };
++            let words = program(form, 3, a16, &vec![0x3C00_3C00; n]);
++            assert_eq!(refused(&words), "a cube sample with 16-bit gradients");
++        }
 +    }
 +    // Comparison and offset forms: not lowered at all, as before.
 +    for (opcode, name, n) in [
@@ -459,169 +471,124 @@ index 0000000..a3b9ba5
 +    }
 +}
 diff --git a/crates/victory-shader/src/emit/host.rs b/crates/victory-shader/src/emit/host.rs
-index 824ac85..460dde7 100644
+index 76f2455..d9ce5a2 100644
 --- a/crates/victory-shader/src/emit/host.rs
 +++ b/crates/victory-shader/src/emit/host.rs
-@@ -995,6 +995,10 @@ pub enum View<'a> {
-     Texture(u32, u32, &'a [[f32; 4]]),
-     /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
-     Cube(u32, &'a [[f32; 4]]),
-+    /// An RGBA32F texture SRV with a mip chain (width and height of level
-+    /// 0, levels, the texels of each level in turn, each level half the
-+    /// size of the one before, at least 1).
-+    Mipped(u32, u32, u32, &'a [[f32; 4]]),
-     /// A raw buffer UAV of this many dwords, zeroed.
-     RawUav(u32),
-     /// An RGBA32F texture UAV (width, height), zeroed.
-@@ -1168,49 +1172,70 @@ impl Host {
-                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
-                 at.ptr += i * view_size;
-                 match *v {
--                    View::Texture(..) | View::Cube(..) => {
--                        let (w, h, texels, faces) = match *v {
--                            View::Texture(w, h, t) => (w, h, t, 1),
--                            View::Cube(n, t) => (n, n, t, 6),
-+                    View::Texture(..) | View::Cube(..) | View::Mipped(..) => {
-+                        let (w, h, texels, faces, levels) = match *v {
-+                            View::Texture(w, h, t) => (w, h, t, 1, 1),
-+                            View::Cube(n, t) => (n, n, t, 6, 1),
-+                            View::Mipped(w, h, levels, t) => {
-+                                let max_levels = u32::BITS - w.max(h).leading_zeros();
-+                                if w == 0 || h == 0 || !(1..=max_levels).contains(&levels) {
-+                                    return Err("invalid dimensions or level count for a mip chain".into());
-+                                }
-+                                let count = (0..levels).try_fold(0u64, |sum, level| {
-+                                    sum.checked_add(u64::from((w >> level).max(1)) * u64::from((h >> level).max(1)))
-+                                });
-+                                if count != Some(t.len() as u64) {
-+                                    return Err("texture data does not match its mip chain".into());
-+                                }
-+                                (w, h, t, 1, levels)
-+                            }
-                             _ => unreachable!(),
-                         };
-                         let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
-                         desc.DepthOrArraySize = faces as u16;
-+                        desc.MipLevels = levels as u16;
-                         let tex = make(
-                             D3D12_HEAP_TYPE_DEFAULT,
-                             &desc,
-                             D3D12_RESOURCE_STATE_COPY_DEST,
-                         )?;
--                        let pitch = (w as usize * 16).next_multiple_of(256);
-+                        // Where the next subresource's texels start.
-+                        let mut from = 0usize;
-                         for face in 0..faces as usize {
--                            let upload = make(
--                                D3D12_HEAP_TYPE_UPLOAD,
--                                &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
--                                D3D12_RESOURCE_STATE_GENERIC_READ,
--                            )?;
--                            let mut p = std::ptr::null_mut();
--                            upload.Map(0, None, Some(&mut p)).map_err(err)?;
--                            let texels = &texels[face * (w * h) as usize..];
--                            for y in 0..h as usize {
--                                let row = &texels[y * w as usize..(y + 1) * w as usize];
--                                std::ptr::copy_nonoverlapping(
--                                    row.as_ptr().cast::<u8>(),
--                                    p.cast::<u8>().add(y * pitch),
--                                    row.len() * 16,
-+                            for level in 0..levels as usize {
-+                                let (w, h) = ((w >> level).max(1), (h >> level).max(1));
-+                                let pitch = (w as usize * 16).next_multiple_of(256);
-+                                let upload = make(
-+                                    D3D12_HEAP_TYPE_UPLOAD,
-+                                    &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
-+                                    D3D12_RESOURCE_STATE_GENERIC_READ,
-+                                )?;
-+                                let mut p = std::ptr::null_mut();
-+                                upload.Map(0, None, Some(&mut p)).map_err(err)?;
-+                                let texels = &texels[from..];
-+                                for y in 0..h as usize {
-+                                    let row = &texels[y * w as usize..(y + 1) * w as usize];
-+                                    std::ptr::copy_nonoverlapping(
-+                                        row.as_ptr().cast::<u8>(),
-+                                        p.cast::<u8>().add(y * pitch),
-+                                        row.len() * 16,
-+                                    );
-+                                }
-+                                upload.Unmap(0, None);
-+                                from += w as usize * h as usize;
-+                                let mut at_sub = subresource(&tex);
-+                                at_sub.Anonymous.SubresourceIndex =
-+                                    (face * levels as usize + level) as u32;
-+                                list.CopyTextureRegion(
-+                                    &at_sub,
-+                                    0,
-+                                    0,
-+                                    0,
-+                                    &footprint(&upload, w, h),
-+                                    None,
-                                 );
-+                                keep.push(upload);
-                             }
--                            upload.Unmap(0, None);
--                            let mut at_face = subresource(&tex);
--                            at_face.Anonymous.SubresourceIndex = face as u32;
--                            list.CopyTextureRegion(
--                                &at_face,
--                                0,
--                                0,
--                                0,
--                                &footprint(&upload, w, h),
--                                None,
--                            );
--                            keep.push(upload);
-                         }
-                         list.ResourceBarrier(&[transition(
-                             &tex,
+@@ -92,4 +92,24 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
+ }
+
++/// An adapter's model and PCI IDs, as the physical-adapter tests print them.
++#[cfg(test)]
++fn adapter_report(desc: &DXGI_ADAPTER_DESC1) -> String {
++    let end = desc
++        .Description
++        .iter()
++        .position(|&c| c == 0)
++        .unwrap_or(desc.Description.len());
++    let name = String::from_utf16_lossy(&desc.Description[..end]);
++    format!(
++        "{name} (vendor {:#06x}, device {:#06x}, subsystem {:#010x}, revision {:#04x}, LUID {:08x}:{:08x})",
++        desc.VendorId,
++        desc.DeviceId,
++        desc.SubSysId,
++        desc.Revision,
++        desc.AdapterLuid.HighPart as u32,
++        desc.AdapterLuid.LowPart,
++    )
++}
++
+ impl Host {
+     /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+@@ -110,4 +130,19 @@ impl Host {
+             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+             let device = device.ok_or("no device")?;
++            if !warp {
++                // The adapter the device was actually made on, by its LUID:
++                // never the software rasteriser, whatever was enumerated.
++                let made: IDXGIAdapter1 = factory
++                    .EnumAdapterByLuid(device.GetAdapterLuid())
++                    .map_err(err)?;
++                let desc = made.GetDesc1().map_err(err)?;
++                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
++                    || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
++                {
++                    return Err("the hardware device is the software adapter".to_owned());
++                }
++                #[cfg(test)]
++                eprintln!("physical adapter: {}", adapter_report(&desc));
++            }
+             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
 diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
-index 07b61fc..908f65e 100644
+index caab7ea..6c878d8 100644
 --- a/crates/victory-shader/src/emit/lower.rs
 +++ b/crates/victory-shader/src/emit/lower.rs
-@@ -8885,17 +8885,23 @@ impl<'a> Lower<'a> {
-             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
-             l.i32_of(v)
-         };
--        // With a16, two 16-bit components per VGPR starting at `base_reg`, low half first.
--        let addr_packed = |l: &mut Self, base_reg: usize, k: usize| -> Result<V, Why> {
--            let x = addr_u32(l, base_reg + if *a16 { k / 2 } else { k })?;
--            if !*a16 {
--                return Ok(x);
--            }
-+        // Two 16-bit components per VGPR starting at `base_reg`, low half
-+        // first: component `k` in the low 16 bits of the result.
-+        let addr_half = |l: &mut Self, base_reg: usize, k: usize| -> Result<V, Why> {
-+            let x = addr_u32(l, base_reg + k / 2)?;
-             let c = l.cur;
-             let (sh, mask) = (l.s.m.i32(16 * (k as u32 % 2)), l.s.m.i32(0xFFFF));
-             let x = l.s.m.bin(c, Bin::LShr, x, sh);
-             Ok(l.s.m.bin(c, Bin::And, x, mask))
-         };
-+        // With a16, two 16-bit components per VGPR starting at `base_reg`, low half first.
-+        let addr_packed = |l: &mut Self, base_reg: usize, k: usize| -> Result<V, Why> {
+@@ -7701,16 +7701,57 @@ impl<'a> Lower<'a> {
+                     .count()
+             });
++        // Explicit gradients (`_d`, `_cd`) follow: per direction, one VGPR
++        // each, or with `_g16` f16 pairs, each direction padded to whole
++        // VGPRs (1D, 3D: a high half unused). `a16` does not change their
++        // width (GFX10.3 has G16); it packs only the coordinates, LOD and
++        // clamp after them.
++        let g16 = name.ends_with("_g16");
++        let derivs = name
++            .strip_prefix("image_sample")
++            .is_some_and(|rest| rest.split('_').any(|t| matches!(t, "d" | "cd")));
++        // Gradient components per direction (a cube's are on its face).
++        let deriv_count = match (derivs, kind) {
++            (false, _) => 0,
++            (true, 5) => 2,
++            (true, _) => coords - usize::from(kind == 6 || kind == 7),
++        };
++        let deriv_regs = if g16 {
++            deriv_count.div_ceil(2)
++        } else {
++            deriv_count
++        };
++        // Component `k` in order (whole values, gradients, then packed
++        // values): (VGPR index, 16-bit half if packed).
++        let place = move |k: usize| -> (usize, Option<u32>) {
++            if k < extra {
++                return (k, None);
++            }
++            let j = k - extra;
++            if j < 2 * deriv_count {
++                let (dir, i) = (j / deriv_count, j % deriv_count);
++                let base = extra + dir * deriv_regs;
++                return if g16 {
++                    (base + i / 2, Some(i as u32 % 2))
++                } else {
++                    (base + i, None)
++                };
++            }
++            let j = j - 2 * deriv_count;
++            let lead = extra + 2 * deriv_regs;
 +            if *a16 {
-+                addr_half(l, base_reg, k)
++                (lead + j / 2, Some(j as u32 % 2))
 +            } else {
-+                addr_u32(l, base_reg + k)
++                (lead + j, None)
 +            }
 +        };
-         let addr_val = |l: &mut Self, k: usize| -> Result<V, Why> { addr_packed(l, 0, k) };
-         let src = self
-             .descriptors
-@@ -9064,13 +9070,19 @@ impl<'a> Lower<'a> {
-             self.end_guarded(at, &[]);
-             return Ok(());
-         }
--        let has_cl = name.ends_with("_cl");
-+        // `_g16`: the explicit gradients are f16 pairs whatever `a16` says;
-+        // `a16` alone decides the coordinates and the clamp.
-+        let g16 = name.ends_with("_g16");
-+        let has_cl = name.strip_suffix("_g16").unwrap_or(name).ends_with("_cl");
-         let (op, sample) = match name {
-             "image_sample" | "image_sample_o" | "image_sample_cl" => (60, true),
-             "image_sample_lz" | "image_sample_l" | "image_sample_lz_o" => (62, true),
-             "image_sample_b" | "image_sample_b_cl" => (61, true),
+         let addr_val = |l: &mut Self, k: usize| -> Result<V, Why> {
+-            let packed = *a16 && k >= extra;
+-            let r = *regs
+-                .get(if packed { extra + (k - extra) / 2 } else { k })
+-                .ok_or("an image address")?;
++            let (at, half) = place(k);
++            let r = *regs.get(at).ok_or("an image address")?;
+             let v = inst.read(Reg::V(r)).ok_or("an image address")?;
+             let x = l.i32_of(v)?;
+-            if !packed {
++            let Some(half) = half else {
+                 return Ok(x);
+-            }
++            };
+             let c = l.cur;
+-            let half = (k - extra) as u32 % 2;
+             let (sh, mask) = (l.s.m.i32(16 * half), l.s.m.i32(0xFFFF));
+             let x = l.s.m.bin(c, Bin::LShr, x, sh);
+@@ -7910,4 +7951,7 @@ impl<'a> Lower<'a> {
              "image_sample_c_lz" => (65, true),
              "image_sample_d" | "image_sample_d_cl" => (63, true),
 +            // Only these two of the `_g16` forms: the comparison and offset
@@ -629,9 +596,7 @@ index 07b61fc..908f65e 100644
 +            "image_sample_d_g16" | "image_sample_d_cl_g16" => (63, true),
              "image_get_lod" if self.s.pixel => (81, true),
              // Implicit derivatives: pixel shaders only.
-             "image_sample_c" if self.s.pixel => (64, true),
-@@ -9080,6 +9092,11 @@ impl<'a> Lower<'a> {
-             "image_get_resinfo" => (72, false),
+@@ -7919,4 +7963,11 @@ impl<'a> Lower<'a> {
              _ => return Err(name),
          };
 +        if g16 && kind == 5 {
@@ -639,133 +604,234 @@ index 07b61fc..908f65e 100644
 +            // sample; it is not extended to 16-bit gradients.
 +            return Err("a cube sample with 16-bit gradients");
 +        }
++        // `_cl`, before any `_g16`: the least level of detail.
++        let has_cl = name.strip_suffix("_g16").unwrap_or(name).ends_with("_cl");
          if op == 72 {
              // Width, height, depth or layers, levels (per dmask) of the level
-             // in the first address: DXIL's dimensions; a channel DXIL leaves
-@@ -9146,8 +9163,11 @@ impl<'a> Lower<'a> {
-             let spatial = coords - usize::from(kind == 6 || kind == 7);
-             // A cube's gradients are the two of its face coordinates.
-             let grads = if kind == 5 { 2 } else { spatial };
-+            // 16-bit gradients (with a16, or `_g16`) go two to a VGPR, each
-+            // direction padded to whole VGPRs (1D, 3D: a high half unused).
-+            let half_grads = *a16 || g16;
-             let deriv_regs = if op == 63 {
--                if *a16 {
-+                if half_grads {
-                     grads.div_ceil(2)
-                 } else {
-                     grads
-@@ -9166,6 +9186,19 @@ impl<'a> Lower<'a> {
-                     l.as_float(x)
+@@ -8009,4 +8060,15 @@ impl<'a> Lower<'a> {
                  }
              };
-+            // Component `k` of the gradient whose first VGPR is `base`: an
-+            // f16 half when gradients are 16-bit, else a whole f32. Not
-+            // `to_float`: with `_g16` and no a16 the coordinates are f32.
-+            let grad = |l: &mut Self, base: usize, k: usize| -> Result<V, Why> {
-+                if half_grads {
-+                    let x = addr_half(l, base, k)?;
++            // Gradient component `k` (as `addr_val` numbers it) as a float:
++            // f16 with `_g16` only, else f32 whatever `a16` says.
++            let grad = |l: &mut Self, k: usize| -> Result<V, Why> {
++                let x = addr_val(l, k)?;
++                Ok(if g16 {
 +                    let f = l.s.t.f32;
-+                    Ok(l.s.op(l.cur, "legacyF16ToF32", Attr::ReadNone, f, 131, &[x]))
++                    l.s.op(l.cur, "legacyF16ToF32", Attr::ReadNone, f, 131, &[x])
 +                } else {
-+                    let x = addr_u32(l, base + k)?;
-+                    Ok(l.as_float(x))
-+                }
++                    l.as_float(x)
++                })
 +            };
-             if kind == 5 && (*unorm || op == 81) {
-                 return Err("a cube sample with texel coordinates or a level query");
-             }
-@@ -9372,10 +9405,8 @@ impl<'a> Lower<'a> {
+             // A level query takes no array slice (the code may pass anything
+             // there, e.g. an unwritten register).
+@@ -8122,6 +8184,5 @@ impl<'a> Lower<'a> {
+                     let mut g = [fu; 4];
+                     for (k, x) in g.iter_mut().enumerate() {
+-                        let v = addr_val(self, first + k)?;
+-                        *x = to_float(self, v);
++                        *x = grad(self, first + k)?;
+                     }
+                     let i32t = self.s.t.i32;
+@@ -8146,5 +8207,5 @@ impl<'a> Lower<'a> {
+                     let l = self.unary(23, m);
+                     let mut lod = self.s.m.bin(c, Bin::Mul, l, half);
+-                    if name.ends_with("_cl") {
++                    if has_cl {
+                         let x = addr_val(self, first + grads + coords)?;
+                         let clamp = to_float(self, x);
+@@ -8163,19 +8224,15 @@ impl<'a> Lower<'a> {
+                 }
                  63 => {
+-                    // With a16 each direction's gradients start a VGPR.
+-                    if *a16 && spatial % 2 == 1 {
+-                        return Err("16-bit gradients of a 1D or 3D image");
+-                    }
++                    // Each direction's gradients start a VGPR; with `_g16`
++                    // an odd count leaves the last high half unused.
                      let mut g = vec![fu; 6];
                      for k in 0..spatial {
--                        let x = addr_packed(self, first, k)?;
+-                        let x = addr_val(self, first + k)?;
 -                        g[k] = to_float(self, x);
--                        let y = addr_packed(self, first + deriv_regs, k)?;
+-                        let y = addr_val(self, first + spatial + k)?;
 -                        g[3 + k] = to_float(self, y);
-+                        g[k] = grad(self, first, k)?;
-+                        g[3 + k] = grad(self, first + deriv_regs, k)?;
++                        g[k] = grad(self, first + k)?;
++                        g[3 + k] = grad(self, first + spatial + k)?;
                      }
                      args.extend(&os);
                      args.extend(g);
+                     // `_cl`: the least level of detail, after the coordinates.
+-                    let clamp = if name.ends_with("_cl") {
++                    let clamp = if has_cl {
+                         let x = addr_val(self, first + grads + coords)?;
+                         to_float(self, x)
 diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
-index 23c7d93..02b4fac 100644
+index 4e1fb2f..ac8917c 100644
 --- a/crates/victory-shader/src/emit/mod.rs
 +++ b/crates/victory-shader/src/emit/mod.rs
-@@ -85,6 +85,8 @@ mod container;
+@@ -191,4 +191,6 @@ mod diff_tests;
  #[cfg(all(test, windows))]
- mod diff_tests;
- #[cfg(all(test, windows))]
-+mod g16_tests;
+ mod flow_tests;
 +#[cfg(all(test, windows))]
- mod intersect_tests;
++mod g16_tests;
  #[cfg(all(windows, any(test, feature = "host")))]
  pub mod host;
+diff --git a/crates/victory-shader/src/emit/synthetic_tests.rs b/crates/victory-shader/src/emit/synthetic_tests.rs
+index 990a3e5..e8eaf27 100644
+--- a/crates/victory-shader/src/emit/synthetic_tests.rs
++++ b/crates/victory-shader/src/emit/synthetic_tests.rs
+@@ -17,5 +17,5 @@ use crate::{io, ir, resource, structure};
+ /// of the table at s0 (a 2D texture at entry 0, a raw UAV at entry 2); the
+ /// level converted from an integer (so it is whole). Gathers red at the
+-/// level, with the offset, and at level 0 (`lz`) into 12 dwords at lane × 48.
++/// level, with the offset, and at level 0 (`lz`) into 12 dwords at lane Ã— 48.
+ fn program(whole: bool) -> Vec<u32> {
+     let mut w = vec![
+@@ -149,5 +149,5 @@ fn first(u: f32, size: u32) -> i64 {
+ #[test]
+ fn gathers_at_a_level_match_the_hardware() {
+-    // 24×16 then 12×8, 6×4, 3×2; red = level × 1000 + y × 32 + x + 1.
++    // 24Ã—16 then 12Ã—8, 6Ã—4, 3Ã—2; red = level Ã— 1000 + y Ã— 32 + x + 1.
+     let mut texels = Vec::new();
+     for l in 0..4 {
+@@ -208,7 +208,8 @@ fn gathers_at_a_level_match_the_hardware() {
+     let views = [
+         View::Mipped(24, 16, 4, &texels),
++        // The program reads these dwords by byte offset through a raw handle.
+         View::Buffer {
+             data: &input,
+-            stride: Stride::Structured(16),
++            stride: Stride::Raw,
+         },
+         View::RawUav(32 * 12),
+@@ -286,5 +287,5 @@ fn gathers_at_a_level_that_may_be_a_fraction_stop() {
+ #[test]
+ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
+-    // Lanes below 24 run the permute; each reads lane (13 × lane + 5) mod 32
++    // Lanes below 24 run the permute; each reads lane (13 Ã— lane + 5) mod 32
+     // (its address in dwords, offset 20 bytes) of 1000 + lane.
+     let shader = build(&[
+diff --git a/crates/victory-shader/src/emit/valu_tests.rs b/crates/victory-shader/src/emit/valu_tests.rs
+index 3bf9d61..2cb6b1c 100644
+--- a/crates/victory-shader/src/emit/valu_tests.rs
++++ b/crates/victory-shader/src/emit/valu_tests.rs
+@@ -183,9 +183,19 @@ fn run_cases(
+     shader: &HostShader,
+     cases: &[[u32; 4]],
++    check: impl FnMut(&str, usize, [u32; 4], u32),
++) {
++    run_cases_on(shader, cases, &[("hardware", false), ("warp", true)], check);
++}
++
++/// [`run_cases`] on these devices only (label, WARP); at least one must run.
++fn run_cases_on(
++    shader: &HostShader,
++    cases: &[[u32; 4]],
++    devices: &[(&str, bool)],
+     mut check: impl FnMut(&str, usize, [u32; 4], u32),
+ ) {
+     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+     let mut ran = 0;
+-    for (label, warp) in [("hardware", false), ("warp", true)] {
++    for &(label, warp) in devices {
+         let host = match Host::new(warp) {
+             Ok(host) => host,
+@@ -223,5 +233,5 @@ fn run_cases(
+         ran += 1;
+     }
+-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
++    assert!(ran > 0, "no SM 6.6 device of {devices:?} available");
+ }
+
+@@ -402,4 +412,21 @@ fn packed_add_selects_halves_of_inline_constants() {
+ #[test]
+ fn v_med3_f32_matches_rdna2_with_nan() {
++    check_med3_f32(&[("hardware", false), ("warp", true)]);
++}
++
++/// The same cases on the physical adapter alone: `Host::new(false)` takes a
++/// hardware adapter, confirms by the device's LUID that it is not the
++/// software one and prints its model and PCI IDs; no such device fails.
++#[test]
++#[ignore = "requires a physical D3D12 adapter with Shader Model 6.6"]
++fn v_med3_f32_on_physical_adapter() {
++    assert!(
++        !std::env::var("VICTORY_WARP").is_ok_and(|value| value == "1"),
++        "the physical adapter check requires VICTORY_WARP to be disabled"
++    );
++    check_med3_f32(&[("hardware", false)]);
++}
++
++fn check_med3_f32(devices: &[(&str, bool)]) {
+     // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
+     let shader = build_valu_cs(&vop3(0x157, 0, vgpr(1), vgpr(2), vgpr(3)));
+@@ -427,6 +454,9 @@ fn v_med3_f32_matches_rdna2_with_nan() {
+     ];
+
++    assert_eq!(cases.len(), 13);
+     let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+-    run_cases(&shader, &inputs, |backend, i, inp, got| {
++    let mut checked = 0;
++    run_cases_on(&shader, &inputs, devices, |backend, i, inp, got| {
++        checked += 1;
+         let expect = cases[i].1;
+         let got_f = f32::from_bits(got);
+@@ -446,4 +476,6 @@ fn v_med3_f32_matches_rdna2_with_nan() {
+         }
+     });
++    assert_eq!(checked % cases.len(), 0, "a device ran only some cases");
++    assert!(checked > 0, "no case ran");
+ }
+
 diff --git a/crates/victory-shader/src/emit/waterfall_tests.rs b/crates/victory-shader/src/emit/waterfall_tests.rs
-index fb1ff21..9447e0e 100644
+index a226d59..f82234a 100644
 --- a/crates/victory-shader/src/emit/waterfall_tests.rs
 +++ b/crates/victory-shader/src/emit/waterfall_tests.rs
-@@ -102,8 +102,9 @@ fn build_with(words: &[u32], buffers: bool, nonuniform: u32) -> HostShader {
- 
+@@ -102,7 +102,8 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
+
  /// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
- /// hardware GPU and on WARP (each skipped without a device) and returns,
--/// per one that ran, the UAV's 32 dwords.
+-/// hardware GPU and on WARP, returning the UAV's 32 dwords for each device
+-/// that ran. At least one device must produce a readback.
 -fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
-+/// per one that ran, the UAV's dwords. The sampler at index 0 is point
-+/// sampled (mips too), clamped, with no level limit.
++/// hardware GPU and on WARP, returning the UAV's dwords for each device
++/// that ran. At least one device must produce a readback. The sampler at
++/// index 0 is point sampled (mips too), clamped, with no level limit.
 +pub(super) fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
      let samplers = [D3D12_SAMPLER_DESC {
          Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
-         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
 diff --git a/crates/victory-shader/src/gfx10/fields.rs b/crates/victory-shader/src/gfx10/fields.rs
-index 2773b3c..3716424 100644
+index 7420242..a31dab4 100644
 --- a/crates/victory-shader/src/gfx10/fields.rs
 +++ b/crates/victory-shader/src/gfx10/fields.rs
-@@ -155,7 +155,7 @@ pub struct Valu {
-     pub opsel: u8,
-     pub opsel_hi: u8,
-     pub clamp: bool,
--    /// Output modifier: 1 ×2, 2 ×4, 3 ÷2.
-+    /// Output modifier: 1 Ã—2, 2 Ã—4, 3 Ã·2.
-     pub omod: u8,
-     pub sdwa: Option<Sdwa>,
-     pub dpp: Option<Dpp>,
-@@ -771,6 +771,12 @@ fn data_dwords(name: &str) -> u8 {
- 
+@@ -785,4 +785,10 @@ fn data_dwords(name: &str) -> u8 {
  /// Address dwords of an image opcode: offset, bias, compare, derivatives,
  /// coordinates, then LOD/clamp/mip, packed in pairs with `a16`.
 +///
 +/// `_g16` opcodes take 16-bit derivatives whatever `a16` says: dP/dx and
 +/// dP/dy are packed in pairs separately, low half first, so an odd count
-+/// (1D, 3D) pads each of them to a whole dword. With `a16` the derivatives
-+/// of the other opcodes are packed the same way here (unchanged); `a16` alone
-+/// decides the coordinates and LOD/clamp/mip.
++/// (1D, 3D) pads each of them to a whole dword. Ordinary gradient opcodes
++/// keep full-width derivatives (GFX10.3 has G16, so `a16` no longer ties
++/// them). Only coordinates and LOD/clamp/mip follow `a16`.
  fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
      // (coordinates, derivatives per direction) for 1D 2D 3D CUBE 1D_ARRAY
-     // 2D_ARRAY 2D_MSAA 2D_MSAA_ARRAY.
-@@ -792,6 +798,7 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
-         _ => {}
+@@ -806,4 +812,5 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
      }
      let (mut whole, mut derivs, mut packed): (u8, u8, u8) = (0, 0, coords);
 +    let mut g16 = false;
      if let Some(rest) = name
          .strip_prefix("image_sample")
-         .or_else(|| name.strip_prefix("image_gather4"))
-@@ -801,15 +808,170 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
-                 "o" | "b" | "c" => whole += 1,
+@@ -815,4 +822,5 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
                  "d" | "cd" => derivs = grads,
                  "l" | "cl" => packed += 1,
 +                "g16" => g16 = true,
                  _ => {}
              }
-         }
-     } else if name.contains("_mip") {
+@@ -821,8 +829,167 @@ fn image_addr_dwords(name: &str, dim: u8, a16: bool) -> u8 {
          packed += 1;
      }
 -    if a16 {
 -        whole + 2 * derivs.div_ceil(2) + packed.div_ceil(2)
 +    // Per direction: dP/dx, then dP/dy.
-+    let derivs = if a16 || g16 {
++    let derivs = if g16 {
 +        2 * derivs.div_ceil(2)
      } else {
 -        whole + 2 * derivs + packed
@@ -783,14 +849,19 @@ index 2773b3c..3716424 100644
 +    /// (opcode, name, dim, a16, address dwords).
 +    type Case = (u16, &'static str, u8, bool, u8);
 +
-+    /// 32-bit derivatives: the counts before `_g16` was told apart.
++    /// Ordinary gradient opcodes use a VGPR per derivative component, including with a16.
 +    const F32_GRADIENTS: &[Case] = &[
 +        (0x022, "image_sample_d", 0, false, 3),
 +        (0x022, "image_sample_d", 1, false, 6),
 +        (0x022, "image_sample_d", 2, false, 9),
 +        (0x022, "image_sample_d", 3, false, 7),
 +        (0x022, "image_sample_d", 5, false, 7),
-+        (0x022, "image_sample_d", 1, true, 3),
++        (0x022, "image_sample_d", 1, true, 5),
++        (0x022, "image_sample_d", 2, true, 8),
++        (0x022, "image_sample_d", 5, true, 6),
++        (0x023, "image_sample_d_cl", 1, true, 6),
++        (0x023, "image_sample_d_cl", 2, true, 8),
++        (0x03b, "image_sample_c_d_cl_o", 1, true, 8),
 +        (0x023, "image_sample_d_cl", 2, false, 10),
 +        (0x03b, "image_sample_c_d_cl_o", 1, false, 9),
 +        (0x020, "image_sample", 1, false, 2),
@@ -904,7 +975,7 @@ index 2773b3c..3716424 100644
 +    }
 +
 +    #[test]
-+    fn g16_retains_existing_f32_gradient_addresses() {
++    fn g16_and_a16_select_gradient_and_coordinate_widths_independently() {
 +        check(F32_GRADIENTS);
 +    }
 +

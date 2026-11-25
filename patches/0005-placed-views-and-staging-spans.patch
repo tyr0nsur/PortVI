@@ -1,13 +1,11 @@
 diff --git a/crates/victory-gpu/src/descriptor.rs b/crates/victory-gpu/src/descriptor.rs
-index ab2875a..171f92e 100644
+index 22ea4a7..05692e9 100644
 --- a/crates/victory-gpu/src/descriptor.rs
 +++ b/crates/victory-gpu/src/descriptor.rs
-@@ -781,6 +781,24 @@ pub(crate) extern "system" fn create_uav(
-     record(handle, view);
+@@ -469,4 +469,21 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
  }
- 
-+/// Read the fields of a console resource description, keeping its two
-+/// four-byte ABI padding slots zero before descriptor interning and lookup.
+
++/// Read defined resource fields without copying ABI padding into the interned view.
 +fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
 +    if desc.is_null() {
 +        return None;
@@ -24,31 +22,26 @@ index ab2875a..171f92e 100644
 +    Some(fields)
 +}
 +
- /// Device methods 0x230 and 0x238: shader resource and unordered access
- /// views of memory the title placed itself, `(resource desc, view desc,
- /// handle)`.
-@@ -790,7 +808,7 @@ pub(crate) extern "system" fn create_placed_srv(
-     desc: *const [u32; 16],
+ /// Device method.
+ pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
+@@ -508,5 +525,5 @@ pub(crate) extern "system" fn create_placed_srv(
      handle: u64,
  ) {
 -    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
 +    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), words(desc)) {
          record(handle, View::Placed(false, resource, desc));
      }
- }
-@@ -801,7 +819,7 @@ pub(crate) extern "system" fn create_placed_uav(
-     desc: *const [u32; 16],
+@@ -519,5 +536,5 @@ pub(crate) extern "system" fn create_placed_uav(
      handle: u64,
  ) {
 -    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
 +    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), words(desc)) {
          record(handle, View::Placed(true, resource, desc));
      }
- }
-@@ -1088,6 +1106,45 @@ mod tests {
-     /// The leak of run 65: a title that writes constant buffer views and
-     /// views of placed memory at ever new addresses adds nothing to the
-     /// table; one shape stands for all the placed views alike.
+@@ -874,3 +891,42 @@ mod tests {
+         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+     }
++
 +    #[cfg(windows)]
 +    #[test]
 +    fn placed_texture_padding_reuses_the_resource_across_views() {
@@ -87,31 +80,52 @@ index ab2875a..171f92e 100644
 +        wider[4] = 16;
 +        assert_ne!(object(&first), object(&record(&wider, false)));
 +    }
+ }
+diff --git a/crates/victory-gpu/src/texture.rs b/crates/victory-gpu/src/texture.rs
+index 9b3d38e..af1242c 100644
+--- a/crates/victory-gpu/src/texture.rs
++++ b/crates/victory-gpu/src/texture.rs
+@@ -241,5 +241,5 @@ fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &S
+             // SAFETY: live resources.
+             let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
+-            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
++            let len = subresource_len(footprint.Offset, f.RowPitch as usize, staging.rows[i], f.Depth, staging.size) as u64;
+             list.note_read(
+                 || {
+@@ -521,3 +521,36 @@ mod tests {
+         unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+     }
 +
-     #[test]
-     fn views_at_new_addresses_add_no_entries() {
-         if !inline() {
-@@ -1097,7 +1154,9 @@ mod tests {
-         let slots = [0u64; 4];
-         let at = slots.as_ptr() as u64;
-         // A resource description and a view no other test uses.
--        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
-+        let mut resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
-+        resource[1] = 0;
-+        resource[13] = 0;
-         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
-         let mine = |v: &View| match v {
-             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
-diff --git a/crates/victory-gpu/src/resource.rs b/crates/victory-gpu/src/resource.rs
-index bda712c..4e066d3 100644
---- a/crates/victory-gpu/src/resource.rs
-+++ b/crates/victory-gpu/src/resource.rs
-@@ -108,6 +108,8 @@ pub(crate) struct AllocationInfo {
- const _: () = assert!(size_of::<HeapProperties>() == 20);
- const _: () = assert!(size_of::<HeapDesc>() == 48);
- const _: () = assert!(size_of::<ResourceDesc>() == 56);
-+const _: () = assert!(std::mem::offset_of!(ResourceDesc, alignment) == 8);
-+const _: () = assert!(std::mem::offset_of!(ResourceDesc, flags) == 48);
- 
- const BUFFER: u32 = 1;
- const TEXTURE_3D: u32 = 4;
++    #[test]
++    fn a_bc4_mip_uses_only_the_bytes_in_its_upload_footprint() {
++        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_BC4_UNORM, DXGI_SAMPLE_DESC};
++        let host = host().expect("D3D12 device for texture footprints");
++        let desc = D3D12_RESOURCE_DESC {
++            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
++            Width: 8, Height: 4, DepthOrArraySize: 1, MipLevels: 2, Format: DXGI_FORMAT_BC4_UNORM,
++            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
++            ..Default::default()
++        };
++        let mut footprints = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 2];
++        let mut rows = [0; 2];
++        let mut row_bytes = [0; 2];
++        let mut total = 0;
++        // SAFETY: one output for each of the two described subresources.
++        unsafe {
++            host.device.GetCopyableFootprints(&desc, 0, 2, 0, Some(footprints.as_mut_ptr()),
++                Some(rows.as_mut_ptr()), Some(row_bytes.as_mut_ptr()), Some(&mut total));
++        }
++        assert_eq!(row_bytes, [16, 8]);
++        assert_eq!(rows, [1, 1]);
++        assert_eq!(total - footprints[1].Offset, 8);
++        assert_eq!(footprints[1].Footprint.RowPitch, 256);
++        let f = footprints[1];
++        let native = subresource_len(f.Offset, f.Footprint.RowPitch as usize, rows[1], f.Footprint.Depth, total);
++        let mut upload = vec![0x91; total as usize];
++        let second = f.Offset as usize;
++        assert_eq!(native, 8);
++        upload[second..second + native].fill(0xbe);
++        assert!(upload[..second].iter().all(|&x| x == 0x91));
++        assert_eq!(&upload[second..], &[0xbe; 8]);
++    }
+ }

@@ -1,0 +1,57 @@
+diff --git a/crates/victory-gpu/src/watch.rs b/crates/victory-gpu/src/watch.rs
+index df74cc0..e6a33df 100644
+--- a/crates/victory-gpu/src/watch.rs
++++ b/crates/victory-gpu/src/watch.rs
+@@ -518,4 +518,7 @@ pub struct Writing {
+ impl Drop for Writing {
+     fn drop(&mut self) {
++        if self.first == self.last {
++            return;
++        }
+         let mut g = guards();
+         if let Some(i) = g.busy.iter().position(|&r| r == (self.first, self.last)) {
+@@ -533,4 +536,7 @@ impl Drop for Writing {
+ /// memory and DirectStorage's writes to addresses.
+ pub fn writing(at: usize, len: usize) -> Writing {
++    if len == 0 {
++        return Writing { first: 0, last: 0 };
++    }
+     // The length is the title's (`fread`'s size times count, saturated).
+     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+@@ -544,4 +550,7 @@ pub fn writing(at: usize, len: usize) -> Writing {
+ /// shows is new, and read-write.
+ pub fn title_memory_remapped(at: usize, len: usize) {
++    if len == 0 {
++        return;
++    }
+     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+     let mut g = guards();
+@@ -678,4 +687,28 @@ pub(crate) mod tests {
+     }
+
++    #[test]
++    fn empty_writes_and_remaps_leave_a_clean_page_and_its_alias_untouched() {
++        let a = pool(1);
++        let b = pool(1);
++        title_memory_aliased(a, &[b]);
++        let copy = track(b, PAGE, true).expect("tracked pool");
++        assert_eq!(copy.take(b, b + PAGE), [(b, b + PAGE)]);
++        {
++            let _empty = writing(a + 1, 0);
++            assert!(copy.take(b, b + PAGE).is_empty());
++        }
++        assert!(copy.take(b, b + PAGE).is_empty());
++        title_memory_remapped(a + 1, 0);
++        assert!(copy.take(b, b + PAGE).is_empty());
++
++        // A subsequent real write still reaches the alias.
++        drop(writing(a + 1, 1));
++        assert_eq!(copy.take(b, b + PAGE), [(b, b + PAGE)]);
++        drop(copy);
++        title_memory_remapped(a, PAGE);
++        free(a);
++        free(b);
++    }
++
+     /// Everything is changed at first; after taking, only what is written
+     /// (by faults, or reported) is, and every tracker of a page sees it.
