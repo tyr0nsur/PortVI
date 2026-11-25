@@ -1058,7 +1058,7 @@ index 9d891ec847819d6b78daf09425872f915858c8cd..ec0d6f1b9bfdd50c98930478511e86ed
      Ok(HostShader {
          stage: HwStage::Cs,
 diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
-index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca757a31c0d1 100644
+index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d742241e754952 100644
 --- a/crates/victory-shader/src/emit/lower.rs
 +++ b/crates/victory-shader/src/emit/lower.rs
 @@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
@@ -1137,15 +1137,18 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca75
          if let StageIo::Cs(cs) = x.native.io {
              s.threads = Some(cs.threads);
              s.lds_dwords = cs.lds_bytes() / 4;
-@@ -645,6 +666,7 @@ impl<'a> Lower<'a> {
+@@ -645,6 +666,10 @@ impl<'a> Lower<'a> {
                  n.starts_with("ds_swizzle")
                      || n.contains("permute")
                      || n.starts_with("v_mbcnt")
-+                    || (x.native.wave64 && n == "v_readfirstlane_b32")
++                    // A parsed descriptor waterfall uses the lane's own value.
++                    // It never performs a first-lane read on the host.
++                    || (x.native.wave64 && n == "v_readfirstlane_b32"
++                        && !i.writes.first().is_some_and(|w| x.res.waterfall.reads.contains(&w.1)))
                      || matches!(n, "v_readlane_b32" | "v_writelane_b32" | "v_permlane16_b32" | "v_permlanex16_b32")
                      || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                      || reads_mask_as_data(x.st, i)
-@@ -714,9 +736,15 @@ impl<'a> Lower<'a> {
+@@ -714,9 +739,15 @@ impl<'a> Lower<'a> {
                      needs_console
                  };
              let wave = if x.native.wave64 { 64 } else { 32 };
@@ -1164,7 +1167,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca75
              }
          }
          let mut no_barrier = HashSet::new();
-@@ -816,6 +844,10 @@ impl<'a> Lower<'a> {
+@@ -816,6 +847,10 @@ impl<'a> Lower<'a> {
              heap: [false; 2],
              src0: None,
              console_lanes,
@@ -1175,7 +1178,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca75
              pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                  if db_shader_control & 1 << 16 != 0),
              root_memory,
-@@ -1263,6 +1295,7 @@ impl<'a> Lower<'a> {
+@@ -1263,6 +1298,7 @@ impl<'a> Lower<'a> {
      /// expanded gives on that wave.
      fn shape(&mut self, shape: super::wave::Shape) -> Result<V, Why> {
          use super::wave::{Op, Shape};
@@ -1183,7 +1186,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca75
          let (op, src, mask, ident, prefix) = match shape {
              Shape::K(k) => return Ok(self.s.m.i32(k)),
              Shape::Value(v) => return self.i32_of(v),
-@@ -1283,6 +1316,7 @@ impl<'a> Lower<'a> {
+@@ -1283,6 +1319,7 @@ impl<'a> Lower<'a> {
              Shape::Prefix(op, src, mask, ident, inclusive) => {
                  (op, src, mask, ident, Some(inclusive))
              }
@@ -1191,7 +1194,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca75
              Shape::Half(_, src, mask, ident, hi) => {
                  // The high half is a console lane's: compute only.
                  if self.mask_data != MaskData::Console {
-@@ -1352,6 +1386,7 @@ impl<'a> Lower<'a> {
+@@ -1352,6 +1389,7 @@ impl<'a> Lower<'a> {
          {
              return Err("a wave reduction in a mesh shader");
          }
@@ -1199,7 +1202,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca75
          let c = self.cur;
          let &m = self
              .x
-@@ -1445,6 +1480,9 @@ impl<'a> Lower<'a> {
+@@ -1445,6 +1483,9 @@ impl<'a> Lower<'a> {
              }
          }
          self.cur = self.s.entry;
@@ -1209,7 +1212,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca75
          self.find_sections();
          self.inputs()?;
          if let Some(mesh) = self.s.mesh {
-@@ -1535,6 +1573,8 @@ impl<'a> Lower<'a> {
+@@ -1535,6 +1576,8 @@ impl<'a> Lower<'a> {
              wave_ops: self.s.flags & flags::WAVE_OPS != 0,
              #[cfg(test)]
              rovs: self.s.flags & flags::ROVS != 0,
@@ -1218,7 +1221,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca75
              dxil: self.s.finish(),
              user_data,
              samplers: self.samplers,
-@@ -1955,6 +1995,7 @@ impl<'a> Lower<'a> {
+@@ -1955,6 +1998,7 @@ impl<'a> Lower<'a> {
                      Some(&b) if b == self.cur_ir => self.cur,
                      Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
                  };
@@ -1226,7 +1229,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca75
                  if !self.balloting.insert(lo) {
                      return Err("a lane mask whose lanes depend on its own value");
                  }
-@@ -2712,17 +2753,21 @@ impl<'a> Lower<'a> {
+@@ -2712,17 +2756,21 @@ impl<'a> Lower<'a> {
          self.s.m.bin(c, Bin::Shl, byte, three)
      }
  
@@ -1257,7 +1260,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca75
          let (k31, k32, one, z) = (
              self.s.m.i32(31),
              self.s.m.i32(32),
-@@ -2949,36 +2994,16 @@ impl<'a> Lower<'a> {
+@@ -2949,36 +2997,16 @@ impl<'a> Lower<'a> {
      /// thread is relabelled so that its host lane is its console lane: the
      /// flat id is the wave's first lane's, rounded down to the wave size,
      /// plus the lane index. (A bijection while each host wave holds a
@@ -1298,7 +1301,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca75
          let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
          Val::I32(match c {
              0 => self.s.m.bin(e, Bin::URem, f, xk),
-@@ -3235,7 +3260,7 @@ impl<'a> Lower<'a> {
+@@ -3235,7 +3263,7 @@ impl<'a> Lower<'a> {
              let a = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
              let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
              let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -1307,7 +1310,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca75
              let at = self.s.m.bin(c, Bin::Add, a, o);
              let lane = self.s.m.bin(c, Bin::LShr, at, two);
              let lane = self.s.m.bin(c, Bin::And, lane, last);
-@@ -5868,7 +5893,7 @@ impl<'a> Lower<'a> {
+@@ -5868,7 +5896,7 @@ impl<'a> Lower<'a> {
              };
              self.src0 = Some(x);
          }
@@ -1316,7 +1319,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca75
          self.src0 = None;
          r
      }
-@@ -5979,9 +6004,15 @@ impl<'a> Lower<'a> {
+@@ -5979,9 +6007,15 @@ impl<'a> Lower<'a> {
              }
          }
          if let Some((rows, banks)) = masks {
@@ -1334,7 +1337,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca75
              let ri = self.s.m.bin(c, Bin::And, ri, three);
              let bi = self.s.m.bin(c, Bin::LShr, lane, two);
              let bi = self.s.m.bin(c, Bin::And, bi, three);
-@@ -6000,7 +6031,7 @@ impl<'a> Lower<'a> {
+@@ -6000,7 +6034,7 @@ impl<'a> Lower<'a> {
          Ok((r, enable))
      }
  
@@ -1343,7 +1346,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca75
          let Fields::Valu(v) = &inst.fields else {
              unreachable!()
          };
-@@ -6692,6 +6723,9 @@ impl<'a> Lower<'a> {
+@@ -6692,6 +6726,9 @@ impl<'a> Lower<'a> {
                      self.s.flags |= flags::WAVE_OPS;
                  } else {
                      self.cross_lane(false)?;
@@ -1353,7 +1356,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca75
                  }
                  let r = self.read_lane(a, lane);
                  int(self, r)
-@@ -6707,96 +6741,12 @@ impl<'a> Lower<'a> {
+@@ -6707,96 +6744,12 @@ impl<'a> Lower<'a> {
                      None => self.s.m.i32(0),
                  };
                  self.cross_lane(false)?;
@@ -1452,7 +1455,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca75
              "v_readfirstlane_b32"
                  if inst
                      .writes
-@@ -6808,7 +6758,25 @@ impl<'a> Lower<'a> {
+@@ -6808,7 +6761,25 @@ impl<'a> Lower<'a> {
                  int(self, a)
              }
              "v_readfirstlane_b32" => {
@@ -1478,7 +1481,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca75
                  self.s.flags |= flags::WAVE_OPS;
                  let r = self.s.op(
                      c,
-@@ -7902,7 +7870,7 @@ impl<'a> Lower<'a> {
+@@ -7902,7 +7873,7 @@ impl<'a> Lower<'a> {
                  } else if self.s.mesh.is_none() {
                      self.cross_lane(false)?;
                  }
@@ -1487,7 +1490,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca75
                  let below = if name == "v_mbcnt_lo_u32_b32" {
                      lane
                  } else {
-@@ -11115,6 +11083,7 @@ mod tests {
+@@ -11115,6 +11086,7 @@ mod tests {
              outputs: vec![],
              prims: vec![],
              mesh_stride: 0,
@@ -1495,7 +1498,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca75
              view_marks: false,
          })
          .map(|_| ())
-@@ -11165,6 +11134,7 @@ mod tests {
+@@ -11165,6 +11137,7 @@ mod tests {
              outputs: vec![],
              prims: vec![],
              mesh_stride: 0,
@@ -1503,7 +1506,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca75
              view_marks: false,
          })
      }
-@@ -11311,6 +11281,7 @@ mod tests {
+@@ -11311,6 +11284,7 @@ mod tests {
              prims: vec![],
              mesh_stride: 0,
              view_marks: false,
@@ -1511,7 +1514,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..790163073d7082fed2d69f72feb1ca75
          })
      }
  
-@@ -11500,6 +11471,7 @@ mod tests {
+@@ -11500,6 +11474,7 @@ mod tests {
              outputs: vec![],
              prims: vec![],
              mesh_stride: 0,
