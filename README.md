@@ -33,11 +33,13 @@ The two shader cards track one instruction, `v_med3_f32`. Each card links to its
 </p>
 <!-- verification:end -->
 
-**Windows regression run** · 131 passed and one upstream GPU-library benchmark was ignored. The native loader probe ran separately and returned its expected exit marker of `73`. The hardware run matched all 13 `v_med3_f32` cases on an NVIDIA GeForce RTX 4060 with driver `32.0.16.2114`. [Test breakdown](docs/engineering-review.md#reproduced-on-this-revision)
+**Windows regression run** · 142 passed and one upstream GPU-library benchmark was ignored. The native loader probe ran separately and returned its expected exit marker of `73`. The hardware run matched all 13 `v_med3_f32` cases on an NVIDIA GeForce RTX 4060 with driver `32.0.16.2114`. [Test breakdown](docs/engineering-review.md#reproduced-on-this-revision)
+
+**Texture streaming** · A completed DirectStorage write now requeues overlapping texture views. Index-selected textures also get five checks for late writes from other sources. A regression covers a write that finishes after the renderer has already consumed the first notification. [Streaming tests and limits](docs/engineering-review.md#upstream-integration-on-25-november)
 
 **Frame pacing** · The first scene benchmark needs paired 120-second captures with cold and warm caches. Stable 30 FPS remains unmeasured. [Capture protocol](docs/engineering-review.md#measuring-a-30-fps-target)
 
-**Shader cache** · Two regression tests caught stale translations being reused after a configuration change. PortVI now keys the cache on translation settings, GPU wave width and descriptor limits. [Fixes and reproductions](docs/engineering-review.md#reproduced-on-this-revision)
+**Shader cache** · PortVI keys translations on shader settings, GPU wave width and descriptor limits. A shader that translates successfully can now run even when Windows refuses the cache write. [Fixes and reproductions](docs/engineering-review.md#reproduced-on-this-revision)
 
 ## Build and run
 
@@ -89,7 +91,7 @@ The `engine` submodule pins the upstream revision. `prepare` prints the path of 
 
 ```powershell
 $source = python portvi.py prepare
-$patchPath = Join-Path $PWD 'patches/0007-description.patch'
+$patchPath = Join-Path $PWD 'patches/0012-description.patch'
 git -C $source diff --output=$patchPath
 python portvi.py test
 ```

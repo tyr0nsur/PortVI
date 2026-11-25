@@ -1,0 +1,57 @@
+diff --git a/crates/victory-gpu/src/device.rs b/crates/victory-gpu/src/device.rs
+index 3b19f53..a7c3257 100644
+--- a/crates/victory-gpu/src/device.rs
++++ b/crates/victory-gpu/src/device.rs
+@@ -399,6 +399,18 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
+     E_NOTIMPL
+ }
+ 
++/// The host device's state: the console's device is removed when the host's is.
++extern "system" fn removed_reason(_: This) -> HRESULT {
++    #[cfg(windows)]
++    if let Some(host) = crate::host::host() {
++        // SAFETY: a plain query.
++        if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
++            return e.code().0;
++        }
++    }
++    S_OK
++}
++
+ /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
+ /// methods `ID3D12Device1` to `ID3D12Device8` add, in order: 3, 1, 3, 6, 9,
+ /// 1, 2, 9 (0x298-0x3a0, the console's own among them), then those of
+@@ -431,6 +443,7 @@ static FUNCTIONS: Table<160> = {
+     f[28] = resource::create_heap as *const (); // 0xe0
+     f[29] = resource::create_placed as *const (); // 0xe8
+     f[36] = fence::create as *const (); // 0x120
++    f[37] = removed_reason as *const (); // 0x128
+     f[38] = resource::copyable_footprints as *const (); // 0x130
+     f[39] = query::create as *const (); // 0x138
+     f[41] = signature::create as *const (); // 0x148
+@@ -584,4 +597,25 @@ mod tests {
+         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
+         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+     }
++
++    /// Slot 0x128 reports the host device's state: `S_OK` without a host
++    /// (the headless fallback), and the host's own removal reason with one.
++    #[test]
++    fn a_healthy_device_reports_no_removal() {
++        let device = device();
++        let reason = slot::<extern "system" fn(This) -> HRESULT>(device, 0x128);
++        #[cfg(windows)]
++        let expected = match crate::host::host() {
++            // SAFETY: a plain query; removal is permanent, so the answer
++            // cannot change from failure back to success between calls.
++            Some(host) => match unsafe { host.device.GetDeviceRemovedReason() } {
++                Ok(()) => S_OK,
++                Err(e) => e.code().0,
++            },
++            None => S_OK,
++        };
++        #[cfg(not(windows))]
++        let expected = S_OK;
++        assert_eq!(reason(device), expected);
++    }
+ }

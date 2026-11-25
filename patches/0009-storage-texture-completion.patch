@@ -1,0 +1,137 @@
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index 94ab554..fffa66f 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -2509,6 +2509,38 @@ mod tests {
+         // A wider texture written at the same address: slot 1 is stale.
+         assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), false), [1]);
+         assert_eq!(slots(u64::MAX), [2]);
++
++        // A virtual storage write may finish after the pre-write event has been drained.
++        // Pick an interior byte outside every fingerprint window of this BC7 texture.
++        let resource = [3, 0, 0, 0, 512, 0, 512, 0x1_0001, 98, 1, 0, 0x105, 0, 0];
++        let bytes = crate::resource::placed_bytes(&resource).unwrap();
++        assert!(bytes >= 128 << 10);
++        let mut data = vec![0u8; bytes as usize];
++        let base = data.as_ptr() as u64;
++        let offset = 32 << 10;
++        let mut desc = [0; 16];
++        (desc[10], desc[11]) = (base as u32, (base >> 32) as u32);
++        heap.note_buffer(5, Some(&View::Placed(false, resource, desc)), false);
++        let generation = |frame| heap.texture_slots_due(frame, 8).0.into_iter().find(|(slot, _)| *slot == 5);
++        let initial = generation(u64::MAX).unwrap().1;
++        heap.texture_slot_done(5, initial, None);
++        let original = crate::texture::fingerprint(base, bytes);
++        let address = data[offset..].as_ptr() as usize;
++        crate::watch::writing(address, 1);
++        assert_eq!(heap.texture_slots_remapped(60), 1);
++        let pre_write = generation(61).unwrap().1;
++        heap.texture_slot_done(5, pre_write, None);
++        assert!(generation(u64::MAX).is_none());
++
++        data[offset] = 0x71;
++        assert_eq!(crate::texture::fingerprint(base, bytes), original);
++        crate::title_texture_written(address, 1);
++        assert_eq!(heap.texture_slots_remapped(62), 1);
++        assert!(generation(62).is_none());
++        let completed = generation(63).unwrap().1;
++        assert_ne!(completed, pre_write);
++        heap.texture_slot_done(5, pre_write, None);
++        assert_eq!(generation(63), Some((5, completed)));
+     }
+ 
+     /// A slot a draw read through a table leaves the queue; the title's
+diff --git a/crates/victory-gpu/src/lib.rs b/crates/victory-gpu/src/lib.rs
+index db53f11..33cfe94 100644
+--- a/crates/victory-gpu/src/lib.rs
++++ b/crates/victory-gpu/src/lib.rs
+@@ -64,3 +64,11 @@ pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view}
+ pub use watch::{
+     title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,
+ };
++
++/// Queue placed texture views overlapping a completed write to a title virtual address.
++#[cfg(windows)]
++pub fn title_texture_written(address: usize, bytes: usize) {
++    if bytes != 0 {
++        descriptor::host::remapped(address, bytes);
++    }
++}
+diff --git a/crates/victory-hle/src/modules/dstorage.rs b/crates/victory-hle/src/modules/dstorage.rs
+index 324db9e..bc77285 100644
+--- a/crates/victory-hle/src/modules/dstorage.rs
++++ b/crates/victory-hle/src/modules/dstorage.rs
+@@ -343,7 +343,7 @@ struct Lanes {
+     staging: u64,
+     /// A start waited for staging space since the last finish.
+     starved: bool,
+-    /// Weighted round robin: each class's virtual time (bytes × cost), and
++    /// Weighted round robin: each class's virtual time (bytes Ã— cost), and
+     /// the time of the last start; within a class, the lane clock of the
+     /// last start.
+     clock: [u64; 3],
+@@ -938,6 +938,21 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
+     result
+ }
+ 
++/// Publish only the bytes a successful virtual write produced. A render pass
++/// can consume the pre-write notification while a read or inflate is in flight.
++fn fill_virtual(
++    out: &mut [u8],
++    fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
++    completed: impl FnOnce(&[u8]),
++) -> Result<(), HRESULT> {
++    let n = fill(out)?;
++    let written = out.get(..n).ok_or(E_INVALIDARG)?;
++    if !written.is_empty() {
++        completed(written);
++    }
++    Ok(())
++}
++
+ /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
+ /// many it produced. GPU-visible destinations are host memory like the
+ /// rest (GPU address = CPU address), so an address is written in place;
+@@ -955,7 +970,9 @@ fn into_destination(
+         // SAFETY: the title's destination holds `destination_size` bytes, at
+         // least `len`, and nothing else writes it until completion.
+         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
+-        return fill(out).map(drop);
++        return fill_virtual(out, fill, |written| {
++            victory_gpu::title_texture_written(written.as_ptr() as usize, written.len());
++        });
+     }
+     let offset = (request.page_offset & 0xffff) as usize;
+     // SAFETY: the title passes a page number per 64 KiB of destination,
+@@ -1362,6 +1379,31 @@ mod tests {
+         assert_eq!(results(), (INVALID_DATA, S_OK));
+     }
+ 
++    #[test]
++    fn a_short_inflate_publishes_only_completed_virtual_bytes() {
++        let expected = bc4_blocks();
++        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&expected, 6);
++        let mut out = [0xa5; 32];
++        let address = out.as_ptr();
++        let mut calls = 0;
++        let result = fill_virtual(&mut out, |bytes| inflate(&packed, bytes), |written| {
++            calls += 1;
++            assert_eq!(written.as_ptr(), address);
++            assert_eq!(written, expected);
++        });
++        assert_eq!(result, Ok(()));
++        assert_eq!(calls, 1);
++        assert_eq!(&out[expected.len()..], &[0xa5; 16]);
++    }
++
++    #[test]
++    fn failed_and_empty_virtual_writes_publish_no_completion() {
++        let mut out = [0xa5; 16];
++        assert_eq!(fill_virtual(&mut out, |bytes| inflate(&[0xff; 4], bytes), |_| panic!()), Err(INVALID_DATA));
++        assert_eq!(fill_virtual(&mut out, |_| Ok(0), |_| panic!()), Ok(()));
++        assert_eq!(fill_virtual(&mut out, |_| Ok(17), |_| panic!()), Err(E_INVALIDARG));
++    }
++
+     #[test]
+     fn zlib_then_bcpack() {
+         with_test_tables();
