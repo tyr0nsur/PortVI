@@ -103,7 +103,7 @@ def smoke(executable, rustc, version, env):
             cwd=folder, capture_output=True, text=True, errors="replace", timeout=45,
         )
         print(result.stdout, end="")
-        if result.returncode or "title exited with 73" not in result.stdout.splitlines():
+        if result.returncode != 73 or "title exited with 73" not in result.stdout.splitlines():
             sys.stderr.write(result.stderr)
             raise RuntimeError(f"Native probe did not return its success marker (host exit {result.returncode}).")
         print("PASS: source-built x64 probe called XGameRuntimeInitialize and returned 73.")
@@ -146,14 +146,8 @@ def main():
     if args.action == "test":
         subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tools"],
                        cwd=ROOT, check=True)
-        for package_args in (
-            ["-p", "victory-gpu", "--lib", "--", "--test-threads=1"],
-            ["-p", "victory-shader", "--features", "host", "--lib", "g16", "--", "--test-threads=1"],
-            ["-p", "victory-loader", "--test", "load_probe"],
-            ["-p", "victory-hle", "--lib", "modules::dstorage::tests"],
-        ):
-            subprocess.run([cargo, version, "test", "--locked", *package_args],
-                           cwd=source, env=env, check=True)
+        subprocess.run([cargo, version, "test", "--workspace", "--locked", "--", "--test-threads=1"],
+                       cwd=source, env=env, check=True)
         return
     subprocess.run([cargo, version, "build", "--release", "--locked", "-p", "victory", "--bin", "portvi"],
                    cwd=source, env=env, check=True)

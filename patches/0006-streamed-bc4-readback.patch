@@ -1,22 +1,26 @@
 diff --git a/crates/victory-gpu/Cargo.toml b/crates/victory-gpu/Cargo.toml
-index a24dd1a..eb6ea1d 100644
+index f1cb0d6..af488f1 100644
 --- a/crates/victory-gpu/Cargo.toml
 +++ b/crates/victory-gpu/Cargo.toml
-@@ -20,6 +20,8 @@ victory-shader.workspace = true
- tempfile.workspace = true
- 
+@@ -21,4 +21,6 @@ tempfile.workspace = true
+
  [features]
-+# Expose the end-to-end texture fixture to the storage crate’s tests.
++# Expose the end-to-end texture fixture to the storage crate's tests.
 +texture-probe = []
  # Debugging switches (frame capture, the host debug layer, per-draw data).
  diagnostics = []
- 
 diff --git a/crates/victory-gpu/src/resource.rs b/crates/victory-gpu/src/resource.rs
-index 3516a8f..bda712c 100644
+index 89417d1..dfd18fe 100644
 --- a/crates/victory-gpu/src/resource.rs
 +++ b/crates/victory-gpu/src/resource.rs
-@@ -3414,3 +3414,7 @@ float4 lit() : SV_Target { return 1.0; }
-         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+@@ -109,4 +109,6 @@ const _: () = assert!(size_of::<HeapProperties>() == 20);
+ const _: () = assert!(size_of::<HeapDesc>() == 48);
+ const _: () = assert!(size_of::<ResourceDesc>() == 56);
++const _: () = assert!(std::mem::offset_of!(ResourceDesc, alignment) == 8);
++const _: () = assert!(std::mem::offset_of!(ResourceDesc, flags) == 48);
+
+ const BUFFER: u32 = 1;
+@@ -2443,2 +2445,6 @@ mod tests {
      }
  }
 +
@@ -25,11 +29,16 @@ index 3516a8f..bda712c 100644
 +pub mod bc4_probe;
 diff --git a/crates/victory-gpu/src/resource_bc4_probe.rs b/crates/victory-gpu/src/resource_bc4_probe.rs
 new file mode 100644
-index 0000000..70de288
+index 0000000..ec01a93
 --- /dev/null
 +++ b/crates/victory-gpu/src/resource_bc4_probe.rs
-@@ -0,0 +1,281 @@
+@@ -0,0 +1,372 @@
 +//! GPU half of the source-authored DirectStorage fixture, enabled only for tests.
++//!
++//! The upload goes through the production path heap-indexing shaders use
++//! ([`crate::texture::upload_changed`]): the staging buffer is detiled from
++//! title memory only when [`crate::watch`] (or, for memory it does not track,
++//! the content hash) reports a change, and its copy is recorded right away.
 +
 +use super::{
 +    HeapProperties, RESOURCE_IIDS, ResourceDesc, create_committed, host_resource, resource_release,
@@ -38,10 +47,12 @@ index 0000000..70de288
 +use crate::host::{self, Host};
 +use crate::object::{S_OK, This};
 +use std::ptr::null;
++use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
++use windows::Win32::Graphics::Direct3D::ID3DBlob;
 +use windows::Win32::Graphics::Direct3D12::*;
-+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_BC4_UNORM;
++use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_BC4_UNORM, DXGI_SAMPLE_DESC};
 +use windows::Win32::Graphics::Dxgi::*;
-+use windows::core::s;
++use windows::core::{Interface, s};
 +
 +const TEXELS: usize = 8 * 4;
 +const OUTPUT_BYTES: u64 = (TEXELS * size_of::<f32>()) as u64;
@@ -65,6 +76,67 @@ index 0000000..70de288
 +    }
 +}
 +
++/// The probe shader's bytecode, its root signature inside.
++fn compile() -> Vec<u8> {
++    let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
++    // SAFETY: the source and names outlive the call; out pointers are ours.
++    let compiled = unsafe {
++        D3DCompile(
++            PROBE_SHADER.as_ptr().cast(),
++            PROBE_SHADER.len(),
++            s!("bc4_probe"),
++            None,
++            None,
++            s!("main"),
++            s!("cs_5_1"),
++            0,
++            0,
++            &mut code,
++            Some(&mut errors),
++        )
++    };
++    let text = |b: &ID3DBlob| {
++        // SAFETY: the blob's own bytes.
++        let bytes = unsafe { std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize()) };
++        bytes.to_vec()
++    };
++    if let Err(e) = compiled {
++        let log = errors.as_ref().map(text).unwrap_or_default();
++        panic!("compile BC4 sampler: {e}: {}", String::from_utf8_lossy(&log));
++    }
++    text(&code.expect("BC4 sampler bytecode"))
++}
++
++/// A committed buffer of `size` bytes in `kind`'s heap, in `state`.
++fn buffer(
++    host: &Host,
++    size: u64,
++    kind: D3D12_HEAP_TYPE,
++    flags: D3D12_RESOURCE_FLAGS,
++    state: D3D12_RESOURCE_STATES,
++) -> ID3D12Resource {
++    let heap = D3D12_HEAP_PROPERTIES { Type: kind, ..Default::default() };
++    let desc = D3D12_RESOURCE_DESC {
++        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
++        Width: size,
++        Height: 1,
++        DepthOrArraySize: 1,
++        MipLevels: 1,
++        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
++        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
++        Flags: flags,
++        ..Default::default()
++    };
++    let mut made: Option<ID3D12Resource> = None;
++    // SAFETY: plain creation with valid descriptions.
++    unsafe {
++        host.device
++            .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut made)
++            .expect("BC4 probe buffer");
++    }
++    made.expect("BC4 probe buffer")
++}
++
 +struct Sampler {
 +    root: ID3D12RootSignature,
 +    pipeline: ID3D12PipelineState,
@@ -75,8 +147,7 @@ index 0000000..70de288
 +
 +impl Sampler {
 +    fn new(host: &Host, image: &ID3D12Resource) -> Self {
-+        let code =
-+            host::compile(PROBE_SHADER, s!("main"), s!("cs_5_1")).expect("compile BC4 sampler");
++        let code = compile();
 +        // SAFETY: the bytecode contains the root signature. All borrowed COM
 +        // references and the shader bytes outlive pipeline and view creation.
 +        let (root, pipeline, views) = unsafe {
@@ -112,10 +183,20 @@ index 0000000..70de288
 +            root,
 +            pipeline,
 +            views,
-+            output: host.uav_buffer(OUTPUT_BYTES).expect("BC4 sample buffer"),
-+            readback: host
-+                .read_back_buffer(OUTPUT_BYTES)
-+                .expect("BC4 readback buffer"),
++            output: buffer(
++                host,
++                OUTPUT_BYTES,
++                D3D12_HEAP_TYPE_DEFAULT,
++                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
++                D3D12_RESOURCE_STATE_COMMON,
++            ),
++            readback: buffer(
++                host,
++                OUTPUT_BYTES,
++                D3D12_HEAP_TYPE_READBACK,
++                D3D12_RESOURCE_FLAG_NONE,
++                D3D12_RESOURCE_STATE_COPY_DEST,
++            ),
 +        }
 +    }
 +
@@ -123,14 +204,13 @@ index 0000000..70de288
 +        let list = host.new_list().expect("BC4 command list");
 +        let image = host_resource(texture.0).unwrap();
 +        if upload {
-+            crate::texture::upload(&list, texture.0, image);
-+            // Indexed uploads retire their staging entry after recording. The
-+            // list retains the allocation until its deferred refresh completes.
++            // The production path refreshes the staging buffer now and
++            // records its copy only if the watched memory (or its hash)
++            // changed; the list keeps the staging buffer until it is reset.
 +            assert!(
-+                crate::texture::is_staged(texture.0),
-+                "runtime recorded the upload"
++                crate::texture::upload_changed(&list, texture.0, image),
++                "the changed title memory was not uploaded"
 +            );
-+            crate::texture::unstage(texture.0);
 +        }
 +        crate::list::ensure_state(
 +            &list,
@@ -193,15 +273,19 @@ index 0000000..70de288
 +
 +/// Exercise the production texture upload on the host device. The storage
 +/// callback receives the two adjacent blocks in the console texture itself.
++/// The device is whichever `host::host` made (the default adapter, or WARP
++/// where a diagnostics build asks for it); `require_hardware` rejects a
++/// software adapter.
 +pub fn run(fill: impl FnOnce(&mut [u8; 16]), require_hardware: bool) {
 +    let host = host::host().expect("the BC4 probe needs a D3D12 device");
 +    // SAFETY: query the adapter belonging to the actual rendering device.
-+    let info = unsafe {
++    let (info, driver) = unsafe {
 +        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
 +        let adapter: IDXGIAdapter1 = factory
 +            .EnumAdapterByLuid(host.device.GetAdapterLuid())
 +            .unwrap();
-+        adapter.GetDesc1().unwrap()
++        let driver = adapter.CheckInterfaceSupport(&IDXGIDevice::IID).ok();
++        (adapter.GetDesc1().unwrap(), driver)
 +    };
 +    let software = (info.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0
 +        || (info.VendorId, info.DeviceId) == (0x1414, 0x8c);
@@ -214,11 +298,20 @@ index 0000000..70de288
 +        .iter()
 +        .position(|&v| v == 0)
 +        .unwrap_or(info.Description.len());
++    let driver = driver.map_or_else(
++        || "unknown".to_owned(),
++        |v| {
++            let v = v as u64;
++            format!("{}.{}.{}.{}", v >> 48, (v >> 32) & 0xffff, (v >> 16) & 0xffff, v & 0xffff)
++        },
++    );
 +    eprintln!(
-+        "BC4 adapter: {} (vendor {:#06x}, device {:#06x}, software={software})",
++        "BC4 adapter: {} (PCI\\VEN_{:04X}&DEV_{:04X}&SUBSYS_{:08X}&REV_{:02X}, driver {driver}, software={software})",
 +        String::from_utf16_lossy(&info.Description[..end]),
 +        info.VendorId,
-+        info.DeviceId
++        info.DeviceId,
++        info.SubSysId,
++        info.Revision,
 +    );
 +
 +    let desc = ResourceDesc {
@@ -267,7 +360,8 @@ index 0000000..70de288
 +    let sampler = Sampler::new(host, host_resource(raw).expect("BC4 host texture"));
 +    let sentinel = [51u8, 51, 0, 0, 0, 0, 0, 0];
 +    {
-+        // SAFETY: the two blocks lie in this texture and no work has been submitted.
++        // SAFETY: the two blocks lie in this texture and no work has been
++        // submitted; its staging (and any guard) does not exist yet.
 +        let blocks = unsafe { &mut *address };
 +        blocks[..8].copy_from_slice(&sentinel);
 +        blocks[8..].copy_from_slice(&sentinel);
@@ -277,7 +371,8 @@ index 0000000..70de288
 +        original.iter().all(|&v| (v * 255.0 - 51.0).abs() < 0.01),
 +        "sentinel upload: {original:?}"
 +    );
-+    // SAFETY: the previous list has completed and the callback waits for its storage request.
++    // SAFETY: the previous list has completed and the callback waits for its
++    // storage request, which opens guarded pages first (`watch::writing`).
 +    fill(unsafe { &mut *address });
 +    let stale = sampler.sample(host, &texture, false);
 +    let updated = sampler.sample(host, &texture, true);
@@ -311,34 +406,26 @@ index 0000000..70de288
 +    eprintln!("BC4 readback: 32/32 expected texels; skipped upload: 32/32 stale texels detected");
 +}
 diff --git a/crates/victory-hle/Cargo.toml b/crates/victory-hle/Cargo.toml
-index e8d6baf..2d8793c 100644
+index bfc5591..c545490 100644
 --- a/crates/victory-hle/Cargo.toml
 +++ b/crates/victory-hle/Cargo.toml
-@@ -45,6 +45,7 @@ windows = { workspace = true, optional = true, features = [
- windows-core = { workspace = true, optional = true }
- 
+@@ -51,4 +51,5 @@ windows-core = { workspace = true, optional = true }
+
  [dev-dependencies]
 +victory-gpu = { workspace = true, features = ["texture-probe"] }
  tempfile.workspace = true
- 
- [features]
+
 diff --git a/crates/victory-hle/src/modules/dstorage.rs b/crates/victory-hle/src/modules/dstorage.rs
-index bc77285..08862d4 100644
+index 83a7a81..9216fd6 100644
 --- a/crates/victory-hle/src/modules/dstorage.rs
 +++ b/crates/victory-hle/src/modules/dstorage.rs
-@@ -343,7 +343,7 @@ struct Lanes {
-     staging: u64,
-     /// A start waited for staging space since the last finish.
-     starved: bool,
--    /// Weighted round robin: each class's virtual time (bytes Ã— cost), and
-+    /// Weighted round robin: each class's virtual time (bytes Ãƒâ€” cost), and
-     /// the time of the last start; within a class, the lane clock of the
-     /// last start.
-     clock: [u64; 3],
-@@ -1465,6 +1465,29 @@ mod tests {
-         out
+@@ -1457,4 +1457,35 @@ mod tests {
      }
- 
+
++    /// ZLIB then BCPack straight into a title BC4 texture's memory, then the
++    /// GPU's own sampling of its host copy: the texels arrive only through
++    /// the upload the storage write marks changed (`kernel_will_write`).
++    /// `PORTVI_BC4_REQUIRE_HARDWARE=1` refuses a software adapter.
 +    #[test]
 +    fn streamed_bc4_texels_survive_a_real_gpu_upload() {
 +        with_test_tables();
@@ -346,15 +433,19 @@ index bc77285..08862d4 100644
 +        let (_dir, file) = file_with(&packed);
 +        let (queue, array) = (new_queue(0), status_array(1));
 +        let require_hardware = std::env::var_os("PORTVI_BC4_REQUIRE_HARDWARE").is_some();
-+        victory_gpu::resource::bc4_probe::run(|blocks| {
-+            let mut r = request(ZLIB | (4 << 1), blocks.as_mut_ptr().cast(), 16, file, 0, packed.len());
-+            r.intermediate_size = BC4_STREAM.len() as u32;
-+            enqueue(queue, &r);
-+            enqueue_status(queue, array, 0);
-+            void(queue, 0x30);
-+            assert_eq!(wait(array, 0), S_OK);
-+            assert_eq!(*blocks, bc4_blocks(), "BCPack output in the console texture");
-+        }, require_hardware);
++        victory_gpu::resource::bc4_probe::run(
++            |blocks| {
++                let destination = blocks.as_mut_ptr().cast();
++                let mut r = request(ZLIB | 4 << 1, destination, 16, file, 0, packed.len());
++                r.intermediate_size = BC4_STREAM.len() as u32;
++                enqueue(queue, &r);
++                enqueue_status(queue, array, 0);
++                void(queue, 0x30);
++                assert_eq!(wait(array, 0), S_OK);
++                assert_eq!(*blocks, bc4_blocks(), "BCPack output in the console texture");
++            },
++            require_hardware,
++        );
 +        void(queue, 0x40);
 +        for object in [queue, array, file] {
 +            let release: extern "system" fn(*mut c_void) -> u32 = call(object, 0x10);
@@ -364,4 +455,3 @@ index bc77285..08862d4 100644
 +
      #[test]
      fn bcpack_requests_unpack_into_the_destination() {
-         with_test_tables();

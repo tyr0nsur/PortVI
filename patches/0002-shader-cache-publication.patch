@@ -1,0 +1,155 @@
+diff --git a/crates/victory-gpu/src/shader_cache.rs b/crates/victory-gpu/src/shader_cache.rs
+index 04af536..5d5c34f 100644
+--- a/crates/victory-gpu/src/shader_cache.rs
++++ b/crates/victory-gpu/src/shader_cache.rs
+@@ -18,8 +18,8 @@
+ use std::path::PathBuf;
+ use std::sync::OnceLock;
+-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::sync::atomic::{AtomicU64, Ordering};
+
+ use victory_pipeline::{Cache, Converter};
+-use victory_shader::emit::{HostShader, StaticSampler, UserData};
++use victory_shader::emit::{HostShader, Options, StaticSampler, UserData};
+ use victory_shader::{HwStage, RootType};
+
+@@ -50,9 +50,11 @@ pub fn counts() -> (u64, u64) {
+ }
+
++/// Writes through buffer views mark the pages for the renderer's copy-back.
++const OPTIONS: Options = Options { view_marks: true };
++
+ /// What a translation depends on besides its container: the translator
+ /// (`victory_shader::SOURCE_HASH`: its sources, manifest, the lock file and
+ /// the compiler), the entry's encoding (this file's text) and the
+-/// translation settings (the loop limit, which a diagnostics build can
+-/// change at run time).
++/// loop limit and translation options passed to the emitter.
+ fn build() -> &'static [u8; 32] {
+     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
+@@ -65,5 +67,5 @@ fn build() -> &'static [u8; 32] {
+             );
+         }
+-        key(victory_shader::SOURCE_HASH, ENCODING, limit)
++        key(victory_shader::SOURCE_HASH, ENCODING, limit, OPTIONS)
+     })
+ }
+@@ -72,9 +74,12 @@ fn build() -> &'static [u8; 32] {
+ const ENCODING: &[u8] = include_bytes!("shader_cache.rs");
+
+-fn key(translator: &str, encoding: &[u8], limit: u32) -> [u8; 32] {
++fn key(translator: &str, encoding: &[u8], limit: u32, options: Options) -> [u8; 32] {
+     let mut h = blake3::Hasher::new();
+     h.update(translator.as_bytes());
+     h.update(blake3::hash(encoding).as_bytes());
+     h.update(&limit.to_le_bytes());
++    // Destructure all options so a new emitter flag requires a cache-key decision.
++    let Options { view_marks } = options;
++    h.update(&[u8::from(view_marks)]);
+     *h.finalize().as_bytes()
+ }
+@@ -85,6 +90,5 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
+     // Writes through views mark their pages: copy-backs compare only those
+     // (`crate::shadow::copy_back_marks`).
+-    let options = victory_shader::emit::Options { view_marks: true };
+-    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
++    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, OPTIONS).map_err(|e| e.to_string());
+     match CACHE.get() {
+         Some(cache) => cached(cache, build(), container, translate),
+@@ -94,8 +98,8 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
+
+ /// The cache entry's converter: the build and the container in, the
+-/// encoded translation (or refusal) out. `ran` tells a miss from a hit.
++/// encoded translation (or refusal) out. Keep the result until publication succeeds.
+ struct Translate<F> {
+     translate: F,
+-    ran: AtomicBool,
++    result: OnceLock<Result<HostShader, String>>,
+ }
+
+@@ -109,6 +113,5 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
+     }
+     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
+-        self.ran.store(true, Ordering::Relaxed);
+-        Ok(encode(&(self.translate)(&input[32..])))
++        Ok(encode(self.result.get_or_init(|| (self.translate)(&input[32..]))))
+     }
+ }
+@@ -123,5 +126,5 @@ fn cached(
+     let converter = Translate {
+         translate,
+-        ran: AtomicBool::new(false),
++        result: OnceLock::new(),
+     };
+     for _ in 0..2 {
+@@ -134,5 +137,5 @@ fn cached(
+         };
+         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
+-            let hit = !converter.ran.load(Ordering::Relaxed);
++            let hit = converter.result.get().is_none();
+             let (counter, what) = if hit {
+                 (&HITS, "from the cache")
+@@ -148,5 +151,6 @@ fn cached(
+     }
+     MISSES.fetch_add(1, Ordering::Relaxed);
+-    ((converter.translate)(container), false)
++    let result = converter.result.into_inner().unwrap_or_else(|| (converter.translate)(container));
++    (result, false)
+ }
+
+@@ -436,9 +440,9 @@ mod tests {
+     #[test]
+     fn the_key_covers_translator_encoding_and_settings() {
+-        let k = key("0123456789abcdef", b"encoding", 1 << 20);
+-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20));
+-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20));
+-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20));
+-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19));
++        let k = key("0123456789abcdef", b"encoding", 1 << 20, OPTIONS);
++        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, OPTIONS));
++        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, OPTIONS));
++        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, OPTIONS));
++        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, OPTIONS));
+         assert_eq!(
+             *build(),
+@@ -446,7 +450,9 @@ mod tests {
+                 victory_shader::SOURCE_HASH,
+                 ENCODING,
+-                victory_shader::emit::loop_limit()
++                victory_shader::emit::loop_limit(),
++                OPTIONS,
+             )
+         );
++        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, Options { view_marks: false }));
+         // The encoding part is this file as built.
+         assert!(
+@@ -457,4 +463,29 @@ mod tests {
+     }
+
++    #[test]
++    fn an_unwritable_entry_keeps_the_translated_shader_and_recovers() {
++        let dir = tempfile::tempdir().unwrap();
++        let cache = Cache::open(dir.path()).unwrap();
++        let calls = AtomicU64::new(0);
++        let run = || cached(&cache, &[9; 32], b"publication fixture", |_| {
++            calls.fetch_add(1, Ordering::Relaxed);
++            Ok(shader())
++        });
++        assert_eq!(run(), (Ok(shader()), false));
++        let entries = walk(dir.path());
++        assert_eq!(entries.len(), 1);
++        let entry = &entries[0];
++        std::fs::remove_file(entry).unwrap();
++        std::fs::create_dir(entry).unwrap();
++        assert_eq!(run(), (Ok(shader()), false), "the shader is usable even if publishing fails");
++        assert_eq!(calls.load(Ordering::Relaxed), 2);
++        assert!(entry.is_dir());
++        std::fs::remove_dir(entry).unwrap();
++        assert_eq!(run(), (Ok(shader()), false));
++        assert!(entry.is_file());
++        assert_eq!(run(), (Ok(shader()), true));
++        assert_eq!(calls.load(Ordering::Relaxed), 3, "the final call is a warm hit");
++    }
++
+     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
+         let mut files = Vec::new();
