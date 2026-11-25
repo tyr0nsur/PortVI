@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 172" width="560" height="172" role="img" aria-labelledby="title desc">
+  <title id="title">PortVI</title>
+  <desc id="desc">Native x86-64 runtime for Windows. A cargo crane stands over the harbor at sunset.</desc>
+  <defs>
+    <linearGradient id="sky"><stop stop-color="#0c1c2c"/><stop offset="1" stop-color="#214455"/></linearGradient>
+    <linearGradient id="sun" x1="0%" x2="0%" y1="0%" y2="100%"><stop stop-color="#ffcb90"/><stop offset="1" stop-color="#f78280"/></linearGradient>
+    <clipPath id="edge"><rect width="560" height="172" rx="12"/></clipPath>
+  </defs>
+  <g clip-path="url(#edge)">
+    <rect width="560" height="172" fill="url(#sky)"/>
+    <g stroke="#84cbd2" opacity=".12" fill="none">
+      <path d="M376 0v156m32-156v156m32-156v156m32-156v156m32-156v156m32-156v156M352 32h208m-208 32h208m-208 32h208m-208 32h208"/>
+    </g>
+    <circle cx="473" cy="70" r="40" fill="url(#sun)"/>
+    <path d="M431 82h84m-84 7h84m-84 8h84" stroke="#214455" stroke-width="3"/>
+    <path d="M362 129h16v-14h11v14h9v-20h7v20h31v-7h14v7h110v10H362z" fill="#416475"/>
+    <g stroke="#9cc7cb" stroke-linejoin="round" fill="none">
+      <path d="M415 131l10-51h23l15 51m-38-51V41l8-9h4v48m-12-37-19 26h81l-50-32m-15 46 27 39m-2-40-27 40" stroke-width="2.6"/>
+      <path d="M405 72h83m-11 0v21m6-21v21" stroke-width="1.6"/>
+    </g>
+    <rect x="471" y="93" width="20" height="10" rx="1" fill="#9cc7cb"/>
+    <path d="M461 127h13v-7h56v7h17l-9 11h-67z" fill="#142d3d" stroke="#81b1bb"/>
+    <path d="M481 114h15v7h-15z M503 109h14v7h-14z" fill="#cf9285"/>
+    <path d="M499 117h17v6h-17z M520 117h10v6h-10z" fill="#689aa6"/>
+    <path d="M362 140h198m-184 10h39m14 0h19m48 0h39" fill="none" stroke="#74aeb8" stroke-opacity=".7"/>
+    <text x="24" y="81" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="77" font-weight="700" letter-spacing="-4" fill="#f3f7f6">Port<tspan fill="#78e4da">VI</tspan></text>
+    <g font-family="Inter, Segoe UI, Arial, sans-serif" font-size="23" fill="#d1e1e4"><text x="27" y="117">Native x86-64 runtime</text><text x="27" y="145">for Windows</text></g>
+    <rect x=".7" y=".7" width="558.6" height="170.6" rx="11.3" fill="none" stroke="#729aaa" stroke-opacity=".45"/>
+  </g>
+</svg>

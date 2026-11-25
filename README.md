@@ -1,4 +1,9 @@
-<h1 align="center"><img src="docs/assets/harbor.svg" width="1040" alt="PortVI — Native x86-64 runtime for Windows"></h1>
+<h1 align="center">
+  <picture>
+    <source media="(max-width: 600px)" srcset="docs/assets/harbor-mobile.svg">
+    <img src="docs/assets/harbor.svg" width="1040" alt="PortVI — Native x86-64 runtime for Windows">
+  </picture>
+</h1>
 
 <p align="center">
   <a href="https://github.com/tyr0nsur/PortVI/actions/workflows/windows.yml"><img src="https://github.com/tyr0nsur/PortVI/actions/workflows/windows.yml/badge.svg?branch=main" alt="Windows native checks on main"></a>
@@ -14,13 +19,11 @@
   <a href="docs/engineering-review.md">Engineering notes</a>
 </p>
 
-PortVI brings x86-64 console programs to Windows through VIctory’s native loader. The host CPU executes the program’s machine code directly. PortVI binds its platform calls and translates console shaders to DXIL for Direct3D 12.
-
-Our first changes fix two cases where a shader compiled under one configuration could be reused under another. The cache now accounts for translation settings, GPU wave width and descriptor limits. Both fixes have regression tests. [Engineering results](docs/engineering-review.md#reproduced-on-this-revision)
+PortVI runs x86-64 console code directly on the Windows host CPU. Built on VIctory’s native loader, it binds platform calls and translates console shaders to DXIL for Direct3D 12.
 
 ## Development dashboard
 
-Each card measures one named check. Select a card to inspect its source, results or open work.
+The two shader cards track one instruction, `v_med3_f32`. Each card links to its evidence or open task.
 
 <!-- verification:start -->
 <p align="center">
@@ -34,6 +37,8 @@ Each card measures one named check. Select a card to inspect its source, results
 **Windows regression run** · 130 passed and one upstream GPU-library test was ignored. The native loader probe ran separately and returned its expected exit marker of `73`. The hardware run matched all 13 `v_med3_f32` cases on an NVIDIA GeForce RTX 4060 with driver `32.0.16.2114`. [Test breakdown](docs/engineering-review.md#reproduced-on-this-revision)
 
 **Frame pacing** · The first scene benchmark needs paired 120-second captures with cold and warm caches. Stable 30 FPS remains unmeasured. [Capture protocol](docs/engineering-review.md#measuring-a-30-fps-target)
+
+**Shader cache** · Two regression tests caught stale translations being reused after a configuration change. PortVI now keys the cache on translation settings, GPU wave width and descriptor limits. [Fixes and reproductions](docs/engineering-review.md#reproduced-on-this-revision)
 
 ## Build and run
 
