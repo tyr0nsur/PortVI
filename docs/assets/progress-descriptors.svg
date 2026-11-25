@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="366" height="104" viewBox="0 0 366 104" role="img" aria-labelledby="title desc">
+  <title id="title">Descriptor reads · RTX 4060</title>
+  <desc id="desc">36 / 36 D3D12 pipelines created (100%).</desc>
+  <rect x=".5" y=".5" width="365" height="103" rx="11" fill="#122737" stroke="#395160"/>
+  <g font-family="Inter, Segoe UI, Arial, sans-serif">
+    <text x="20" y="34" font-size="17" font-weight="600" fill="#edf5f5">Descriptor reads · RTX 4060</text>
+    <text x="346" y="36" text-anchor="end" font-size="25" font-weight="700" fill="#79e0cf">100%</text>
+    <text x="20" y="62" font-size="14.5" fill="#c6d9df">36 / 36 D3D12 pipelines created</text>
+  </g>
+  <rect x="20" y="78" width="326" height="7" rx="3.5" fill="#344c5c"/>
+  <rect x="20" y="78" width="326.00" height="7" rx="3.5" fill="#79e0cf"/>
+</svg>

@@ -2,7 +2,8 @@ diff --git a/crates/victory-gpu/src/device.rs b/crates/victory-gpu/src/device.rs
 index ce1cad1..27cdbaf 100644
 --- a/crates/victory-gpu/src/device.rs
 +++ b/crates/victory-gpu/src/device.rs
-@@ -601,3 +601,22 @@ mod tests {
+@@ -600,4 +600,23 @@ mod tests {
+         let reason = slot::<extern "system" fn(This) -> HRESULT>(device, 0x128);
          assert_eq!(reason(device), S_OK);
      }
 +
@@ -26,33 +27,66 @@ index ce1cad1..27cdbaf 100644
 +    }
  }
 diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
-index 3172caf..6ef8089 100644
+index c5e5840..a2bfb39 100644
 --- a/crates/victory-gpu/src/draw.rs
 +++ b/crates/victory-gpu/src/draw.rs
-@@ -1864,4 +1864,16 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
- }
-
-+/// `OMSetDepthBounds`, for the pipelines made with the test
-+/// (`crate::pipeline::host`); nothing on a host without it, whose
-+/// pipelines are made without the test.
-+pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
-+    if crate::host::host().is_some_and(|h| h.depth_bounds())
-+        && let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>()
-+    {
-+        // SAFETY: an open list on a device with the depth bounds test.
-+        unsafe { list1.OMSetDepthBounds(min, max) };
+@@ -101,6 +101,7 @@ struct Fixed {
+     scissors: Option<Vec<RECT>>,
+     blend_factor: Option<Option<[f32; 4]>>,
+     stencil_ref: Option<u32>,
++    depth_bounds: Option<(f32, f32)>,
+     /// Render target and depth view handles.
+     targets: Option<(Vec<u64>, u64)>,
+     topology: bool,
+@@ -291,17 +292,28 @@ impl State {
+         unsafe { list.list.OMSetStencilRef(reference) };
+     }
+ 
++    /// Set depth bounds and keep them for the next command-list segment.
++    pub(crate) fn depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
++        if crate::host::host().is_some_and(|host| host.depth_bounds())
++            && let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>()
++        {
++            self.fixed.depth_bounds = Some((min, max));
++            // SAFETY: an open list on a device supporting depth bounds.
++            unsafe { list1.OMSetDepthBounds(min, max) };
++        }
 +    }
-+}
 +
- #[cfg(test)]
- mod tests {
+     /// The title list goes on in a fresh host list (a segment after a wait,
+     /// `crate::list`): the state it set is given to `list` again.
+     ///
+     /// Replayed: topology, viewports, scissors, blend factor, stencil
+-    /// reference, render targets and depth (set at once); heaps, root
++    /// reference, depth bounds, render targets and depth (set at once); heaps, root
+     /// signatures, pipelines, root arguments, vertex and index buffers are
+     /// set by the next draw or dispatch from what this state holds (the
+     /// host caches are cleared). Made again in the new segment, so their
+     /// submission-time work (refreshes, uploads) runs with it: fresh tables,
+     /// root views and the title-memory page table. Not replayed, as nothing
+-    /// of it is on the host list: depth bounds and shading rate (ignored),
++    /// of it is on the host list: shading rate (ignored),
+     /// queries (resolved with plain values), the 0x4a0 upload memory (the
+     /// title list's own), texture states and twins (each segment has its
+     /// own, made from the real states at its submission). Clears and copies
+@@ -327,6 +339,9 @@ impl State {
+         if let Some(s) = fixed.stencil_ref {
+             self.stencil_ref(list, s);
+         }
++        if let Some((min, max)) = fixed.depth_bounds {
++            self.depth_bounds(list, min, max);
++        }
+         if let Some((targets, depth)) = &fixed.targets {
+             self.set_targets(list, targets, *depth);
+         }
 diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
-index 09314c3..7ce4857 100644
+index 17852d8..f6f2dac 100644
 --- a/crates/victory-gpu/src/host.rs
 +++ b/crates/victory-gpu/src/host.rs
-@@ -751,4 +751,25 @@ impl Host {
+@@ -1073,6 +1073,27 @@ impl Host {
+         })
      }
-
+ 
 +    /// Whether the host GPU supports the depth bounds test; logged once.
 +    pub(crate) fn depth_bounds(&self) -> bool {
 +        static BOUNDS: OnceLock<bool> = OnceLock::new();
@@ -76,44 +110,52 @@ index 09314c3..7ce4857 100644
 +
      /// A new list, open for recording.
      pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
+         // SAFETY: plain object creation.
 diff --git a/crates/victory-gpu/src/list.rs b/crates/victory-gpu/src/list.rs
-index edcebb8..ac8894d 100644
+index a16d61c..24793dc 100644
 --- a/crates/victory-gpu/src/list.rs
 +++ b/crates/victory-gpu/src/list.rs
-@@ -1007,5 +1007,5 @@ unsafe impl Send for Upload {}
-
+@@ -1319,7 +1319,7 @@ pub(crate) static UPLOADS: [std::sync::atomic::AtomicU64; 2] =
+     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+ 
  /// Draw state the host has no use for (root signatures: ours come with
 -/// the pipeline; depth bounds, depth order and shading rate hints): any
 +/// the pipeline; depth order and shading rate hints): any
  /// arguments, nothing returned.
  extern "system" fn ignored_state(_: This) {}
-@@ -1057,4 +1057,10 @@ mod state {
-         }
+ 
+@@ -1361,6 +1361,10 @@ mod state {
+     pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
+         with_state(this, |list, s| s.stencil_ref(list, reference));
      }
 +    /// `OMSetDepthBounds(min, max)`.
 +    pub(super) extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
-+        if let Some(list) = host_list(this) {
-+            crate::draw::depth_bounds(list, min, max);
-+        }
++        with_state(this, |list, s| s.depth_bounds(list, min, max));
 +    }
      pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
          with_state(this, |_, s| s.set_heaps(items(heaps, count)));
-@@ -1252,4 +1258,5 @@ mod state {
+     }
+@@ -1556,6 +1560,7 @@ mod state {
+     pub(super) use super::ignored_state as compute_constants;
      pub(super) use super::ignored_state as compute_table;
      pub(super) use super::ignored_state as compute_view;
 +    pub(super) use super::ignored_state as depth_bounds;
      pub(super) use super::ignored_state as graphics_constant;
      pub(super) use super::ignored_state as graphics_constants;
-@@ -1465,5 +1472,5 @@ const METHODS: [(usize, *const ()); 52] = [
+     pub(super) use super::ignored_state as graphics_table;
+@@ -1772,7 +1777,7 @@ const METHODS: [(usize, *const ()); 52] = [
+     (52, clear_rtv as *const ()),                 // 0x1a0
      (59, execute_indirect as *const ()),          // 0x1d8 indirect
      (60, copy_memory as *const ()),               // 0x1e0
 -    (68, ignored_state as *const ()),             // 0x220 depth bounds
 +    (68, state::depth_bounds as *const ()),       // 0x220 depth bounds (newer: 0x230)
      (69, write32 as *const ()),                   // 0x228
      (70, write64 as *const ()),                   // 0x230
-@@ -1656,4 +1663,15 @@ mod tests {
+     (71, wait32 as *const ()),                    // 0x238 (newer 0x248)
+@@ -1963,6 +1968,17 @@ mod tests {
+         }
      }
-
+ 
 +    /// OMSetDepthBounds is 0x220 in older lists and 0x230 in newer ones
 +    /// (where older lists have the 64-bit write); both reach the host list.
 +    #[test]
@@ -127,7 +169,9 @@ index edcebb8..ac8894d 100644
 +
      #[test]
      fn every_inline_command_falls_back_to_the_table() {
-@@ -1724,3 +1742,45 @@ mod tests {
+         let null = std::ptr::null();
+@@ -2031,4 +2047,46 @@ mod tests {
+             assert_eq!(release(object), 0);
          }
      }
 +
@@ -174,23 +218,28 @@ index edcebb8..ac8894d 100644
 +    }
  }
 diff --git a/crates/victory-gpu/src/pipeline/host.rs b/crates/victory-gpu/src/pipeline/host.rs
-index f6c566a..8c5d3e6 100644
+index f6c566a..478d3b4 100644
 --- a/crates/victory-gpu/src/pipeline/host.rs
 +++ b/crates/victory-gpu/src/pipeline/host.rs
-@@ -25,4 +25,6 @@ pub(crate) struct GraphicsState {
+@@ -24,6 +24,8 @@ pub(crate) struct GraphicsState {
+     sample_mask: u32,
      rasterizer: D3D12_RASTERIZER_DESC,
      depth: D3D12_DEPTH_STENCIL_DESC,
 +    /// `DepthBoundsTestEnable` of a `DEPTH_STENCIL1` subobject.
 +    depth_bounds: bool,
      /// Input elements, their names pointing into `names`.
      inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
-@@ -76,4 +78,5 @@ impl Default for GraphicsState {
+     names: Vec<CString>,
+@@ -75,6 +77,7 @@ impl Default for GraphicsState {
+                 BackFace: keep,
                  ..Default::default()
              },
 +            depth_bounds: false,
              inputs: Vec::new(),
              names: Vec::new(),
-@@ -104,10 +107,11 @@ impl GraphicsState {
+             strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
+@@ -103,12 +106,13 @@ impl GraphicsState {
+                 8 => self.blend = data.cast::<D3D12_BLEND_DESC>().read_unaligned(),
                  9 => self.sample_mask = data.cast::<u32>().read_unaligned(),
                  10 => self.rasterizer = data.cast::<D3D12_RASTERIZER_DESC>().read_unaligned(),
 -                11 => self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned(),
@@ -206,7 +255,9 @@ index f6c566a..8c5d3e6 100644
 +                    self.depth_bounds = d.DepthBoundsTestEnable.as_bool();
                      self.depth = D3D12_DEPTH_STENCIL_DESC {
                          DepthEnable: d.DepthEnable,
-@@ -184,6 +188,13 @@ impl GraphicsState {
+                         DepthWriteMask: d.DepthWriteMask,
+@@ -183,8 +187,15 @@ impl GraphicsState {
+                 )
              })
              .collect();
 +        // Only pipelines with the test get a new name: the others keep
@@ -221,9 +272,11 @@ index f6c566a..8c5d3e6 100644
 +            "{:?} {} {:?} {:?}{bounds} {inputs:?} {} {} {:?} {} {:?}",
              self.blend,
              self.sample_mask,
-@@ -198,4 +209,28 @@ impl GraphicsState {
+             self.rasterizer,
+@@ -197,6 +208,30 @@ impl GraphicsState {
+         )
      }
-
+ 
 +    /// The host's `DEPTH_STENCIL1` for a pipeline with the depth bounds test.
 +    fn depth1(&self) -> D3D12_DEPTH_STENCIL_DESC1 {
 +        let d = &self.depth;
@@ -250,7 +303,9 @@ index f6c566a..8c5d3e6 100644
 +
      /// The vertex buffer slots the input layout reads.
      fn slots(&self) -> u32 {
-@@ -568,4 +603,19 @@ impl HostPipeline {
+         self.inputs
+@@ -567,6 +602,21 @@ impl HostPipeline {
+         let Some(g) = g else {
              return refuse("graphics state not kept (plain description)", shaders);
          };
 +        // A host without the test gets the plain description: the
@@ -270,14 +325,18 @@ index f6c566a..8c5d3e6 100644
 +        };
          let state = g.describe();
          if mesh.is_some() {
-@@ -576,5 +626,5 @@ impl HostPipeline {
+             let name = super::library::name(
+@@ -575,7 +625,7 @@ impl HostPipeline {
+                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                  &state,
              );
 -            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
 +            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
                  Ok(pso) => pso,
                  Err(e) => {
-@@ -645,11 +695,15 @@ impl HostPipeline {
+                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
+@@ -644,13 +694,17 @@ impl HostPipeline {
+             &state,
          );
          let started = std::time::Instant::now();
 -        let made = super::library::pipeline(
@@ -300,15 +359,19 @@ index f6c566a..8c5d3e6 100644
 +        };
          let pso = match made {
              Ok(pso) => pso,
-@@ -665,4 +719,5 @@ impl HostPipeline {
+             Err(e) => {
+@@ -664,6 +718,7 @@ impl HostPipeline {
+         tracing::debug!(
              ?shaders,
              depth = ?g.depth,
 +            depth_bounds,
              dsv = g.depth_format.0,
              targets = ?&g.targets.RTFormats[..g.targets.NumRenderTargets.min(8) as usize],
-@@ -695,6 +750,99 @@ fn host_topology(g: &GraphicsState) -> D3D12_PRIMITIVE_TOPOLOGY_TYPE {
+             blend = ?g.blend.RenderTarget[0],
+@@ -694,62 +749,158 @@ fn host_topology(g: &GraphicsState) -> D3D12_PRIMITIVE_TOPOLOGY_TYPE {
+     }
  }
-
+ 
 +/// A stream subobject: its type, then its description, pointer-aligned.
 +#[repr(C, align(8))]
 +struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
@@ -407,7 +470,8 @@ index f6c566a..8c5d3e6 100644
 +/// stream form (no input layout), with `DEPTH_STENCIL1` if `depth_bounds`.
  fn mesh_pipeline(
      device: &ID3D12Device,
-@@ -703,12 +851,9 @@ fn mesh_pipeline(
+     root: &ID3D12RootSignature,
+     ms: D3D12_SHADER_BYTECODE,
      ps: D3D12_SHADER_BYTECODE,
      g: &GraphicsState,
 +    depth_bounds: bool,
@@ -422,14 +486,15 @@ index f6c566a..8c5d3e6 100644
 +    struct Stream<D> {
          root: Sub<*mut std::ffi::c_void>,
          ms: Sub<D3D12_SHADER_BYTECODE>,
-@@ -717,5 +862,5 @@ fn mesh_pipeline(
+         ps: Sub<D3D12_SHADER_BYTECODE>,
+         blend: Sub<D3D12_BLEND_DESC>,
          mask: Sub<u32>,
          raster: Sub<D3D12_RASTERIZER_DESC>,
 -        depth: Sub<D3D12_DEPTH_STENCIL_DESC>,
 +        depth: Sub<D>,
          targets: Sub<D3D12_RT_FORMAT_ARRAY>,
          dsv: Sub<DXGI_FORMAT>,
-@@ -723,32 +868,38 @@ fn mesh_pipeline(
+         samples: Sub<DXGI_SAMPLE_DESC>,
          topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
      }
 -    let mut stream = Stream {
@@ -495,8 +560,10 @@ index f6c566a..8c5d3e6 100644
 +        make(device, root, (ms, ps), g, depth, name)
 +    }
  }
-
-@@ -871,3 +1022,322 @@ mod tests {
+ 
+ /// The bytes of shader code (none for an absent stage).
+@@ -870,4 +1021,326 @@ mod tests {
+         ];
          let _ = offsets(&inputs);
      }
 +
@@ -743,7 +810,10 @@ index f6c566a..8c5d3e6 100644
 +        // bounds: the first pixel's red.
 +        let draw = |min: f32, max: f32| -> u8 {
 +            let list = host.new_list().unwrap();
-+            crate::draw::depth_bounds(&list, min, max);
++            let first = host.new_list().unwrap();
++            let mut state = crate::draw::State::default();
++            state.depth_bounds(&first, min, max);
++            state.cut(&list);
 +            let rtv = host.rtv(&color, None);
 +            let dsv = host.dsv(&depth, None);
 +            let viewport = D3D12_VIEWPORT {
@@ -820,10 +890,11 @@ index f6c566a..8c5d3e6 100644
 +    }
  }
 diff --git a/crates/victory-gpu/src/queue.rs b/crates/victory-gpu/src/queue.rs
-index 99a0d07..15e0cf8 100644
+index 3da261b..49d7e7b 100644
 --- a/crates/victory-gpu/src/queue.rs
 +++ b/crates/victory-gpu/src/queue.rs
-@@ -548,3 +548,34 @@ mod tests {
+@@ -807,4 +807,35 @@ mod tests {
+         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
          assert!(at[1] > first);
      }
 +

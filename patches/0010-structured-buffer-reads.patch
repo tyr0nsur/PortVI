@@ -1,10 +1,11 @@
 diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
-index 8f4d73c..7752e4b 100644
+index bce4175..3b92841 100644
 --- a/crates/victory-gpu/src/descriptor/host.rs
 +++ b/crates/victory-gpu/src/descriptor/host.rs
-@@ -848,4 +848,18 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
+@@ -1032,6 +1032,20 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
+     }
  }
-
+ 
 +/// A shared copy must place a buffer SRV on an element boundary. Raw
 +/// SRVs, including structured SRVs lowered to raw, also start on 16 bytes.
 +fn srv_alignment(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC, element: u64) -> u64 {
@@ -19,9 +20,11 @@ index 8f4d73c..7752e4b 100644
 +    element * (alignment / common)
 +}
 +
- /// Writes slot `index`'s view address into the view addresses at `data`:
- /// a buffer view's title address (dword 0 low, dword 1 bits 0-15 high);
-@@ -894,5 +908,11 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
+ /// Writes slot `index`'s words into the view addresses at `data`, 16 bytes
+ /// a slot: a buffer view's title address (dword 0 low, dword 1 bits 0-15
+ /// high), a texture view's size fields ([`texture_words`]), zeros for
+@@ -1147,7 +1161,13 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
+ /// reads, [`crate::shadow::for_view`]) and the view's title range.
  pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
      let (address, len) = buffer_range(view)?;
 -    let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
@@ -34,28 +37,36 @@ index 8f4d73c..7752e4b 100644
 +    let (shadow, _) = crate::shadow::for_view(address, len, alignment)?;
      Some((shadow, address, len))
  }
-@@ -932,4 +952,5 @@ fn buffer_srv(
+ 
+@@ -1185,6 +1205,7 @@ fn buffer_srv(
+     at: D3D12_CPU_DESCRIPTOR_HANDLE,
  ) -> Option<Kept> {
      let element = element_size(&desc);
 +    let alignment = srv_alignment(&desc, element);
      // SAFETY: a buffer view's union member.
      let buffer = unsafe { &mut desc.Anonymous.Buffer };
-@@ -941,5 +962,5 @@ fn buffer_srv(
+     if element == 0 {
+@@ -1194,7 +1215,7 @@ fn buffer_srv(
+     // The copy its own bytes are in, its first element counted from there.
      let start = address + buffer.FirstElement * element;
      let Some((shadow, own)) =
 -        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
 +        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, alignment)
      else {
          #[cfg(feature = "diagnostics")]
-@@ -959,4 +980,5 @@ fn buffer_srv(
+         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
+@@ -1212,6 +1233,7 @@ fn buffer_srv(
+         once!(first, count, element, "buffer view empty or past its host copy");
          return None;
      }
 +    raw_structured(&mut desc)?;
      let host = host()?;
      // SAFETY: a live buffer and a slot of our heap.
-@@ -968,4 +990,30 @@ fn buffer_srv(
+     unsafe {
+@@ -1221,6 +1243,32 @@ fn buffer_srv(
+     Some(Some((shadow.buffer.clone(), own.then_some(shadow))))
  }
-
+ 
 +/// Makes a structured buffer shader view (stride a multiple of 4) the raw
 +/// view of the same bytes: translated shaders read structured shader views
 +/// raw, at element Ãƒâ€” stride + offset (`victory_shader::emit`, "Buffer views
@@ -84,9 +95,11 @@ index 8f4d73c..7752e4b 100644
 +
  /// Whether `count` elements of `element` bytes from element `first` lie in
  /// `buffer`. The console takes a view that is empty or runs past its
-@@ -1473,4 +1521,26 @@ mod tests {
-     use super::*;
-
+ /// memory; the host removes the device for one.
+@@ -2016,6 +2064,28 @@ mod tests {
+         assert!(host.made(0) && !host.made(1), "a cleared record leaves its slot");
+     }
+ 
 +    #[test]
 +    fn structured_srv_retains_its_byte_range_in_a_raw_descriptor() {
 +        let view = |first, count, stride| D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -111,40 +124,49 @@ index 8f4d73c..7752e4b 100644
 +
      /// The world's 16-byte view of 0 elements removed the device.
      #[test]
+     fn empty_and_overlong_buffer_views_are_refused() {
 diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
-index 6ef8089..49c1d3a 100644
+index a2bfb39..fd952ab 100644
 --- a/crates/victory-gpu/src/draw.rs
 +++ b/crates/victory-gpu/src/draw.rs
-@@ -72,5 +72,5 @@ pub(crate) struct State {
+@@ -71,7 +71,7 @@ pub(crate) struct State {
+     /// Graphics, compute.
      host_roots: [usize; 2],
      host_heaps: [usize; 2],
 -    /// Tables made afresh in this list: (table, what it holds) → first
 +    /// Tables made afresh in this list: (table, what it holds) â†’ first
      /// dynamic slot.
      fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-@@ -84,5 +84,5 @@ pub(crate) struct State {
+     /// The dynamic slots the list holds: title heap, first, count; given
+@@ -83,7 +83,7 @@ pub(crate) struct State {
+     /// and its view heap.
      memory: Option<(usize, crate::memory::Map)>,
      /// Views made for root SRVs and UAVs in this list ([`State::root_view`]):
 -    /// (view heap, host copy, unordered access) → dynamic slot.
 +    /// (view heap, host copy, unordered access) â†’ dynamic slot.
      root_slots: std::collections::HashMap<(usize, usize, bool), u32>,
      /// The run of dynamic slots root views take from (view heap, next
-@@ -2478,5 +2478,9 @@ void main(uint3 id : SV_DispatchThreadID) {
+     /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
+@@ -2960,8 +2960,11 @@ void main(uint3 id : SV_DispatchThreadID) {
+             // SAFETY: a live buffer.
              unsafe { made.GetDesc() }.Width
          };
 -        assert_eq!(width(start + 456), 1 << 16, "on an element: the buffer's copy");
+-        assert_ne!(width(start + 100), 1 << 16, "off: a copy of its own bytes (in a shared buffer)");
 +        assert_eq!(width(start + 912), 1 << 16, "on both element and raw boundaries: shared");
-+        let own_width = (4 * 456u64).next_multiple_of(256);
-+        assert_eq!(width(start + 456), own_width, "element boundary without raw alignment");
++        assert_ne!(width(start + 456), 1 << 16, "the element boundary alone cannot back a raw SRV");
 +        assert_eq!(crate::descriptor::host::view_copy(&view(start + 456)).unwrap().0.range(),
 +                   (start + 456, 4 * 456));
-         assert_eq!(width(start + 100), (4 * 456u64).next_multiple_of(256), "off: its own bytes");
++        assert_ne!(width(start + 100), 1 << 16, "off: a copy of its own bytes in a pooled buffer");
          let (copy, address, len) = crate::descriptor::host::view_copy(&view(start + 100)).unwrap();
+         assert_eq!((copy.range(), address, len), ((start + 100, 4 * 456), start + 100, 4 * 456));
+         drop(copy);
 diff --git a/crates/victory-shader/src/emit/diff_tests.rs b/crates/victory-shader/src/emit/diff_tests.rs
-index 69fda31..d34f3f8 100644
+index 65e6114..23c3d30 100644
 --- a/crates/victory-shader/src/emit/diff_tests.rs
 +++ b/crates/victory-shader/src/emit/diff_tests.rs
-@@ -1382,52 +1382,57 @@ fn translated_compute_matches_pc() {
+@@ -1381,54 +1381,59 @@ fn translated_compute_matches_pc() {
+         })
          .collect();
      let raw_data: Vec<u32> = (0..32u32).map(|i| i.wrapping_mul(0x9E37_79B9)).collect();
 -    let views = [
@@ -246,7 +268,9 @@ index 69fda31..d34f3f8 100644
 +    let (views, views_p) = (heap(Stride::Structured(16)), heap(Stride::HostStructured(16)));
      let samplers = [D3D12_SAMPLER_DESC {
          Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
-@@ -1445,4 +1450,10 @@ fn translated_compute_matches_pc() {
+         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+@@ -1444,6 +1449,12 @@ fn translated_compute_matches_pc() {
+         samplers: &samplers,
          groups: [2, 2, 1],
      };
 +    let dispatch_p = |roots| Dispatch {
@@ -257,18 +281,22 @@ index 69fda31..d34f3f8 100644
 +    };
      let mut failures = Vec::new();
      let only = std::env::var("VICTORY_DIFF_ONLY").ok();
-@@ -1517,5 +1528,5 @@ fn translated_compute_matches_pc() {
+     let warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+@@ -1518,7 +1529,7 @@ fn translated_compute_matches_pc() {
+             .dispatch(
                  &root_p,
                  &pso_p,
 -                &dispatch(vec![
 +                &dispatch_p(vec![
                      (0, Root::Constants(k.to_vec())),
                      (1, table(false, 1)),
+                     (2, table(true, 1)),
 diff --git a/crates/victory-shader/src/emit/host.rs b/crates/victory-shader/src/emit/host.rs
-index 010ab1c..d91a3f2 100644
+index 455bc84..4d11398 100644
 --- a/crates/victory-shader/src/emit/host.rs
 +++ b/crates/victory-shader/src/emit/host.rs
-@@ -1338,6 +1338,11 @@ pub enum Stride {
+@@ -1368,8 +1368,13 @@ pub enum Stride {
+     Raw,
      /// RGBA32F elements.
      Typed,
 -    /// Structured, elements of this many bytes.
@@ -281,7 +309,9 @@ index 010ab1c..d91a3f2 100644
 +    HostStructured(u32),
      /// Typed, elements in this format of this many bytes.
      Format(DXGI_FORMAT, u32),
-@@ -1716,5 +1721,18 @@ impl Host {
+ }
+@@ -1778,7 +1783,20 @@ impl Host {
+                                 0,
                                  D3D12_BUFFER_SRV_FLAG_NONE,
                              ),
 -                            Stride::Structured(s) => (
@@ -301,11 +331,13 @@ index 010ab1c..d91a3f2 100644
 +                            Stride::HostStructured(s) => (
                                  DXGI_FORMAT_UNKNOWN,
                                  data.len() * 4 / s as usize,
+                                 s,
 diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
-index 98e1a62..0cdbb8f 100644
+index b88599a..6c9905b 100644
 --- a/crates/victory-shader/src/emit/lower.rs
 +++ b/crates/victory-shader/src/emit/lower.rs
-@@ -4068,4 +4068,8 @@ impl<'a> Lower<'a> {
+@@ -4123,6 +4123,10 @@ impl<'a> Lower<'a> {
+             || un.contains("atomic")
              || used.is_some_and(|u| u.kind == ResourceType::Uav);
          let u = if uav { 0x1000 } else { 0 };
 +        // A structured shader view is raw on the host (module notes, "Buffer
@@ -314,7 +346,9 @@ index 98e1a62..0cdbb8f 100644
 +        let mut per_record = None;
          let (props, image) = match &ui.fields {
              Fields::Image { dim, .. } => {
-@@ -4087,5 +4091,10 @@ impl<'a> Lower<'a> {
+                 let kind = match dim {
+@@ -4142,7 +4146,12 @@ impl<'a> Lower<'a> {
+                 {
                      (10 | u, 0x409)
                  } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
 -                    (12 | u, stride)
@@ -326,7 +360,9 @@ index 98e1a62..0cdbb8f 100644
 +                    }
                  } else {
                      (11 | u, 0)
-@@ -4106,5 +4115,9 @@ impl<'a> Lower<'a> {
+                 };
+@@ -4161,7 +4170,11 @@ impl<'a> Lower<'a> {
+                 }
                  let props = match used.stride {
                      0 | 1 => (11 | u, 0),
 -                    s if s.is_multiple_of(4) => (12 | u, s),
@@ -337,7 +373,9 @@ index 98e1a62..0cdbb8f 100644
 +                    }
                      _ => return Err("a scalar-loaded buffer of odd stride read as data"),
                  };
-@@ -4163,5 +4176,15 @@ impl<'a> Lower<'a> {
+                 (props, None)
+@@ -4218,7 +4231,17 @@ impl<'a> Lower<'a> {
+                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
                  vec![(1, d1), (2, d2), (3, d3), (4, depth)]
              }
 -            None => vec![(2, field(self, 0))],
@@ -354,7 +392,9 @@ index 98e1a62..0cdbb8f 100644
 +            }
          };
          for k in 0..count {
-@@ -9107,4 +9130,27 @@ impl<'a> Lower<'a> {
+             let rel = k.wrapping_sub(u32::from(first));
+@@ -9551,6 +9574,29 @@ impl<'a> Lower<'a> {
+             let mask = self.s.m.i8((1u8 << count) - 1);
              let align = self.s.m.i32(4);
              match index {
 +                Some(index) if !uav => {
@@ -382,11 +422,13 @@ index 98e1a62..0cdbb8f 100644
 +                }
                  Some(index) => {
                      let stride = used.map_or(0, |u| u.stride);
+                     if stride < 4 || !stride.is_multiple_of(4) {
 diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
-index f0cac78..97fcf56 100644
+index eb49b01..3b6a701 100644
 --- a/crates/victory-shader/src/emit/mod.rs
 +++ b/crates/victory-shader/src/emit/mod.rs
-@@ -58,6 +58,11 @@
+@@ -57,8 +57,13 @@
+ //!   descriptor fields.
  //! * **Buffer views in the heap** are declared by how the shader reads
  //!   them: raw (ByteAddressBuffer) for dword loads and stores, atomics and
 -//!   typed-format loads without an index; structured with the used-resource
@@ -400,3 +442,4 @@ index f0cac78..97fcf56 100644
 +//!   dword `k` read element `k`); typed with four 32-bit float channels for
  //!   `buffer_load_format_*` and `buffer_store_format_*`. The host's view at
  //!   that index must be of that kind and start at the console descriptor's
+ //!   base address (raw: `R32_TYPELESS` with the raw flag), whatever kind the

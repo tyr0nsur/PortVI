@@ -1,8 +1,9 @@
 diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
-index 9873a11..8d475d7 100644
+index 588a4df..1dd6352 100644
 --- a/crates/victory-shader/src/emit/lower.rs
 +++ b/crates/victory-shader/src/emit/lower.rs
-@@ -229,6 +229,6 @@ struct Lower<'a> {
+@@ -236,8 +236,8 @@ struct Lower<'a> {
+     lane_bits: HashMap<Value, V>,
      /// IR phi location by value.
      phi_at: HashMap<Value, (usize, usize)>,
 -    mask_phis: HashMap<Value, V>,
@@ -11,7 +12,9 @@ index 9873a11..8d475d7 100644
 +    pending_masks: Vec<(V, usize, (Value, Value))>,
      data_phis: Vec<(V, usize, usize)>,
      read_phis: HashSet<Value>,
-@@ -598,27 +598,67 @@ impl<'a> Lower<'a> {
+     params: HashMap<Value, (usize, u32)>,
+@@ -647,29 +647,69 @@ impl<'a> Lower<'a> {
+                     || reads_mask_as_data(x.st, i)
              }) || reads_mask_derived(p, x.st)
                  || {
 -                // Masks held as numbers or constant lane sets: the lane
@@ -102,7 +105,9 @@ index 9873a11..8d475d7 100644
 +                };
              let wave = if x.native.wave64 { 64 } else { 32 };
              let one_wave = cs.threads.iter().product::<u32>() <= wave;
-@@ -2548,12 +2588,13 @@ impl<'a> Lower<'a> {
+             if console_lanes || one_wave && s.lds_dwords > 0 {
+@@ -2601,14 +2641,15 @@ impl<'a> Lower<'a> {
+                 if let Some(&v) = self.mask_phis.get(&id) {
                      return Ok(v);
                  }
 -                let &(b, i) = self
@@ -119,7 +124,9 @@ index 9873a11..8d475d7 100644
 +                self.pending_masks.push((v, b, id));
                  Ok(v)
              }
-@@ -2564,8 +2605,9 @@ impl<'a> Lower<'a> {
+             // shortcut: "some lane of the quad is set" is taken as true: the
+@@ -2617,10 +2658,11 @@ impl<'a> Lower<'a> {
+             Atom::Quad(_) => Ok(self.s.m.bool(true)),
              // With console lanes, a mask held as a number is the console's:
              // the lane tests its own bit.
 -            Atom::Opaque(v) if self.console_lanes => {
@@ -133,9 +140,11 @@ index 9873a11..8d475d7 100644
 +                    None
                  };
                  let lo = self.get(v)?;
-@@ -2643,36 +2685,4 @@ impl<'a> Lower<'a> {
+                 let word = |w: Val| match w {
+@@ -2696,38 +2738,6 @@ impl<'a> Lower<'a> {
+         self.s.m.cmp(at, pred::NE, t, z)
      }
-
+ 
 -    /// The value of the high dword of the wave64 register pair whose low
 -    /// dword holds `lo` (none in wave32).
 -    fn pair_high(&self, lo: Value) -> Option<Value> {
@@ -170,7 +179,9 @@ index 9873a11..8d475d7 100644
 -
      fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
          match self.x.st.guards[b][i] {
-@@ -6179,14 +6189,8 @@ impl<'a> Lower<'a> {
+             None => Ok(None),
+@@ -6515,16 +6525,10 @@ impl<'a> Lower<'a> {
+             "v_cndmask_b32" => {
                  let cond = match v.src.get(2) {
                      Some(&Operand::Scalar { code, .. }) => {
 -                        let m = inst
@@ -189,7 +200,9 @@ index 9873a11..8d475d7 100644
 +                            .operand_mask(inst, code, self.x.native.wave64)
                              .ok_or("a select on an untracked mask")?;
                          self.boolean(m, c)?
-@@ -6251,9 +6255,9 @@ impl<'a> Lower<'a> {
+                     }
+@@ -6587,11 +6591,11 @@ impl<'a> Lower<'a> {
+                 }
                  let cin = if name.ends_with("_ci_u32") {
                      let m = match v.src.get(2) {
 -                        Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
@@ -203,7 +216,9 @@ index 9873a11..8d475d7 100644
 +                    }
                          .ok_or("a carry-in from an untracked mask")?;
                      Some(self.boolean(m, c)?)
-@@ -7778,10 +7782,16 @@ impl<'a> Lower<'a> {
+                 } else {
+@@ -8114,12 +8118,18 @@ impl<'a> Lower<'a> {
+                     let all = self.lane_edge(q, to);
                      let block = &self.x.p.blocks[to];
                      let n = block.preds.iter().position(|&p| p == q).expect("an edge");
 -                    let links: Vec<(Bool, Bool)> = block
@@ -225,7 +240,9 @@ index 9873a11..8d475d7 100644
 +                            Some((joined, incoming))
                          })
                          .collect();
-@@ -9978,9 +9988,11 @@ impl<'a> Lower<'a> {
+                     (all, to, links)
+@@ -10436,11 +10446,13 @@ impl<'a> Lower<'a> {
+                 continue;
              }
              let v = match atom {
 -                Atom::Lane(v)
@@ -242,9 +259,11 @@ index 9873a11..8d475d7 100644
 +                }
                  Atom::Constant(_) => None,
              };
-@@ -10170,8 +10182,51 @@ impl<'a> Lower<'a> {
+             if v.is_some_and(|v| tainted.contains(&v)) {
+@@ -10793,10 +10805,67 @@ impl<'a> Lower<'a> {
+         (slot < limit).then_some(())
      }
-
+ 
 +    fn fill_mask_phis(&mut self) -> Result<(), Stop> {
 +        let p = self.x.p;
 +        while let Some((v, b, key)) = self.pending_masks.pop() {
@@ -255,13 +274,27 @@ index 9873a11..8d475d7 100644
 +                .phi_masks
 +                .get(&key)
 +                .ok_or_else(|| unsupported(offset, "a lane-mask join of an untracked mask"))?;
++            // On a divergent path a reused scalar need not hold the wave's
++            // mask. A skipped compare contributes zero only when the other
++            // incoming masks cannot contain any lane taking this edge.
++            let mixed = self.phi_at.get(&key.0)
++                .filter(|_| !p.wave64 && !self.uniform_join(b))
++                .map(|&(block, i)| &p.blocks[block].phis[i].args)
++                .filter(|values| values.iter().any(|v| self.x.st.masks.contains_key(v)));
 +            let mut incoming = Vec::new();
 +            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
 +                let Some(qb) = self.tail[q] else { continue };
 +                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
-+                let x = self
-+                    .boolean(args[n], qb)
-+                    .map_err(|w| unsupported(offset, w))?;
++                let x = if let Some(values) = mixed
++                    && !self.x.st.masks.contains_key(&values[n])
++                {
++                    if !self.no_mask_lane_on_edge(b, values, n) {
++                        return Err(unsupported(offset, "a lane-mask join of an untracked mask"));
++                    }
++                    self.s.m.bool(false)
++                } else {
++                    self.boolean(args[n], qb).map_err(|w| unsupported(offset, w))?
++                };
 +                incoming.push((x, qb));
 +            }
 +            self.s.m.set_phi(v, incoming);
@@ -295,7 +328,27 @@ index 9873a11..8d475d7 100644
 +        for &(v, b, i) in data_phis {
              let phi = &p.blocks[b].phis[i];
              let bit = phi.reg == Reg::Scc;
-@@ -10228,23 +10283,4 @@ impl<'a> Lower<'a> {
+             let mut incoming = Vec::new();
+@@ -10845,17 +10914,6 @@ impl<'a> Lower<'a> {
+                     (Some(Val::Bit(_)), false) if read => {
+                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
+                     }
+-                    // A lane mask joined with data at a join every lane
+-                    // enters along one edge: the register holds the mask's
+-                    // number there (console lanes, so exact).
+-                    _ if read
+-                        && !bit
+-                        && self.mask_data == MaskData::Console
+-                        && (self.x.st.masks.contains_key(&arg) || self.x.st.highs.contains_key(&arg))
+-                        && self.uniform_join(b) =>
+-                    {
+-                        self.mask_dword(arg).map_err(|w| Stop::Retry(phi.value, w))?
+-                    }
+                     (Some(Val::Missing(why)), _) if read => {
+                         return Err(Stop::Retry(phi.value, why));
+                     }
+@@ -10869,34 +10927,6 @@ impl<'a> Lower<'a> {
+             }
              self.s.m.set_phi(v, incoming);
          }
 -        for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
@@ -308,20 +361,31 @@ index 9873a11..8d475d7 100644
 -            for (n, &q) in p.blocks[b].preds.iter().enumerate() {
 -                let Some(qb) = self.tail[q] else { continue };
 -                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
--                let m =
--                    *self.x.st.masks.get(&phi.args[n]).ok_or_else(|| {
--                        unsupported(offset, "a lane-mask join of an untracked mask")
--                    })?;
--                let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
+-                let arg = phi.args[n];
+-                const UNTRACKED: Why = "a lane-mask join of an untracked mask";
+-                // Data joined with masks where the wave takes one edge (the BVH
+-                // walks pop masks from memory): with console lanes the lane's
+-                // own bit of the number, as `Atom::Opaque`.
+-                let number = self.console_lanes && !self.x.native.wave64 && self.uniform_join(b);
+-                let x = match (self.x.st.masks.get(&arg), self.vals.get(&arg)) {
+-                    (Some(&m), _) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
+-                    (None, Some(&Val::I32(word))) if number => self.lane_bit(qb, word, None),
+-                    (None, _) if !self.uniform_join(b) && self.no_mask_lane_on_edge(b, &phi.args, n) => {
+-                        self.s.m.bool(false)
+-                    }
+-                    (None, _) => return Err(unsupported(offset, UNTRACKED)),
+-                };
 -                incoming.push((x, qb));
 -            }
 -            self.s.m.set_phi(v, incoming);
 -        }
          Ok(())
      }
-@@ -10295,4 +10331,148 @@ mod tests {
+ }
+@@ -10945,6 +10975,150 @@ mod tests {
+         .map(|_| ())
      }
-
+ 
 +    /// Lowers a compute program of constants or wave64 params: whether it translates.
 +    fn lowers_cs(
 +        words: &[u32],
@@ -468,13 +532,15 @@ index 9873a11..8d475d7 100644
 +
      /// Lowers a compute program with the root parameters `layout` (in user
      /// SGPRs from s0 on) and the used resources `used`.
+     fn lower_with(
 diff --git a/crates/victory-shader/src/emit/synthetic_tests.rs b/crates/victory-shader/src/emit/synthetic_tests.rs
-index 7e0c66f..a197ca6 100644
+index e210523..999c2f0 100644
 --- a/crates/victory-shader/src/emit/synthetic_tests.rs
 +++ b/crates/victory-shader/src/emit/synthetic_tests.rs
-@@ -694,4 +694,200 @@ fn data_phi_of_a_tracked_mask_or_a_number_wave32() {
+@@ -951,6 +951,202 @@ fn data_phi_of_a_tracked_mask_or_a_number_wave32() {
+     }
  }
-
+ 
 +// ---- Loop-carried lane-mask joins ----
 +
 +/// Every lane stores its `v_mbcnt_lo` count to v4. Lanes whose b is set
@@ -673,11 +739,13 @@ index 7e0c66f..a197ca6 100644
 +
  /// The wave64 form: s[2:3] joins a & b (both dwords of a tracked mask) or
  /// two numbers; every lane stores s2 and s3.
+ #[test]
 diff --git a/crates/victory-shader/src/structure.rs b/crates/victory-shader/src/structure.rs
 index ab3977e..0913f54 100644
 --- a/crates/victory-shader/src/structure.rs
 +++ b/crates/victory-shader/src/structure.rs
-@@ -50,12 +50,12 @@ pub enum Atom {
+@@ -49,14 +49,14 @@ pub enum Atom {
+     Lane(Value),
      /// An SCC value, the same in every lane.
      Uniform(Value),
 -    /// A lane mask joined at a block entry, by its low dword's phi.
@@ -694,20 +762,24 @@ index ab3977e..0913f54 100644
 +    Opaque((Value, Value)),
      /// A constant mask other than all lanes or none.
      Constant(u64),
-@@ -461,4 +461,5 @@ pub struct Structured {
+ }
+@@ -460,6 +460,7 @@ pub struct Structured {
+     pub other: HashMap<Value, Bool>,
      /// Exact Wave64 pairs for checking masks at their uses.
      paired_masks: Map<Key, Bool>,
 +    paired_other: Map<Key, Bool>,
      /// Wave64 masks: low dword's value by the high dword's.
      pub highs: HashMap<Value, Value>,
-@@ -473,7 +474,31 @@ pub struct Structured {
+     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
+@@ -472,9 +473,33 @@ pub struct Structured {
+     /// A pixel's discards, by block and instruction: the lanes (EXEC there)
      /// the instruction takes out of the live mask, which here stay in it.
      pub discards: HashMap<(usize, usize), Bool>,
 +    /// Incoming lane boolean per predecessor edge (in block predecessor order)
 +    /// for each [`Atom::Phi`] id.
 +    pub phi_masks: HashMap<Key, Vec<Bool>>,
  }
-
+ 
  impl Structured {
 +    /// A predicate at this instruction. Scalar selects can also use a mask
 +    /// held as a number. A carry-in requires a tracked compare or carry.
@@ -732,7 +804,9 @@ index ab3977e..0913f54 100644
 +
      pub(crate) fn mask_bits(&self, low: Value, high: Option<Value>) -> Option<Bool> {
          match high {
-@@ -506,9 +531,13 @@ fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderEr
+             Some(high) => self.paired_masks.get(&(low, high)),
+@@ -505,11 +530,15 @@ fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderEr
+     loop {
          let execs = l.masks_in_order();
          let cond = l.paths()?;
 -        let wrong = l.wrong_joins(&cond);
@@ -748,7 +822,9 @@ index ab3977e..0913f54 100644
 +        l.derived_phis.extend(new_derived);
          l.reset();
      }
-@@ -531,5 +560,8 @@ struct Lanes<'a> {
+ }
+@@ -530,7 +559,10 @@ struct Lanes<'a> {
+     /// Block and index of each phi value.
      phis: Map<Value, (usize, usize)>,
      /// Mask joins found wrong when resolved to a constant: atoms instead.
 -    unresolved: HashSet<Value>,
@@ -758,7 +834,9 @@ index ab3977e..0913f54 100644
 +    derived_phis: HashSet<Key>,
      b: Bools,
      /// Masks derived from EXEC and VALU results.
-@@ -542,4 +574,8 @@ struct Lanes<'a> {
+     masks: Map<Key, Bool>,
+@@ -541,6 +573,10 @@ struct Lanes<'a> {
+     scc_lane: Map<Value, Bool>,
      /// Joins resolved to a constant, to check once all edges are known.
      joins: Vec<Join>,
 +    /// [`Atom::Phi`] joins created in the current pass, resolved in
@@ -767,7 +845,9 @@ index ab3977e..0913f54 100644
 +    phi_join_ids: HashSet<Key>,
      /// Per block: what a lane knows on entry, over forward edges only.
      first: Vec<Bool>,
-@@ -559,7 +595,17 @@ struct Lanes<'a> {
+     /// Per block ending in a branch: when a lane takes it.
+@@ -558,9 +594,19 @@ struct Lanes<'a> {
+ /// incoming mask held (or failed) on its edge.
  struct Join {
      block: usize,
 -    /// The phi value naming the join.
@@ -787,29 +867,35 @@ index ab3977e..0913f54 100644
 +    derived: bool,
      args: Vec<Key>,
  }
-@@ -608,4 +654,5 @@ impl<'a> Lanes<'a> {
+ 
+@@ -607,11 +653,14 @@ impl<'a> Lanes<'a> {
+             defs,
              phis,
              unresolved: HashSet::new(),
 +            derived_phis: HashSet::new(),
              b: Bools::new(),
              masks: Map::default(),
-@@ -613,4 +660,6 @@ impl<'a> Lanes<'a> {
+             other: Map::default(),
              scc_lane: Map::default(),
              joins: Vec::new(),
 +            phi_joins: Vec::new(),
 +            phi_join_ids: HashSet::new(),
              first: vec![Bool::FALSE; blocks.len()],
              when: vec![None; blocks.len()],
-@@ -691,4 +740,6 @@ impl<'a> Lanes<'a> {
+             active: HashSet::new(),
+@@ -690,6 +739,8 @@ impl<'a> Lanes<'a> {
+         self.other.clear();
          self.scc_lane.clear();
          self.joins.clear();
 +        self.phi_joins.clear();
 +        self.phi_join_ids.clear();
          self.first.fill(Bool::FALSE);
          self.when.fill(None);
-@@ -793,26 +844,59 @@ impl<'a> Lanes<'a> {
+         self.active.clear();
+@@ -792,28 +843,61 @@ impl<'a> Lanes<'a> {
+         }
      }
-
+ 
 -    /// Joins whose constant fails on some edge, given what lanes know.
 -    fn wrong_joins(&mut self, cond: &[Bool]) -> Vec<Value> {
 +    /// Joins whose constant fails on some edge, and joins that need another
@@ -881,8 +967,10 @@ index ab3977e..0913f54 100644
 -        wrong
 +        (wrong, new_derived)
      }
-
-@@ -822,4 +906,20 @@ impl<'a> Lanes<'a> {
+ 
+     fn finish(
+@@ -821,6 +905,22 @@ impl<'a> Lanes<'a> {
+         execs: &[Vec<Option<Bool>>],
          cond: &[Bool],
      ) -> Result<Structured, ShaderError> {
 +        let phi_joins = std::mem::take(&mut self.phi_joins);
@@ -903,7 +991,9 @@ index ab3977e..0913f54 100644
 +        }
          let blocks = &self.p.blocks;
          let b = &mut self.b;
-@@ -880,5 +980,14 @@ impl<'a> Lanes<'a> {
+         let guards = blocks
+@@ -879,7 +979,16 @@ impl<'a> Lanes<'a> {
+                 .filter(|(lo, hi)| lo != hi)
                  .map(|&(lo, hi)| (hi, lo))
                  .collect(),
 -            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
@@ -919,13 +1009,17 @@ index ab3977e..0913f54 100644
 +            },
              active: self.active,
              restored: self.restored.into_iter().collect(),
-@@ -888,4 +997,5 @@ impl<'a> Lanes<'a> {
+             discards: self
+@@ -887,6 +996,7 @@ impl<'a> Lanes<'a> {
+                 .iter()
                  .filter_map(|&(b, i)| execs[b][i].map(|e| ((b, i), e)))
                  .collect(),
 +            phi_masks,
              bools: self.b,
              exits,
-@@ -955,6 +1065,6 @@ impl<'a> Lanes<'a> {
+             guards,
+@@ -954,8 +1064,8 @@ impl<'a> Lanes<'a> {
+                 };
                  let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
                  let m = m.unwrap_or_else(|| {
 -                    let born = self.born(k.0);
@@ -934,7 +1028,9 @@ index ab3977e..0913f54 100644
 +                    self.b.atom(Atom::Opaque(k), born)
                  });
                  (m, derived)
-@@ -982,4 +1092,16 @@ impl<'a> Lanes<'a> {
+             }
+@@ -981,6 +1091,18 @@ impl<'a> Lanes<'a> {
+             (Some((b, _)), _) | (_, Some((b, _))) => b,
              _ => return None,
          };
 +        // An unchanged partner written in or after the join block is only
@@ -951,7 +1047,9 @@ index ab3977e..0913f54 100644
 +        }
          let target = &p.blocks[block];
          let arg = |phi: Option<(usize, usize)>, own: Value, n: usize| {
-@@ -989,6 +1111,6 @@ impl<'a> Lanes<'a> {
+             phi.map_or(own, |(_, i)| target.phis[i].args[n])
+@@ -988,8 +1110,8 @@ impl<'a> Lanes<'a> {
+         let args: Vec<Key> = (0..target.preds.len())
              .map(|n| (arg(lo, k.0, n), arg(hi, k.1, n)))
              .collect();
 -        let id = lo.map_or(k.1, |_| k.0);
@@ -960,13 +1058,17 @@ index ab3977e..0913f54 100644
 +        let mut derived = self.derived_phis.contains(&id);
          // (edge condition, mask) per forward edge; back edges come later.
          let mut forward = Vec::new();
-@@ -1020,4 +1142,5 @@ impl<'a> Lanes<'a> {
+         for (n, &a) in args.iter().enumerate() {
+@@ -1019,6 +1141,7 @@ impl<'a> Lanes<'a> {
+                         block,
                          id,
                          value,
 +                        derived,
                          args,
                      });
-@@ -1027,4 +1150,12 @@ impl<'a> Lanes<'a> {
+                     let m = if value { Bool::TRUE } else { Bool::FALSE };
+@@ -1026,6 +1149,14 @@ impl<'a> Lanes<'a> {
+                 }
              }
          }
 +        if self.phi_join_ids.insert(id) {
@@ -979,7 +1081,9 @@ index ab3977e..0913f54 100644
 +        }
          let born = self.index[block];
          Some((self.b.atom(Atom::Phi(id), born), derived))
-@@ -1860,3 +1991,162 @@ mod tests {
+     }
+@@ -1859,4 +1990,163 @@ mod tests {
+             );
          }
      }
 +
