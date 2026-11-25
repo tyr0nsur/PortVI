@@ -1,9 +1,8 @@
 <h1 align="center">
-  <picture>
-    <source media="(max-width: 600px)" srcset="docs/assets/harbor-mobile.svg">
-    <img src="docs/assets/harbor.svg" width="1040" alt="PortVI — Native x86-64 runtime for Windows">
-  </picture>
+  <img src="docs/assets/portvi-logo.png" width="500" alt="PortVI">
 </h1>
+
+<p align="center"><strong>Native x86-64 runtime for Windows</strong></p>
 
 <p align="center">
   <a href="https://github.com/tyr0nsur/PortVI/actions/workflows/windows.yml"><img src="https://github.com/tyr0nsur/PortVI/actions/workflows/windows.yml/badge.svg?branch=main" alt="Windows native checks on main"></a>
