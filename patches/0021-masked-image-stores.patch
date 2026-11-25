@@ -1,0 +1,390 @@
+diff --git a/crates/victory-shader/src/emit/image_store_tests.rs b/crates/victory-shader/src/emit/image_store_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d891ec847819d6b78daf09425872f915858c8cd
+--- /dev/null
++++ b/crates/victory-shader/src/emit/image_store_tests.rs
+@@ -0,0 +1,309 @@
++//! End-to-end tests of synthetic GFX10 image stores lowered to DXIL,
++//! validated by `dxil.dll` when present, and executed on the host GPU and
++//! WARP.
++//!
++//! Each program fills texel (1, 1) of a 2x2 texture UAV with a four-channel
++//! store, then stores to it again with the dmask (and d16) under test; the
++//! texture is read back. The console writes the channels the dmask leaves
++//! out as 0.
++
++use super::host::{Dispatch, Host, Root, View};
++use super::valu_tests::ONE_AT_A_TIME;
++use super::{HostShader, lower, validator};
++use crate::ShaderError;
++use crate::native::{
++    ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
++};
++use crate::{io, ir, resource, structure};
++
++const S_ENDPGM: u32 = 0xBF81_0000;
++const IMAGE_STORE: u8 = 0x08;
++
++/// SOP1 `s_mov_b32 sdst, src0`.
++const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
++    0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32
++}
++
++/// SMEM `s_load_dwordx8 s[dst:dst+7], s[base:base+1], offset` (soffset =
++/// null).
++const fn s_load_dwordx8(dst: u8, base: u8, offset: u32) -> [u32; 2] {
++    [
++        0x3D << 26 | 3 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
++        125 << 25 | offset,
++    ]
++}
++
++/// VOP1 `v_mov_b32 vdst, src0` (`src0`: 0..105 = SGPR, 128 = inline 0, 129
++/// = inline 1).
++const fn v_mov_b32(vdst: u8, src0: u16) -> u32 {
++    0x7E00_0000 | (vdst as u32) << 17 | 0x01 << 9 | (src0 as u32 & 0x1FF)
++}
++
++/// MIMG `op vdata, vaddr, s[srsrc:srsrc+7] dmask dim:2D unorm [d16]`
++/// (non-NSA).
++const fn mimg_2d(op: u8, vdata: u8, vaddr: u8, srsrc: u8, dmask: u8, d16: bool) -> [u32; 2] {
++    [
++        0x3C << 26
++            | (op as u32 & 0x7F) << 18
++            | 1 << 12 // unorm
++            | (dmask as u32 & 0xF) << 8
++            | 1 << 3 // dim 2D
++            | (op as u32 >> 7),
++        (d16 as u32) << 31 | (srsrc as u32 >> 2) << 16 | (vdata as u32) << 8 | vaddr as u32,
++    ]
++}
++
++/// Root constants s0..s3: the fill; s4..s7: the data under test; s8, s9:
++/// the texel. s12 is the table of the texture UAV.
++fn program(dmask: u8, d16: bool) -> NativeProgram {
++    let mut words = vec![s_mov_b32(13, 0x80)]; // s13 = 0: the table's high dword
++    words.extend(s_load_dwordx8(16, 12, 0));
++    words.push(v_mov_b32(4, 8));
++    words.push(v_mov_b32(5, 9));
++    for k in 0..4u8 {
++        words.push(v_mov_b32(k, u16::from(k)));
++    }
++    words.extend(mimg_2d(IMAGE_STORE, 0, 4, 16, 0xF, false));
++    for k in 0..4u8 {
++        words.push(v_mov_b32(k, u16::from(4 + k)));
++    }
++    words.extend(mimg_2d(IMAGE_STORE, 0, 4, 16, dmask, d16));
++    words.push(S_ENDPGM);
++
++    NativeProgram {
++        stage: HwStage::Cs,
++        wave64: false,
++        vgprs: 8,
++        layout: vec![
++            RootParam {
++                root: RootType::Constants,
++                table_offset_dwords: 0,
++                sgprs: 12,
++                base_register: 0,
++                user_data: 0,
++                slot: 0,
++            },
++            RootParam {
++                root: RootType::Table,
++                table_offset_dwords: 0,
++                sgprs: 1,
++                base_register: 0,
++                user_data: 12,
++                slot: 1,
++            },
++        ],
++        used: vec![UsedResource {
++            kind: ResourceType::Uav,
++            root: RootType::Table,
++            table_offset_dwords: 0,
++            lower_bound: 0,
++            stride: 0,
++            dwords: 8,
++            user_data: 12,
++            slot: 1,
++        }],
++        io: StageIo::Cs(ComputeIo {
++            rsrc2: 13 << 1, // 13 user SGPRs: s0..s12
++            threads: [1, 1, 1],
++        }),
++        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
++    }
++}
++
++fn lower(native: &NativeProgram) -> Result<HostShader, ShaderError> {
++    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
++    let st = structure::structure(&p).expect("structure");
++    let res =
++        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
++    let io = io::raise(&p, native).expect("io::raise");
++    let lowered = lower::lower(&lower::Parts {
++        native,
++        p: &p,
++        st: &st,
++        io: &io,
++        res: &res,
++        inputs: Vec::new(),
++        outputs: Vec::new(),
++        prims: Vec::new(),
++        mesh_stride: 0,
++        view_marks: false,
++    })?;
++    Ok(HostShader {
++        stage: HwStage::Cs,
++        dxil: lowered.dxil,
++        user_data: lowered.user_data,
++        samplers: lowered.samplers,
++        static_samplers: Vec::new(),
++        root_cbvs: lowered.root_cbvs,
++        root_srvs: lowered.root_srvs,
++        root_uavs: lowered.root_uavs,
++        memory: lowered.memory,
++        memory_writes: lowered.memory_writes,
++        view_addresses: lowered.view_addresses,
++        heap: lowered.heap,
++        heap_writes: lowered.heap_writes,
++        view_marks: lowered.view_marks,
++    })
++}
++
++/// The program lowered and validated.
++fn build(dmask: u8, d16: bool) -> HostShader {
++    let shader = lower(&program(dmask, d16)).expect("lower");
++    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
++        let mut copy = shader.dxil.clone();
++        let ours = copy[4..20].to_vec();
++        v.validate(&mut copy).expect("DXIL validation failed");
++        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
++    } else {
++        eprintln!("no dxil.dll; validation skipped");
++    }
++    shader
++}
++
++/// A store under test: its dmask, whether its data is d16, and the data
++/// dwords (as the VGPRs hold them, the enabled channels' in order).
++struct Case {
++    dmask: u8,
++    d16: bool,
++    data: [u32; 4],
++}
++
++/// Texel (1, 1) after the program: the enabled channels from the data VGPRs
++/// in order (d16: two per VGPR, low half first, widened to f32), the others
++/// 0.
++fn expected(case: &Case) -> [u32; 4] {
++    let mut texel = [0; 4];
++    let mut k = 0;
++    for (ch, t) in texel.iter_mut().enumerate() {
++        if case.dmask >> ch & 1 == 0 {
++            continue;
++        }
++        *t = if case.d16 {
++            let half = (case.data[k / 2] >> (16 * (k % 2))) as u16;
++            f16_to_f32(half).to_bits()
++        } else {
++            case.data[k]
++        };
++        k += 1;
++    }
++    texel
++}
++
++/// An f16 (normal, zero or infinite) as an f32.
++fn f16_to_f32(h: u16) -> f32 {
++    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
++    let (e, m) = (i32::from(h >> 10 & 0x1F), f32::from(h & 0x3FF));
++    match e {
++        0 => sign * m * 2f32.powi(-24),
++        0x1F => sign * f32::INFINITY,
++        _ => sign * (1.0 + m / 1024.0) * 2f32.powi(e - 15),
++    }
++}
++
++/// Four nonzero channels let the readback distinguish a clear from a preserved channel.
++const FILL: [u32; 4] = [0x3F80_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000];
++
++/// Runs each case's shader on the hardware adapter and WARP (each skipped
++/// without an SM 6.6 device) and checks the whole texture.
++fn run(cases: &[Case]) {
++    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
++    let shaders: Vec<_> = cases.iter().map(|c| build(c.dmask, c.d16)).collect();
++    run_shaders(cases, &shaders);
++}
++
++fn run_shaders(cases: &[Case], shaders: &[HostShader]) {
++    let mut ran = 0;
++    for (label, warp) in [("hardware", false), ("warp", true)] {
++        let Ok(host) = Host::new(warp) else {
++            eprintln!("no SM 6.6 {label} device; skipped");
++            continue;
++        };
++        for (case, shader) in cases.iter().zip(shaders) {
++            let what = format!(
++                "{label} RGBA32_FLOAT dmask {:#x}{}",
++                case.dmask,
++                if case.d16 { " d16" } else { "" }
++            );
++            let (root, pso) = host
++                .compute_pipeline(shader)
++                .unwrap_or_else(|e| panic!("{what}: compute_pipeline: {e}"));
++            let mut k = [0u32; 12];
++            k[..4].copy_from_slice(&FILL);
++            k[4..8].copy_from_slice(&case.data);
++            k[8..10].copy_from_slice(&[1, 1]);
++            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
++            for u in &shader.user_data {
++                ud[u.index as usize] = match (u.root, u.slot) {
++                    (RootType::Constants, 0) => k[u.dword as usize],
++                    (RootType::Table, 1) => 0,
++                    other => panic!("unexpected user data {other:?}"),
++                };
++            }
++            let out = host
++                .dispatch(
++                    &root,
++                    &pso,
++                    &Dispatch {
++                        roots: vec![(0, Root::Constants(ud))],
++                        views: &[View::TextureUav(2, 2)],
++                        samplers: &[],
++                        groups: [1, 1, 1],
++                    },
++                )
++                .unwrap_or_else(|e| panic!("{what}: dispatch: {e}"));
++            let n = 4;
++            let want = expected(case);
++            let mut texture = [0u32; 16];
++            texture[3 * n..].copy_from_slice(&want[..n]);
++            assert_eq!(out[0].as_slice(), texture, "{what}: texture");
++        }
++        eprintln!(
++            "{label}: {} channel masks matched all four texels",
++            cases.len()
++        );
++        ran += 1;
++    }
++    if ran == 0 {
++        eprintln!("no host device could run these; translation and validation only");
++    }
++}
++
++/// Float data: distinct finite values, none of them the fill's.
++const FLOATS: [u32; 4] = [0x3FC0_0000, 0xC000_0000, 0x3E80_0000, 0x447A_0000]; // 1.5, -2, 0.25, 1000
++
++#[test]
++fn float_stores_of_each_dmask_run_on_the_host() {
++    let cases: Vec<_> = (1..16u8)
++        .map(|dmask| Case {
++            dmask,
++            d16: false,
++            data: FLOATS,
++        })
++        .collect();
++    run(&cases);
++}
++
++#[test]
++fn d16_float_stores_of_each_dmask_run_on_the_host() {
++    // f16 pairs: (1.5, -2), (0.25, 1000).
++    let data = [0xC000_3E00, 0x63D0_3400, 0, 0];
++    let cases: Vec<_> = (1..16u8)
++        .map(|dmask| Case {
++            dmask,
++            d16: true,
++            data,
++        })
++        .collect();
++    run(&cases);
++}
++
++#[test]
++fn zero_image_store_mask_is_refused() {
++    assert!(matches!(
++        lower(&program(0, false)),
++        Err(ShaderError::Unsupported {
++            what: "an image store with no channels",
++            ..
++        })
++    ));
++}
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 72519189189cc73e9fbada1a8528d08f217fa6b6..d76ebfbfd59703d10857cb3e71ba75d31322485c 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -8449,6 +8449,10 @@ impl<'a> Lower<'a> {
+         if name.starts_with("image_bvh") {
+             return self.bvh(inst, b, i);
+         }
++        // A zero store mask has no tested host mapping.
++        if name == "image_store" && *dmask == 0 {
++            return Err("an image store with no channels");
++        }
+         // A load or sample with no channel enabled returns the first.
+         let dmask = if *dmask == 0 { &1 } else { dmask };
+         let site = (b, i);
+@@ -8683,11 +8687,8 @@ impl<'a> Lower<'a> {
+             if name != "image_store" {
+                 return Err("an image store to a mip level");
+             }
+-            // shortcut: stores are taken to write all four channels of a
+-            // float format (the console converts by the view's format).
+-            if *dmask != 0xF {
+-                return Err("an image store of some channels");
+-            }
++            // shortcut: stores are taken to be to a float format (the
++            // console converts by the view's format).
+             let iu = self.s.m.undef(self.s.t.i32);
+             let mut cs = vec![iu; 3];
+             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+@@ -8696,12 +8697,20 @@ impl<'a> Lower<'a> {
+             let Operand::Vector { reg, .. } = *data else {
+                 return Err("image store data");
+             };
+-            let mut vals = Vec::new();
+-            for k in 0..4u8 {
++            // The data VGPRs hold the enabled channels only, in channel
++            // order. The console writes the others as 0 (the ISA guides'
++            // DMASK: "missing components get 0"; LLVM trims zero channels
++            // from image stores on the same grounds), so the host's store
++            // writes all four: DXIL's validator wants typed UAV stores to
++            // write every channel (with a 0xF mask) anyway.
++            let zero = self.s.m.f32(0);
++            let mut vals = vec![zero; 4];
++            for (k, ch) in (0..4u8).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
++                let k = k as u8;
+                 // d16: two f16 channels per VGPR, low half first.
+                 let r = if *d16 { k / 2 } else { k };
+                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
+-                vals.push(if *d16 {
++                vals[usize::from(ch)] = if *d16 {
+                     let mut x = self.i32_of(v)?;
+                     if k % 2 == 1 {
+                         let k16 = self.s.m.i32(16);
+@@ -8712,7 +8721,7 @@ impl<'a> Lower<'a> {
+                         .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
+                 } else {
+                     self.float_of(v)?
+-                });
++                };
+             }
+             let h = self.handle(site, src, false, props)?;
+             let at = self.begin_guarded(guard);
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index fc33a893e9558eff309c43873d95b59c6ee63cbc..c3ba944d14bdcc49494d1cff1dca3a0a1b3206ee 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -226,6 +226,8 @@ mod flow_tests;
+ mod g16_tests;
+ #[cfg(all(windows, any(test, feature = "host")))]
+ pub mod host;
++#[cfg(all(test, windows))]
++mod image_store_tests;
+ mod lower;
+ #[cfg(all(test, windows))]
+ mod permlane_tests;

@@ -1,0 +1,158 @@
+diff --git a/crates/victory-hle/src/modules/kernel.rs b/crates/victory-hle/src/modules/kernel.rs
+index 4e7e7deec2e02d66fe10b3eb361a4d11c365f8b5..e1b72d2088efa5aa446b6724e9822476b8a17a4c 100644
+--- a/crates/victory-hle/src/modules/kernel.rs
++++ b/crates/victory-hle/src/modules/kernel.rs
+@@ -164,17 +164,7 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
+     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
+         return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
+     };
+-    // Values below 0x10000 are ordinals; we export by name only.
+-    if (name as usize) < 0x1_0000 {
+-        tracing::warn!(
+-            module = m.name,
+-            ordinal = name as usize,
+-            "GetProcAddress by ordinal"
+-        );
+-        return std::ptr::null_mut();
+-    }
+-    // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
+-    let name = unsafe { CStr::from_ptr(name.cast()) }.to_string_lossy();
++    let name = export_name(name);
+     match m.exports.iter().find(|e| e.name == name) {
+         Some(e) => e.address as *mut c_void,
+         None => {
+@@ -191,11 +181,7 @@ fn host_override(module: *mut c_void, name: *const u8) -> Option<*mut c_void> {
+     if module.is_null() || runtime::image_path(module as usize).is_some() {
+         return None;
+     }
+-    let symbol = if (name as usize) < 0x1_0000 {
+-        format!("#{}", name as usize)
+-    } else {
+-        narrow(name)
+-    };
++    let symbol = export_name(name);
+     let mut path = [0u16; 260];
+     let len = host::get_module_file_name_w(module, path.as_mut_ptr(), path.len() as u32) as usize;
+     let path = String::from_utf16_lossy(&path[..len.min(path.len())]);
+@@ -203,6 +189,15 @@ fn host_override(module: *mut c_void, name: *const u8) -> Option<*mut c_void> {
+     crate::registry::lookup(file, &symbol).map(|address| address as *mut c_void)
+ }
+ 
++/// GetProcAddress encodes a 16-bit ordinal in the pointer itself.
++fn export_name(name: *const u8) -> String {
++    if (name as usize) < 0x1_0000 {
++        format!("#{}", name as usize)
++    } else {
++        narrow(name)
++    }
++}
++
+ /// Our pseudo modules and the title's images stay loaded: `LoadLibrary`
+ /// took no reference on them, so the host's count must not drop.
+ pub extern "system" fn FreeLibrary(module: *mut c_void) -> i32 {
+diff --git a/crates/victory-hle/src/modules/mod.rs b/crates/victory-hle/src/modules/mod.rs
+index 4aba794ed5ae9c0e7cd560d196f0f2c5ec643d4c..92cd76b3917fa2e6f6c2e1c13dd3293daeb6a260 100644
+--- a/crates/victory-hle/src/modules/mod.rs
++++ b/crates/victory-hle/src/modules/mod.rs
+@@ -28,6 +28,8 @@ pub mod lifecycle;
+ pub mod media;
+ #[cfg(windows)]
+ pub mod net;
++#[cfg(windows)]
++mod oleaut;
+ pub mod rpcrt4;
+ pub mod speech;
+ pub mod storage;
+@@ -69,6 +71,8 @@ pub(crate) fn all() -> Vec<HleModule> {
+     all.push(lifecycle::module());
+     #[cfg(windows)]
+     all.push(net::module());
++    #[cfg(windows)]
++    all.push(oleaut::module());
+     all.push(rpcrt4::module());
+     #[cfg(windows)]
+     all.push(xmem::module());
+diff --git a/crates/victory-hle/src/modules/oleaut.rs b/crates/victory-hle/src/modules/oleaut.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..83748d46d00b99d3339c34c3cf85514e0c6c18ce
+--- /dev/null
++++ b/crates/victory-hle/src/modules/oleaut.rs
+@@ -0,0 +1,78 @@
++//! Automation strings passed between a console library and Windows use the same allocator.
++
++use crate::{HleExport, HleModule, hle_export};
++use windows_sys::Win32::Foundation::{SysAllocStringLen, SysFreeString};
++
++pub(super) fn module() -> HleModule {
++    let alloc = hle_export!(SysAllocStringLen);
++    let free = hle_export!(SysFreeString);
++    HleModule {
++        name: "oleaut32",
++        dlls: &["oleaut32.dll"],
++        exports: vec![
++            alloc,
++            free,
++            HleExport {
++                name: "#4",
++                ..alloc
++            },
++            HleExport { name: "#6", ..free },
++        ],
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use crate::modules::kernel::{FreeLibrary, GetProcAddress, LoadLibraryA};
++    use crate::{HleResolver, HostPolicy};
++    use std::ptr::{null, without_provenance};
++    use victory_loader::{ImportResolver, Resolution};
++    use victory_pe::ImportSymbol;
++    use windows_sys::Win32::Foundation::SysStringLen;
++
++    #[test]
++    fn automation_string_imports_match_dynamic_lookup_and_round_trip() {
++        let dll = "oleaut32.dll";
++        let resolver = HleResolver::new(HostPolicy::none());
++        let module = LoadLibraryA(c"OLEAUT32.dll".as_ptr().cast());
++        assert!(!module.is_null());
++        let mut addresses = [0usize; 2];
++        for (i, (ordinal, name)) in [(4, c"SysAllocStringLen"), (6, c"SysFreeString")]
++            .into_iter()
++            .enumerate()
++        {
++            let Resolution::Found { address, .. } =
++                resolver.resolve(dll, &ImportSymbol::Ordinal(ordinal))
++            else {
++                panic!("unresolved Automation ordinal {ordinal}");
++            };
++            assert_eq!(
++                address,
++                GetProcAddress(module, without_provenance(usize::from(ordinal))) as usize
++            );
++            assert_eq!(
++                address,
++                GetProcAddress(module, name.as_ptr().cast()) as usize
++            );
++            addresses[i] = address;
++        }
++        assert!(GetProcAddress(module, without_provenance(0xffff)).is_null());
++        // SAFETY: these addresses were resolved as the two functions with the corresponding Windows ABI.
++        let alloc: unsafe extern "system" fn(*const u16, u32) -> *const u16 =
++            unsafe { std::mem::transmute(addresses[0]) };
++        // SAFETY: the second address is SysFreeString.
++        let free: unsafe extern "system" fn(*const u16) =
++            unsafe { std::mem::transmute(addresses[1]) };
++        let input = [0x41, 0, 0x03a9];
++        // SAFETY: input is live for three UTF-16 units. The returned BSTR stays live until free.
++        unsafe {
++            let string = alloc(input.as_ptr(), input.len() as u32);
++            assert!(!string.is_null());
++            assert_eq!(SysStringLen(string), 3);
++            assert_eq!(std::slice::from_raw_parts(string, 4), &[0x41, 0, 0x03a9, 0]);
++            free(string);
++            free(null());
++        }
++        assert_ne!(FreeLibrary(module), 0);
++    }
++}

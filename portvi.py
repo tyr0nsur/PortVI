@@ -87,7 +87,7 @@ def smoke(executable, rustc, version, env):
         folder = Path(staging)
         probe = folder / "portvi_probe.exe"
         subprocess.run([
-            rustc, version, "--edition=2024", "-C", "panic=abort",
+            rustc, version, "--edition=2024", "-C", "panic=abort", "-C", "opt-level=2",
             "-C", "link-arg=/ENTRY:probe_entry", "-C", "link-arg=/SUBSYSTEM:CONSOLE",
             str(ROOT / "probes" / "runtime.rs"), "-o", str(probe),
         ], cwd=folder, env=env, check=True)
@@ -106,7 +106,7 @@ def smoke(executable, rustc, version, env):
         if result.returncode != 73 or "title exited with 73" not in result.stdout.splitlines():
             sys.stderr.write(result.stderr)
             raise RuntimeError(f"Native probe did not return its success marker (host exit {result.returncode}).")
-        print("PASS: source-built x64 probe called XGameRuntimeInitialize and returned 73.")
+        print("PASS: source-built x64 probe initialized the runtime, round-tripped a BSTR and returned 73.")
 
 
 def main():

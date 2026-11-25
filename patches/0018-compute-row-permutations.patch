@@ -1,0 +1,652 @@
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 2c824eeef724a8425675f4ebff57f6c04d97397e..e551740b02f85e59079d0b2bc5ab260e710b1a05 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
+ use crate::structure::{Atom, Bool, LaneExit, Structured};
+ 
+ mod bvh;
++mod permlane;
+ 
+ type Why = &'static str;
+ 
+@@ -307,6 +308,8 @@ struct Lower<'a> {
+     def_block: HashMap<Value, usize>,
+     /// IR block being lowered.
+     cur_ir: usize,
++    /// Blocks reached with all host lanes, computed once if a permlane needs inactive sources.
++    full_wave_blocks: std::cell::OnceCell<Option<Vec<bool>>>,
+     /// Whole-wave sections by block and start index.
+     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
+     /// Values written in a section that code outside it reads.
+@@ -642,7 +645,7 @@ impl<'a> Lower<'a> {
+                 n.starts_with("ds_swizzle")
+                     || n.contains("permute")
+                     || n.starts_with("v_mbcnt")
+-                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
++                    || matches!(n, "v_readlane_b32" | "v_writelane_b32" | "v_permlane16_b32" | "v_permlanex16_b32")
+                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+                     || reads_mask_as_data(x.st, i)
+             }) || reads_mask_derived(p, x.st)
+@@ -841,6 +844,7 @@ impl<'a> Lower<'a> {
+                 })
+                 .collect(),
+             cur_ir: 0,
++            full_wave_blocks: std::cell::OnceCell::new(),
+             sections: HashMap::new(),
+             section_out: HashSet::new(),
+             code_table: None,
+@@ -6683,6 +6687,91 @@ impl<'a> Lower<'a> {
+                 let r = self.s.m.select(c, is, a, old);
+                 int(self, r)
+             }
++            "v_permlane16_b32" | "v_permlanex16_b32" => {
++                // RDNA2 ISA 12.12: each nibble of {src2, src1} selects a lane
++                // in this row of 16, or the other row of the same 32-lane half.
++                // OP_SEL[0:1] are fetch-inactive and bound-control, not half selects.
++                if v.abs != 0 || v.neg != 0 || v.opsel & !3 != 0 {
++                    return Err("permlane input modifiers");
++                }
++                self.cross_lane(false)?;
++                let fetch_inactive = v.opsel & 1 != 0;
++                let cross = name == "v_permlanex16_b32";
++                // FI can read a lane outside EXEC, even when its VGPR contains
++                // an earlier value. A partial last row has no such host invocation.
++                let row_group = if cross { 32 } else { 16 };
++                if fetch_inactive && self.s.threads.is_some_and(|group| {
++                    !group.iter().map(|&n| u64::from(n)).product::<u64>().is_multiple_of(row_group)
++                }) {
++                    return Err("a permlane fetch from an incomplete thread-group row");
++                }
++                if fetch_inactive
++                    && !self.full_wave_blocks.get_or_init(|| permlane::all_lane_blocks(self.x.p, self.x.st))
++                        .as_ref().is_some_and(|all| all[self.cur_ir])
++                {
++                    // DXIL cannot read the last VGPR value of a host invocation
++                    // that has left through a lane branch. A guard keeps it here.
++                    return Err("a permlane fetch from lanes outside the host branch");
++                }
++                let (x, lo, hi) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
++                let lane = self.lane_index();
++                let (k7, k8, k15, k16, k31, k32, k4, one, zero) = (
++                    self.s.m.i32(7),
++                    self.s.m.i32(8),
++                    self.s.m.i32(15),
++                    self.s.m.i32(16),
++                    self.s.m.i32(31),
++                    self.s.m.i32(32),
++                    self.s.m.i32(4),
++                    self.s.m.i32(1),
++                    self.s.m.i32(0),
++                );
++                let pos = self.s.m.bin(c, Bin::And, lane, k15);
++                let lower = self.s.m.cmp(c, pred::IULT, pos, k8);
++                let packed = self.s.m.select(c, lower, lo, hi);
++                let shift = self.s.m.bin(c, Bin::And, pos, k7);
++                let shift = self.s.m.bin(c, Bin::Mul, shift, k4);
++                let pick = self.s.m.bin(c, Bin::LShr, packed, shift);
++                let pick = self.s.m.bin(c, Bin::And, pick, k15);
++                let not15 = self.s.m.i32(!15);
++                let mut row = self.s.m.bin(c, Bin::And, lane, not15);
++                if cross {
++                    row = self.s.m.bin(c, Bin::Xor, row, k16);
++                }
++                let src = self.s.m.bin(c, Bin::Or, row, pick);
++                let r = if fetch_inactive {
++                    self.read_lane(x, src)
++                } else {
++                    // Ballot the console EXEC guard as well as the host's active
++                    // invocations. Never shuffle from an inactive host lane.
++                    let enabled = guard.unwrap_or_else(|| self.s.m.bool(true));
++                    let i32t = self.s.t.i32;
++                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
++                    let mask =
++                        self.s
++                            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[enabled]);
++                    let lo = self.s.m.extract(c, mask, 0);
++                    let hi = self.s.m.extract(c, mask, 1);
++                    let lower = self.s.m.cmp(c, pred::IULT, src, k32);
++                    let word = self.s.m.select(c, lower, lo, hi);
++                    let bit = self.s.m.bin(c, Bin::And, src, k31);
++                    let bit = self.s.m.bin(c, Bin::LShr, word, bit);
++                    let bit = self.s.m.bin(c, Bin::And, bit, one);
++                    let active = self.s.m.cmp(c, pred::NE, bit, zero);
++                    let safe = self.s.m.select(c, active, src, lane);
++                    let read = self.read_lane(x, safe);
++                    let fallback = if v.opsel & 2 != 0 {
++                        zero
++                    } else {
++                        let Some(Operand::Vector { reg, .. }) = v.dst else {
++                            return Err("a permlane result outside a VGPR");
++                        };
++                        self.i32_of(inst.read(Reg::V(reg)).ok_or("a permlane old value")?)?
++                    };
++                    self.s.m.select(c, active, read, fallback)
++                };
++                int(self, r)
++            }
+             "v_readfirstlane_b32"
+                 if inst
+                     .writes
+diff --git a/crates/victory-shader/src/emit/lower/permlane.rs b/crates/victory-shader/src/emit/lower/permlane.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..ff662f45ef3a2410bcffa748b54c4146bb62ec34
+--- /dev/null
++++ b/crates/victory-shader/src/emit/lower/permlane.rs
+@@ -0,0 +1,81 @@
++use super::{Atom, LaneExit, Program, Structured};
++
++/// Blocks reached by every host lane: a fetch-inactive shuffle cannot
++/// recover registers of invocations absent from a divergent host branch.
++pub(super) fn all_lane_blocks(p: &Program, st: &Structured) -> Option<Vec<bool>> {
++    let exit_block = st.exits.len();
++    let n = exit_block + 1;
++    let mut successors = vec![Vec::new(); n];
++    let mut rpo = vec![usize::MAX; exit_block];
++    for (index, block) in crate::ir::reverse_postorder(&p.blocks)
++        .into_iter()
++        .enumerate()
++    {
++        rpo[block] = index;
++    }
++    let mut aborts = vec![false; exit_block];
++    for (b, exit) in st.exits.iter().enumerate() {
++        match *exit {
++            LaneExit::Jump(t) => {
++                successors[b].push(t);
++                if rpo[b] != usize::MAX && rpo[t] <= rpo[b] {
++                    // `Lower::exit` adds a per-lane return at the iteration
++                    // limit of an unconditional back edge. It bypasses the
++                    // loop's normal exit and every later reconvergence point.
++                    successors[b].push(exit_block);
++                    aborts[b] = true;
++                }
++            }
++            LaneExit::Branch {
++                taken, not_taken, ..
++            } => {
++                successors[b].extend([taken, not_taken]);
++            }
++            LaneExit::End => successors[b].push(exit_block),
++            LaneExit::Indirect => return None,
++        }
++    }
++    // Post-dominators are the ordinary dominators of the reversed graph.
++    // One synthetic exit includes early returns from a bounded loop.
++    let mut predecessors = vec![Vec::new(); n];
++    for (from, next) in successors.iter().enumerate() {
++        for &to in next {
++            predecessors[to].push(from);
++        }
++    }
++    let order = crate::ir::graph_rpo(n, exit_block, |b, i| predecessors[b].get(i).copied());
++    if order.len() != n {
++        return None;
++    }
++    let mut index = vec![usize::MAX; n];
++    for (i, &b) in order.iter().enumerate() {
++        index[b] = i;
++    }
++    let post = crate::ir::graph_idoms(&order, &index, |b| &successors[b]);
++    let mut all = vec![true; n];
++    let mut visited = vec![usize::MAX; n];
++    for (branch, exit) in st.exits.iter().enumerate() {
++        let divergent = match *exit {
++            LaneExit::Branch { when, .. } => !st
++                .bools
++                .support(when)
++                .iter()
++                .all(|a| matches!(a, Atom::Uniform(_))),
++            _ => false,
++        };
++        if !divergent && !aborts[branch] {
++            continue;
++        }
++        let mut pending = successors[branch].clone();
++        while let Some(b) = pending.pop() {
++            if visited[b] == branch || b == post[branch] {
++                continue;
++            }
++            visited[b] = branch;
++            all[b] = false;
++            pending.extend(successors[b].iter().copied());
++        }
++    }
++    all.truncate(exit_block);
++    Some(all)
++}
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index 18a5512b7730c31ffac03ac64842b0a767947975..66e97500fa9a146d38194f00a988897f1ba2fde9 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -227,6 +227,8 @@ mod g16_tests;
+ #[cfg(all(windows, any(test, feature = "host")))]
+ pub mod host;
+ mod lower;
++#[cfg(all(test, windows))]
++mod permlane_tests;
+ mod rect;
+ pub use rect::{rectangle_gs, right_angle};
+ #[cfg(all(test, windows))]
+diff --git a/crates/victory-shader/src/emit/permlane_tests.rs b/crates/victory-shader/src/emit/permlane_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..b387418df9399447026928712d1c43863c81f0f9
+--- /dev/null
++++ b/crates/victory-shader/src/emit/permlane_tests.rs
+@@ -0,0 +1,362 @@
++//! Synthetic row permutations on hosts supporting waves of at least 32 lanes.
++
++use super::host::{Dispatch, Host, Root, View};
++use super::{HostShader, lower, validator};
++use crate::native::{
++    ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
++};
++use crate::{ShaderError, io, ir, resource, structure};
++
++const THREADS: u32 = 128;
++const OLD: u32 = 42;
++const BASE: u32 = 0x1234_0000;
++
++fn native(cross: bool, fi: bool, bc: bool, alias: bool, wave64: bool) -> NativeProgram {
++    let mov = |dst: u32, src: u32| 0x7E00_0200 | dst << 17 | src;
++    let smov = |dst: u32, src: u32| 0xBE80_0300 | dst << 16 | src;
++    let mut words = vec![
++        smov(5, 128),
++        0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
++        125 << 25,   // s_load_dwordx4 s[8:11], s[4:5], 0
++        0x340E_0082, // v_lshlrev_b32 v7, 2, v0 (output byte offset)
++        0x4A0A_00FF,
++        BASE, // v_add_nc_u32 v5, BASE, v0
++        mov(6, if alias { 256 + 5 } else { 128 + OLD }),
++    ];
++    words.push(if wave64 { 0xBEFE_0402 } else { smov(126, 2) }); // exec = s[2:3] / s2
++    words.extend([
++        0xD400_0006
++            | (if cross { 0x378 } else { 0x377 }) << 16
++            | u32::from(fi) << 11
++            | u32::from(bc) << 12,
++        (256 + if alias { 6 } else { 5 }) | (1 << 18),
++    ]); // v_permlane[x]16_b32 v6, v5/v6, s0, s1
++    words.push(if wave64 { 0xBEFE_04C1 } else { smov(126, 193) }); // restore EXEC
++    words.extend([
++        0x38 << 26 | 0x1C << 18 | 1 << 12,
++        0x80 << 24 | 2 << 16 | 6 << 8 | 7, // buffer_store_dword v6, v7, s[8:11], 0 offen
++        0xBF81_0000,
++    ]);
++    NativeProgram {
++        stage: HwStage::Cs,
++        wave64,
++        vgprs: 8,
++        layout: vec![
++            RootParam {
++                root: RootType::Constants,
++                table_offset_dwords: 0,
++                sgprs: 4,
++                base_register: 0,
++                user_data: 0,
++                slot: 0,
++            },
++            RootParam {
++                root: RootType::Table,
++                table_offset_dwords: 0,
++                sgprs: 1,
++                base_register: 0,
++                user_data: 4,
++                slot: 1,
++            },
++        ],
++        used: vec![UsedResource {
++            kind: ResourceType::Uav,
++            root: RootType::Table,
++            table_offset_dwords: 0,
++            lower_bound: 0,
++            stride: 0,
++            dwords: 4,
++            user_data: 4,
++            slot: 1,
++        }],
++        io: StageIo::Cs(ComputeIo {
++            rsrc2: 5 << 1,
++            threads: [THREADS, 1, 1],
++        }),
++        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
++    }
++}
++
++fn lowered(native: &NativeProgram) -> Result<HostShader, ShaderError> {
++    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir");
++    let st = structure::structure(&p).expect("structure");
++    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resources");
++    let io = io::raise(&p, native).expect("io");
++    let result = lower::lower(&lower::Parts {
++        native,
++        p: &p,
++        st: &st,
++        io: &io,
++        res: &res,
++        inputs: Vec::new(),
++        outputs: Vec::new(),
++        prims: Vec::new(),
++        mesh_stride: 0,
++        view_marks: false,
++    });
++    let result = result?;
++    let shader = HostShader {
++        stage: HwStage::Cs,
++        dxil: result.dxil,
++        user_data: result.user_data,
++        samplers: result.samplers,
++        static_samplers: Vec::new(),
++        root_cbvs: result.root_cbvs,
++        root_srvs: result.root_srvs,
++        root_uavs: result.root_uavs,
++        memory: result.memory,
++        memory_writes: result.memory_writes,
++        view_addresses: result.view_addresses,
++        heap: result.heap,
++        heap_writes: result.heap_writes,
++        view_marks: false,
++    };
++    match validator::Validator::load(validator::Validator::default_path().as_deref()) {
++        Ok(mut v) => {
++            let mut copy = shader.dxil.clone();
++            v.validate(&mut copy).expect("DXIL validation");
++            assert_eq!(copy[4..20], shader.dxil[4..20], "container hash");
++        }
++        Err(e) => eprintln!("DXIL validator unavailable: {e}"),
++    }
++    Ok(shader)
++}
++
++#[test]
++fn fetch_inactive_needs_a_complete_source_row() {
++    for (cross, threads, valid) in [
++        (false, 15, false),
++        (false, 16, true),
++        (true, 16, false),
++        (true, 32, true),
++    ] {
++        let mut program = native(cross, true, false, false, false);
++        let StageIo::Cs(ref mut cs) = program.io else {
++            unreachable!()
++        };
++        cs.threads = [threads, 1, 1];
++        let result = lowered(&program);
++        if valid {
++            result.expect("complete rows have all source invocations");
++        } else {
++            assert!(matches!(
++                result,
++                Err(ShaderError::Unsupported {
++                    what: "a permlane fetch from an incomplete thread-group row",
++                    ..
++                })
++            ));
++        }
++    }
++}
++
++#[test]
++fn permlane_fetch_inactive_outside_the_host_branch_is_rejected() {
++    let mut native = native(true, true, false, false, false);
++    let mut words: Vec<u32> = native
++        .code
++        .as_chunks::<4>()
++        .0
++        .iter()
++        .map(|w| u32::from_le_bytes(*w))
++        .collect();
++    // Skip the permutation when EXEC is empty. Structurisation turns this
++    // into a host lane branch, so FI cannot read lanes that took the skip.
++    words.insert(8, 0xBF88_0002); // s_cbranch_execz +2 (to the EXEC restore)
++    native.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
++    assert!(matches!(
++        lowered(&native),
++        Err(ShaderError::Unsupported {
++            what: "a permlane fetch from lanes outside the host branch",
++            ..
++        })
++    ));
++}
++
++#[test]
++fn permlane_fetch_inactive_after_reconvergence_is_allowed() {
++    let mut native = native(true, true, false, false, false);
++    let mut words: Vec<u32> = native
++        .code
++        .as_chunks::<4>()
++        .0
++        .iter()
++        .map(|w| u32::from_le_bytes(*w))
++        .collect();
++    // The branch only skips a scalar nop; every host lane meets at the shuffle.
++    words.splice(8..8, [0xBF88_0001, 0xBF80_0000]);
++    native.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
++    lowered(&native).expect("fetch-inactive after the lanes reconverge");
++}
++
++#[test]
++fn permlane_fetch_inactive_inside_a_uniform_branch_is_allowed() {
++    let mut native = native(true, true, false, false, false);
++    let mut words: Vec<u32> = native
++        .code
++        .as_chunks::<4>()
++        .0
++        .iter()
++        .map(|w| u32::from_le_bytes(*w))
++        .collect();
++    words.splice(8..8, [0xBF06_8000, 0xBF85_0002]); // scalar compare; skip shuffle on SCC
++    native.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
++    lowered(&native).expect("all host lanes take the scalar branch together");
++}
++
++#[test]
++fn permlane_fetch_inactive_after_a_lane_abort_is_rejected() {
++    let mut native = native(true, true, false, false, false);
++    let mut words: Vec<u32> = native
++        .code
++        .as_chunks::<4>()
++        .0
++        .iter()
++        .map(|w| u32::from_le_bytes(*w))
++        .collect();
++    // A lane-dependent header test with an unconditional back edge. The
++    // emitter's iteration limit returns the looping lanes from the shader;
++    // they never meet the lanes which reached the shuffle normally.
++    words.splice(
++        8..8,
++        [
++            0x7D88_0003, // v_cmp_gt_u32 vcc, s3, v0
++            0xBF86_0002, // s_cbranch_vccz -> shuffle
++            0xBF80_0000, // s_nop 0
++            0xBF82_FFFC, // s_branch -> compare
++        ],
++    );
++    native.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
++    assert!(matches!(
++        lowered(&native),
++        Err(ShaderError::Unsupported {
++            what: "a permlane fetch from lanes outside the host branch",
++            ..
++        })
++    ));
++}
++
++#[test]
++fn permlane_rows_and_inactive_sources() {
++    let _one = super::valu_tests::ONE_AT_A_TIME
++        .lock()
++        .unwrap_or_else(|e| e.into_inner());
++    let mut ran = 0;
++    for (backend, warp) in [("hardware", false), ("WARP", true)] {
++        let Ok(host) = Host::new(warp) else {
++            eprintln!("no SM 6.6 {backend}; skipped");
++            continue;
++        };
++        let mut options =
++            windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
++        // SAFETY: options is the correctly sized output for this feature query.
++        unsafe {
++            host.device
++                .CheckFeatureSupport(
++                    windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_D3D12_OPTIONS1,
++                    (&raw mut options).cast(),
++                    size_of_val(&options) as u32,
++                )
++                .expect("wave capabilities");
++        }
++        eprintln!(
++            "{backend} waves {}..{}",
++            options.WaveLaneCountMin, options.WaveLaneCountMax
++        );
++        if options.WaveLaneCountMax < 32 {
++            eprintln!("{backend} cannot hold two 16-lane rows; GPU checks skipped");
++            continue;
++        }
++        ran += 1;
++        let mut dispatches = 0usize;
++        eprintln!("permlane: testing row and EXEC cases on {backend}");
++        for wave64 in [false, true] {
++            let wave = if wave64 { 64 } else { 32 };
++            if wave < options.WaveLaneCountMin || wave > options.WaveLaneCountMax {
++                eprintln!("{backend} does not support the requested console wave size; skipped");
++                continue;
++            }
++            for cross in [false, true] {
++                for fi in [false, true] {
++                    for bc in [false, true] {
++                        for alias in [false, true] {
++                            let shader = lowered(&native(cross, fi, bc, alias, wave64))
++                                .expect("lower permlane");
++                            let (root, pso) =
++                                host.compute_pipeline(&shader).expect("permlane pipeline");
++                            for selectors in [
++                                [0x7654_3210u32, 0xFEDC_BA98], // identity
++                                [0x89AB_CDEF, 0x0123_4567],    // reverse
++                                [0, 0],                        // broadcast lane 0
++                                [u32::MAX, u32::MAX],          // broadcast lane 15
++                                [0xF10E_2D3C, 0x4B5A_6978],    // arbitrary; both selector words
++                            ] {
++                                for mask in [
++                                    u32::MAX,
++                                    0x5555_5555,
++                                    0xFFFF_0000,
++                                    0x0001_8000,
++                                    0x8000_0001,
++                                    1,
++                                    0,
++                                ] {
++                                    let constants = [selectors[0], selectors[1], mask, mask];
++                                    let mut ud = vec![0; shader.user_data_dwords() as usize];
++                                    for u in &shader.user_data {
++                                        ud[u.index as usize] = if u.root == RootType::Constants {
++                                            constants[u.dword as usize]
++                                        } else {
++                                            0
++                                        };
++                                    }
++                                    let out = host
++                                        .dispatch(
++                                            &root,
++                                            &pso,
++                                            &Dispatch {
++                                                roots: vec![(0, Root::Constants(ud))],
++                                                views: &[View::RawUav(THREADS)],
++                                                samplers: &[],
++                                                groups: [1, 1, 1],
++                                            },
++                                        )
++                                        .expect("dispatch permlane");
++                                    dispatches += 1;
++                                    for t in 0..THREADS {
++                                        let pos = t % 16;
++                                        let packed =
++                                            u64::from(selectors[0]) | u64::from(selectors[1]) << 32;
++                                        let pick = (packed >> (4 * pos)) as u32 & 15;
++                                        let src = ((t & !15) ^ if cross { 16 } else { 0 }) | pick;
++                                        let old = if alias { BASE + t } else { OLD };
++                                        let want = if mask >> (t % 32) & 1 == 0 {
++                                            old
++                                        } else if fi || mask >> (src % 32) & 1 != 0 {
++                                            BASE + src
++                                        } else if bc {
++                                            0
++                                        } else {
++                                            old
++                                        };
++                                        let got = out[0][t as usize];
++                                        assert_eq!(
++                                            got, want,
++                                            "{backend} wave64={wave64} cross={cross} fi={fi} bc={bc} alias={alias} selectors={selectors:x?} mask={mask:x} lane={t}"
++                                        );
++                                    }
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        eprintln!(
++            "permlane on {backend}: {dispatches} dispatches, {} lane results matched",
++            dispatches * THREADS as usize
++        );
++    }
++    if ran == 0 {
++        eprintln!("no SM 6.6 device with 32-lane rows; GPU checks skipped");
++    }
++}
+diff --git a/crates/victory-shader/src/ir.rs b/crates/victory-shader/src/ir.rs
+index d32861aa7c75a06b7b57e7d362af654d78faec7c..b58a4661c53953ccc16eae5dde2570dcd2b1d903 100644
+--- a/crates/victory-shader/src/ir.rs
++++ b/crates/victory-shader/src/ir.rs
+@@ -341,15 +341,20 @@ fn lookup(outs: &[(Reg, Value)], reg: Reg) -> Value {
+ }
+ 
+ pub(crate) fn reverse_postorder(blocks: &[Block]) -> Vec<usize> {
+-    let mut seen = vec![false; blocks.len()];
+-    let mut post = Vec::with_capacity(blocks.len());
+-    let mut stack = vec![(0, 0)];
+-    seen[0] = true;
++    graph_rpo(blocks.len(), 0, |b, i| blocks[b].exit.successors().get(i).copied())
++}
++
++/// Reverse postorder for a graph whose edges can be visited by index.
++pub(crate) fn graph_rpo(n: usize, entry: usize, next: impl Fn(usize, usize) -> Option<usize>) -> Vec<usize> {
++    let mut seen = vec![false; n];
++    let mut post = Vec::with_capacity(n);
++    let mut stack = vec![(entry, 0)];
++    seen[entry] = true;
+     while let Some(top) = stack.last_mut() {
+         let (b, i) = *top;
+         top.1 += 1;
+-        match blocks[b].exit.successors().get(i) {
+-            Some(&s) if !seen[s] => {
++        match next(b, i) {
++            Some(s) if !seen[s] => {
+                 seen[s] = true;
+                 stack.push((s, 0));
+             }
+@@ -407,7 +412,12 @@ pub(crate) fn irreducible_edge(
+ /// blocks' `usize::MAX`); `order` is reverse postorder, `index` each
+ /// block's position in it.
+ pub(crate) fn idoms(blocks: &[Block], order: &[usize], index: &[usize]) -> Vec<usize> {
+-    let mut idom = vec![usize::MAX; blocks.len()];
++    graph_idoms(order, index, |b| &blocks[b].preds)
++}
++
++/// Immediate dominators using predecessor lists in the direction of traversal.
++pub(crate) fn graph_idoms<'a>(order: &[usize], index: &[usize], predecessors: impl Fn(usize) -> &'a [usize]) -> Vec<usize> {
++    let mut idom = vec![usize::MAX; index.len()];
+     let Some(&entry) = order.first() else {
+         return idom;
+     };
+@@ -428,7 +438,7 @@ pub(crate) fn idoms(blocks: &[Block], order: &[usize], index: &[usize]) -> Vec<u
+         changed = false;
+         for &b in &order[1..] {
+             let mut new = usize::MAX;
+-            for &q in blocks[b].preds.iter().filter(|&&q| idom[q] != usize::MAX) {
++            for &q in predecessors(b).iter().filter(|&&q| idom[q] != usize::MAX) {
+                 new = if new == usize::MAX {
+                     q
+                 } else {

@@ -1,0 +1,450 @@
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index 79a295f54bbff98ffecc3d56a4683f6efe3bb3e3..73af865a500575898e3525e40bb0b9a02ec061b0 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -1099,6 +1099,20 @@ fn srv_alignment(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC, element: u64) -> u64 {
+     if buffer.StructureByteStride == 0 && buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 == 0 {
+         return element;
+     }
++    raw_alignment(element)
++}
++
++/// Alignment of a mirrored buffer UAV in a shared host resource.
++fn uav_alignment(desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC, element: u64) -> u64 {
++    // SAFETY: called for buffer UAVs.
++    if unsafe { desc.Anonymous.Buffer.Flags }.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
++        raw_alignment(element)
++    } else {
++        element
++    }
++}
++
++fn raw_alignment(element: u64) -> u64 {
+     let alignment = u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT);
+     // The alignment is a power of two. Divide out its common factor with the stride.
+     let common = 1u64 << element.trailing_zeros().min(alignment.trailing_zeros());
+@@ -1195,22 +1209,28 @@ struct BufferView {
+     /// ones (as the console's driver counts them); a raw range past
+     /// `u32::MAX` bytes saturates.
+     records: u32,
++    /// STRIDE: bytes per record, the element size of typed views (packed
++    /// formats and 12- and 16-byte ones included) and the structure stride
++    /// of structured ones; 0 for raw views, whose records are bytes.
++    stride: u32,
+     /// BUF_FMT ([`buffer_format`]).
+     format: u8,
+ }
+ 
+ impl BufferView {
+     /// The console buffer descriptor's dwords 0-3.
+-    /// Modeled: BASE_ADDRESS (dword 0, dword 1 bits 0-15), NUM_RECORDS
+-    /// (dword 2) and FORMAT (dword 3 bits 12-18).
+-    /// Not modeled, left 0: the rest of dword 1 (STRIDE, SWIZZLE_ENABLE) and
+-    /// of dword 3 (DST_SEL_XYZW, INDEX_STRIDE, ADD_TID_ENABLE, OOB_SELECT,
+-    /// TYPE). No word of the API description (an SRV's padding, the high
+-    /// half of a UAV's FirstElement) is passed through.
++    /// Modeled: BASE_ADDRESS (dword 0, dword 1 bits 0-15), STRIDE (dword 1
++    /// bits 16-29), NUM_RECORDS (dword 2) and FORMAT (dword 3 bits 12-18).
++    /// Not modeled, left 0: the rest of dword 1 (CACHE_SWIZZLE,
++    /// SWIZZLE_ENABLE) and of dword 3 (DST_SEL_XYZW, INDEX_STRIDE,
++    /// ADD_TID_ENABLE, OOB_SELECT, TYPE). No word of the API description
++    /// (an SRV's padding, the high half of a UAV's FirstElement) is passed
++    /// through. A shader taking dwords 0-1 as an address drops bits 48 and
++    /// up, as the hardware does (`victory_shader::emit`, "Title memory").
+     fn words(&self) -> [u32; 4] {
+         [
+             self.address as u32,
+-            (self.address >> 32) as u32 & 0xFFFF,
++            (self.address >> 32) as u32 & 0xFFFF | (self.stride & 0x3FFF) << 16,
+             self.records,
+             u32::from(self.format & 0x7F) << 12,
+         ]
+@@ -1335,6 +1355,10 @@ fn buffer_view(view: &View) -> Option<BufferView> {
+         bytes,
+         // D3D12 counts raw views in dwords, the console in bytes.
+         records: if raw { count.saturating_mul(4) } else { count },
++        // As the record count: a raw flag wins over a structure stride the
++        // API does not allow beside it. Strides past 14 bits (the API allows
++        // 2048 at most) keep their low bits, as the field takes them.
++        stride: if raw { 0 } else { element as u32 },
+         // The title's own format, before the host's substitutions (`srv_desc`).
+         format: buffer_format(DXGI_FORMAT(words[0] as i32), stride, raw),
+     })
+@@ -1354,6 +1378,8 @@ pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Sh
+     let alignment = match view {
+         View::Shader(_, Some(d)) => srv_alignment(&srv_desc(d), element),
+         View::Placed(false, _, d) => srv_alignment(&srv_desc(d[..10].try_into().ok()?), element),
++        View::Unordered(_, _, Some(d)) => uav_alignment(&uav_desc(d), element),
++        View::Placed(true, _, d) => uav_alignment(&uav_desc(d[..10].try_into().ok()?), element),
+         _ => element,
+     };
+     let (shadow, _) = crate::shadow::for_view(address, len, alignment)?;
+@@ -1477,7 +1503,11 @@ fn buffer_uav(
+         return None;
+     }
+     let start = address + buffer.FirstElement * element;
+-    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
++    let bytes = u64::from(buffer.NumElements) * element;
++    let alignment = uav_alignment(&desc, element);
++    let (shadow, own) = crate::shadow::for_view(start, bytes, alignment)?;
++    // SAFETY: the buffer descriptor is still the active union member.
++    let buffer = unsafe { &mut desc.Anonymous.Buffer };
+     // SAFETY: a live buffer.
+     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+@@ -2340,6 +2370,51 @@ mod tests {
+         assert_eq!(view.records, u32::MAX);
+     }
+ 
++    /// Dword 1 holds address bits 32-47 and, beside them, STRIDE (bits
++    /// 16-29): the element size of typed views, the structure stride of
++    /// structured ones, 0 for raw ones. Neither field changes the other, nor
++    /// the byte range and record count.
++    #[test]
++    fn descriptor_word_1_holds_the_high_address_and_the_stride() {
++        let mut resource = [0; 14];
++        resource[0] = 1;
++        let base = 0x7654_3210_0000u64;
++        let raw = (D3D12_BUFFER_SRV_FLAG_RAW.0 | D3D12_BUFFER_UAV_FLAG_RAW.0) as u32;
++        // Unordered, format, structure stride, flags; stride, record count
++        // and bytes expected for 6 elements from element 1.
++        for (unordered, format, structure, flags, stride, records, bytes) in [
++            (false, DXGI_FORMAT_R8_UINT, 0, 0, 1, 6, 6),
++            (false, DXGI_FORMAT_R11G11B10_FLOAT, 0, 0, 4, 6, 24),
++            (true, DXGI_FORMAT_R10G10B10A2_UINT, 0, 0, 4, 6, 24),
++            (true, DXGI_FORMAT_R16G16B16A16_FLOAT, 0, 0, 8, 6, 48),
++            (false, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, 12, 6, 72),
++            (true, DXGI_FORMAT_R32G32B32A32_UINT, 0, 0, 16, 6, 96),
++            (false, DXGI_FORMAT_UNKNOWN, 24, 0, 24, 6, 144),
++            (true, DXGI_FORMAT_UNKNOWN, 2048, 0, 2048, 6, 12288),
++            (false, DXGI_FORMAT_R32_TYPELESS, 0, raw, 0, 24, 24),
++            (true, DXGI_FORMAT_R32_TYPELESS, 0, raw, 0, 24, 24),
++            // Not allowed by the API, kept as before: a raw flag beside a
++            // structure stride counts bytes, a stride past 14 bits keeps
++            // its low bits and its byte range.
++            (false, DXGI_FORMAT_UNKNOWN, 12, raw, 0, 24, 72),
++            (true, DXGI_FORMAT_UNKNOWN, 0x4004, 0, 4, 6, 6 * 0x4004),
++        ] {
++            let mut words = [0; 16];
++            words[0] = format.0 as u32;
++            words[1] = 1; // buffer dimension
++            let (first, count, stride_at) = if unordered { (2, 4, 5) } else { (4, 6, 7) };
++            (words[first], words[count], words[stride_at], words[8]) = (1, 6, structure, flags);
++            (words[10], words[11]) = (base as u32, (base >> 32) as u32);
++            let view = buffer_view(&View::Placed(unordered, resource, words)).unwrap();
++            let element = if structure > 0 { u64::from(structure) } else { bytes / 6 };
++            let element = if flags != 0 && structure == 0 { 4 } else { element };
++            assert_eq!((view.address, view.bytes, view.records), (base + element, bytes, records), "{format:?}");
++            let word = view.words()[1];
++            assert_eq!(word & 0xFFFF, 0x7654, "{format:?}: address bits 32-47");
++            assert_eq!(word >> 16, stride, "{format:?}: STRIDE, bits 30-31 clear");
++        }
++    }
++
+     /// Ranges past the address space are refused rather than wrapped; the
+     /// same views placed low keep their range.
+     #[test]
+@@ -2398,17 +2473,18 @@ mod tests {
+         let srv = |format: DXGI_FORMAT, first, count, flags| {
+             [format.0 as u32, 1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 0x0007_F000, first, 0, count, 0, flags, 0]
+         };
+-        let buffer = |address: u64, records: u32, format: u32| {
+-            [address as u32, (address >> 32) as u32 & 0xFFFF, records, format << 12]
++        // Dword 1: address bits 32-47, STRIDE at bits 16-29.
++        let buffer = |address: u64, stride: u32, records: u32, format: u32| {
++            [address as u32, (address >> 32) as u32 & 0xFFFF | stride << 16, records, format << 12]
+         };
+         // Slot 1, the guard beside the slot rewritten: 3 R32_FLOAT from
+         // element 2. Slots 0 and 3 stay empty.
+         crate::descriptor::create_srv(null, input, &srv(DXGI_FORMAT_R32_FLOAT, 2, 3, 0), at(1));
+-        let guard = buffer(base + 8, 3, 22);
++        let guard = buffer(base + 8, 4, 3, 22);
+         // Slot 2: 6 RGBA8 elements from element 4.
+         crate::descriptor::create_srv(null, input, &srv(DXGI_FORMAT_R8G8B8A8_UNORM, 4, 6, 0), at(2));
+         let table = || [entry(0), entry(1), entry(2), entry(3)];
+-        assert_eq!(table(), [[0; 4], guard, buffer(base + 16, 6, 56), [0; 4]], "a typed buffer view");
++        assert_eq!(table(), [[0; 4], guard, buffer(base + 16, 4, 6, 56), [0; 4]], "a typed buffer view");
+         // Slot 2: a 2D view of level 0 of a 4x1 RGBA8 texture placed in
+         // memory of its own (left null until a draw reads it; its words
+         // are written all the same).
+@@ -2426,7 +2502,7 @@ mod tests {
+         // Slot 2: a raw view of 5 dwords from dword 2, counted in bytes.
+         let raw = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+         crate::descriptor::create_srv(null, input, &srv(DXGI_FORMAT_R32_TYPELESS, 2, 5, raw), at(2));
+-        assert_eq!(table(), [[0; 4], guard, buffer(base + 8, 20, 20), [0; 4]], "a raw buffer view again");
++        assert_eq!(table(), [[0; 4], guard, buffer(base + 8, 0, 20, 20), [0; 4]], "a raw buffer view again");
+         drop(memory);
+     }
+ 
+diff --git a/crates/victory-gpu/src/descriptor/tests/buffer_data.rs b/crates/victory-gpu/src/descriptor/tests/buffer_data.rs
+index c1d38cfa1b32fc1a195267d45294ca99f1f784cc..4f26969bff904e52f37a05d8e096a1e7cb47d686 100644
+--- a/crates/victory-gpu/src/descriptor/tests/buffer_data.rs
++++ b/crates/victory-gpu/src/descriptor/tests/buffer_data.rs
+@@ -1,8 +1,8 @@
+ use super::*;
+ use std::ptr::null;
+ use windows::Win32::Graphics::Direct3D12::{
+-    D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, D3D12_SRV_DIMENSION_BUFFER,
+-    D3D12_UAV_DIMENSION_BUFFER,
++    D3D12_BUFFER_SRV_FLAG_RAW, D3D12_BUFFER_UAV_FLAG_RAW, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
++    D3D12_SRV_DIMENSION_BUFFER, D3D12_UAV_DIMENSION_BUFFER,
+ };
+ use windows::Win32::Graphics::Dxgi::Common::*;
+ use windows::core::{IUnknown, Interface};
+@@ -62,7 +62,7 @@ fn adjacent_buffer_descriptors_report_their_fields_after_a_rewrite() {
+     write_srv(1, DXGI_FORMAT_R32_UINT, 4, 5, 0);
+     write_srv(2, DXGI_FORMAT_R32_FLOAT, 12, 11, 0);
+ 
+-    let shader = descriptor_reader();
++    let shader = descriptor_reader(2);
+     assert!(shader.view_addresses && shader.root_srvs.is_empty() && !shader.memory);
+     let host = victory_shader::emit::host::Host {
+         device: device.device.clone(),
+@@ -104,6 +104,7 @@ fn adjacent_buffer_descriptors_report_their_fields_after_a_rewrite() {
+     let after = dispatch(0);
+     // AMD RDNA2 ISA, buffer resource descriptor: NUM_RECORDS is DWORD 2,
+     // FORMAT is bits 18:12 of DWORD 3. R32_UINT/SINT/FLOAT encode as 20/21/22.
++    // The address takes DWORD 1 bits 15:0 only: STRIDE lies above them.
+     let fields = |[lo, hi, count, word3]: [u32; 4]| {
+         let address = u64::from(lo) | (u64::from(hi & 0xffff) << 32);
+         (address.wrapping_sub(base), count, (word3 >> 12) & 0x7f)
+@@ -214,9 +215,154 @@ fn adjacent_buffer_descriptors_report_their_fields_after_a_rewrite() {
+     eprintln!("rebuilt descriptor table: original, cleared and reused slots matched on GPU");
+ }
+ 
++/// Each buffer view kind's descriptor as the shader's SGPRs hold it, before
++/// and after every slot is rewritten as another kind: dword 1 carries the
++/// address bits 32-47 and STRIDE (bits 29:16) side by side, the element size
++/// of typed views (packed and 12/16-byte formats too), the structure stride
++/// of structured ones, 0 for raw ones (records in bytes). A table relocated
++/// past the title slots holds the same words.
++#[test]
++fn shader_reads_high_address_and_stride_of_each_buffer_view_kind() {
++    const SLOTS: u32 = 6;
++    let Some(device) = crate::host::host() else {
++        eprintln!("no D3D12 device; skipped buffer stride readback");
++        return;
++    };
++    let mut guest = null();
++    let desc = HeapDesc { kind: VIEWS_KIND, count: SLOTS + 1, flags: SHADER_VISIBLE, nodes: 0 };
++    assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut guest), S_OK);
++    // SAFETY: create handed out one reference to the guest descriptor heap.
++    let _heap_owner = unsafe { IUnknown::from_raw(guest.cast_mut().cast()) };
++    let guest_heap = heap(guest);
++    let input = crate::resource::test_buffer(4096);
++    // SAFETY: test_buffer hands out one reference to the guest buffer.
++    let _input_owner = unsafe { IUnknown::from_raw(input.cast_mut().cast()) };
++    let base = crate::resource::buffer_bytes(input).unwrap().0 as u64;
++    let handle =
++        |slot: u32| guest_heap.start + u64::from(slot * increment_size(null(), VIEWS_KIND));
++    // A view: its API format, structure stride and raw flag.
++    type Kind = (DXGI_FORMAT, u32, bool);
++    let typed = |format| (format, 0, false);
++    let structured = |stride| (DXGI_FORMAT_UNKNOWN, stride, false);
++    let raw: Kind = (DXGI_FORMAT_R32_TYPELESS, 0, true);
++    // Unordered, kind, first element, count; then the expected STRIDE,
++    // NUM_RECORDS and FORMAT.
++    type Case = (bool, Kind, u32, u32, u32, u32, u32);
++    let write = |slot: u32, &(unordered, (format, stride, raw), first, count, ..): &Case| {
++        if unordered {
++            let flags = if raw { D3D12_BUFFER_UAV_FLAG_RAW.0 as u32 } else { 0 };
++            let dimension = D3D12_UAV_DIMENSION_BUFFER.0 as u32;
++            let desc = [format.0 as u32, dimension, first, 0, count, stride, 0, 0, flags, 0];
++            create_uav(null(), input, null(), &desc, handle(slot));
++        } else {
++            let flags = if raw { D3D12_BUFFER_SRV_FLAG_RAW.0 as u32 } else { 0 };
++            let dimension = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
++            let mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++            let desc = [format.0 as u32, dimension, mapping, 0, first, 0, count, stride, flags, 0];
++            create_srv(null(), input, &desc, handle(slot));
++        }
++        if unordered && raw {
++            let view = super::view(handle(slot)).unwrap();
++            let (copy, address, len) = crate::descriptor::host::view_copy(&view).unwrap();
++            assert_eq!((address, len), (base + u64::from(first) * 4, u64::from(count) * 4));
++            assert_eq!(copy.offset(address) % 16, 0, "raw UAV at slot {slot}");
++        }
++        // SAFETY: only query the live device's diagnostic state.
++        assert!(unsafe { device.device.GetDeviceRemovedReason() }.is_ok(), "invalid descriptor at slot {slot}: {format:?} stride={stride} raw={raw} first={first}");
++    };
++    // Raw and structured SRVs start on 16 bytes; every range fits 4 KiB.
++    let before: [Case; SLOTS as usize] = [
++        (false, typed(DXGI_FORMAT_R32G32B32_FLOAT), 1, 4, 12, 4, 74),
++        (false, structured(24), 2, 3, 24, 3, 20),
++        (false, raw, 4, 8, 0, 32, 20),
++        (true, typed(DXGI_FORMAT_R16G16B16A16_FLOAT), 3, 5, 8, 5, 71),
++        (true, structured(20), 1, 6, 20, 6, 20),
++        (true, raw, 2, 6, 0, 24, 20),
++    ];
++    // Each slot rewritten as another kind: no stale STRIDE survives.
++    let after: [Case; SLOTS as usize] = [
++        (false, raw, 4, 4, 0, 16, 20),
++        (false, typed(DXGI_FORMAT_R10G10B10A2_UNORM), 5, 7, 4, 7, 50),
++        (false, structured(16), 1, 2, 16, 2, 20),
++        (true, raw, 6, 3, 0, 12, 20),
++        (true, typed(DXGI_FORMAT_R32G32B32A32_UINT), 2, 4, 16, 4, 75),
++        (true, structured(2048), 0, 1, 2048, 1, 20),
++    ];
++    // RDNA2 buffer descriptor: BASE_ADDRESS in dword 0 and dword 1 bits
++    // 15:0, STRIDE dword 1 bits 29:16 (30-31 clear here), NUM_RECORDS dword
++    // 2, FORMAT dword 3 bits 18:12. Each read apart from the others.
++    let fields = |[lo, hi, records, word3]: [u32; 4]| {
++        (lo, hi & 0xFFFF, hi >> 16 & 0x3FFF, hi >> 30, records, word3 >> 12 & 0x7F)
++    };
++    let expected = |cases: [Case; SLOTS as usize]| {
++        cases.map(|(_, (_, _, raw), first, _, stride, records, format)| {
++            let element = if raw { 4 } else { u64::from(stride) };
++            let address = base + u64::from(first) * element;
++            (address as u32, (address >> 32) as u32 & 0xFFFF, stride, 0, records, format)
++        })
++    };
++
++    let shader = descriptor_reader(SLOTS);
++    let host = victory_shader::emit::host::Host { device: device.device.clone() };
++    let (root, pso) = host.compute_pipeline(&shader).unwrap();
++    let mirror = guest_heap.host().expect("host view heap");
++    let addresses = mirror.view_addresses().expect("view-address table");
++    const BYTES: u64 = 16 * SLOTS as u64;
++    let (output, mapped) = device.shared_buffer(BYTES).unwrap();
++    mirror.raw_view_at(0, Some(&output), 0, BYTES, true);
++    let dispatch = |base_slot: u32| {
++        let list = device.new_list().unwrap();
++        let mut table_base = vec![0u32; shader.user_data_dwords() as usize];
++        let table = shader.user_data.iter().find(|u| u.slot == 0 && u.dword == 0).unwrap();
++        table_base[table.index as usize] = base_slot * 32;
++        // SAFETY: the root table begins at base_slot; the shader reads its
++        // SLOTS input descriptors as data only and writes all of the
++        // output. Each submission finishes before the next rewrite.
++        unsafe {
++            std::ptr::write_bytes(mapped, 0xa5, BYTES as usize);
++            list.list.SetDescriptorHeaps(&[Some(mirror.heap.clone())]);
++            list.list.SetComputeRootSignature(&root);
++            list.list.SetPipelineState(&pso);
++            list.list.SetComputeRoot32BitConstants(0, table_base.len() as u32, table_base.as_ptr().cast(), 0);
++            list.list.SetComputeRootShaderResourceView(1, addresses);
++            list.list.Dispatch(1, 1, 1);
++        }
++        list.close();
++        device.execute(&[&list]);
++        // SAFETY: BYTES mapped bytes written before the submission's fence.
++        unsafe { mapped.cast::<[[u32; 4]; SLOTS as usize]>().read_unaligned() }
++    };
++
++    for (slot, case) in (1..).zip(&before) {
++        write(slot, case);
++    }
++    let first = dispatch(0);
++    for (slot, case) in (1..).zip(&after) {
++        write(slot, case);
++    }
++    let rewritten = dispatch(0);
++    eprintln!(
++        "(address low, bits 32-47, STRIDE, bits 30-31, records, FORMAT) before and after: {:?} {:?}",
++        first.map(fields),
++        rewritten.map(fields)
++    );
++    assert_eq!(first.map(fields), expected(before), "the first views");
++    assert_eq!(rewritten.map(fields), expected(after), "every slot rewritten as another kind");
++
++    // Descriptor-as-data: a relocated table holds the same whole words.
++    let relocated = mirror.dynamic(SLOTS + 1).expect("relocated table slots");
++    mirror.raw_view_at(relocated, Some(&output), 0, BYTES, true);
++    for slot in 1..=SLOTS {
++        mirror.make_at(relocated + slot, &super::view(handle(slot)).unwrap());
++    }
++    assert_eq!(dispatch(relocated), rewritten, "the relocated table's words");
++    mirror.release(relocated, SLOTS + 1);
++}
++
+ /// A synthetic one-thread GFX10 shader copies the four descriptor words at
+-/// table slots 1 and 2 into the raw UAV at slot 0. Neither input is dereferenced.
+-fn descriptor_reader() -> victory_shader::emit::HostShader {
++/// each table slot 1 to `slots` into the raw UAV at slot 0, 16 bytes a slot.
++/// No input is dereferenced.
++fn descriptor_reader(slots: u32) -> victory_shader::emit::HostShader {
+     use victory_shader::native::{
+         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
+     };
+@@ -225,22 +371,20 @@ fn descriptor_reader() -> victory_shader::emit::HostShader {
+         0xbe81_0380u32, // s_mov_b32 s1, 0: the table begins at s0
+         0xf408_0100,
+         0xfa00_0000, // s_load_dwordx4 s[4:7], s[0:1], 0 (output UAV)
+-        0xf408_0200,
+-        0xfa00_0020, // s_load_dwordx4 s[8:11], s[0:1], 32 (slot 1)
+-        0xf408_0300,
+-        0xfa00_0040, // s_load_dwordx4 s[12:15], s[0:1], 64 (slot 2)
+-        0xbf8c_0000, // s_waitcnt 0
+     ];
+-    for v in 0..8 {
+-        words.push(0x7e00_0200 | v << 17 | (8 + v)); // v_mov_b32 vN, s[8 + N]
++    for slot in 1..=slots {
++        words.extend([
++            0xf408_0200,
++            0xfa00_0000 | (32 * slot), // s_load_dwordx4 s[8:11], s[0:1], 32 * slot
++            0xbf8c_0000,             // s_waitcnt 0
++        ]);
++        for v in 0..4 {
++            words.push(0x7e00_0200 | v << 17 | (8 + v)); // v_mov_b32 vN, s[8 + N]
++        }
++        // buffer_store_dwordx4 v[0:3], off, s[4:7], 0 offset:16 * (slot - 1)
++        words.extend([0xe078_0000 | (16 * (slot - 1)), 0x8001_0000]);
+     }
+-    words.extend([
+-        0xe078_0000,
+-        0x8001_0000, // buffer_store_dwordx4 v[0:3], off, s[4:7], 0
+-        0xe078_0010,
+-        0x8001_0400, // buffer_store_dwordx4 v[4:7], off, s[4:7], 0 offset:16
+-        0xbf81_0000, // s_endpgm
+-    ]);
++    words.push(0xbf81_0000); // s_endpgm
+     let native = NativeProgram {
+         stage: HwStage::Cs,
+         wave64: false,
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index e551740b02f85e59079d0b2bc5ab260e710b1a05..72519189189cc73e9fbada1a8528d08f217fa6b6 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -4768,8 +4768,8 @@ impl<'a> Lower<'a> {
+     /// height, first and last level, type: size queries of a texture the
+     /// program never samples). They come from the host's view addresses,
+     /// `t1` in [`super::shader::MEMORY_SPACE`]: four dwords per heap index.
+-    // shortcut: dword 1 holds the address bits only (stride and swizzle read
+-    // 0) or a texture's width bits, dword 3 a texture's size fields or a buffer's FORMAT,
++    // shortcut: dword 1 holds a buffer's address bits 32-47 and STRIDE
++    // (swizzle reads 0) or a texture's width bits, dword 3 a texture's size fields or a buffer's FORMAT,
+     // with other buffer control fields left zero; dwords 4-7 stop the
+     // program when read; the table offset's computed part is taken as whole
+     // descriptors (32-byte multiples).
+diff --git a/crates/victory-shader/src/emit/memory_tests.rs b/crates/victory-shader/src/emit/memory_tests.rs
+index 2942b94eed96e18ce116bc43dbe919cb84bcea7f..a1587cce0919f96b18fad41c990b745e29fa33c2 100644
+--- a/crates/victory-shader/src/emit/memory_tests.rs
++++ b/crates/victory-shader/src/emit/memory_tests.rs
+@@ -257,9 +257,11 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
+     memory[0x84 / 4] = (-1.0f32).to_bits();
+     let value = 0xCAFE_F00D;
+     // Heap index 1 (the memory's view) has the title address, index 2 a
+-    // texture's size fields; four dwords per slot.
++    // texture's size fields; four dwords per slot. Dword 1 holds STRIDE
++    // (16) above the address bits, as the host writes it: the read through
++    // dwords 0-1 takes address bits 32-47 only.
+     let mut view_addresses = vec![0u32; 4 * 5];
+-    view_addresses[4..6].copy_from_slice(&[TITLE as u32, (TITLE >> 32) as u32]);
++    view_addresses[4..6].copy_from_slice(&[TITLE as u32, (TITLE >> 32) as u32 | 16 << 16]);
+     let words = [0x0000_0100, 0x0500_0001];
+     view_addresses[6..8].copy_from_slice(&words);
+     let image = [0xC000_0000, 0x0957_C0F9, 0x9004_2FAC];
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index 66e97500fa9a146d38194f00a988897f1ba2fde9..fc33a893e9558eff309c43873d95b59c6ee63cbc 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -165,8 +165,8 @@
+ //!   and an image descriptor's dwords 1-3 read only for sizes come from the
+ //!   root SRV `t1` in [`MEMORY_SPACE`]: per resource-heap index, four
+ //!   dwords, a console descriptor's first four as far as the host knows
+-//!   them: a buffer view's title address (high dword bits 0-15; stride bits
+-//!   0), a texture view's width and height - 1 (dword 1 bits 30-31, dword 2
++//!   them: a buffer view's title address (high dword bits 0-15; STRIDE in
++//!   bits 16-29, which addresses taken from the words drop), a texture view's width and height - 1 (dword 1 bits 30-31, dword 2
+ //!   bits 0-13 and 14-29), first and last level (dword 3 bits 12-15, 16-19)
+ //!   and type (bits 28-31) with an identity swizzle; zeros for anything
+ //!   else.
