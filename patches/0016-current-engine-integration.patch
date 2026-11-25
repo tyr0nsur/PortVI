@@ -1,0 +1,247 @@
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 6c80aa7..d605bdb 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -439,7 +439,7 @@ pub(crate) mod tests {
+         let Some(host) = host() else { return };
+         // No submission takes the marks meanwhile.
+         let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+-        let (plain, memory) = (victory_shader::emit::HEAP_VIEWS - 2, victory_shader::emit::HEAP_VIEWS - 1);
++        let (plain, memory) = (victory_shader::emit::heap_views() - 2, victory_shader::emit::heap_views() - 1);
+         crate::shadow::tests::mark_read(false, plain);
+         crate::shadow::tests::mark_read(true, memory);
+         let taken = crate::shadow::take_reads();
+diff --git a/crates/victory-gpu/src/resource_bc4_probe.rs b/crates/victory-gpu/src/resource_bc4_probe.rs
+index ec01a93..960d78e 100644
+--- a/crates/victory-gpu/src/resource_bc4_probe.rs
++++ b/crates/victory-gpu/src/resource_bc4_probe.rs
+@@ -1,9 +1,7 @@
+ //! GPU half of the source-authored DirectStorage fixture, enabled only for tests.
+ //!
+-//! The upload goes through the production path heap-indexing shaders use
+-//! ([`crate::texture::upload_changed`]): the staging buffer is detiled from
+-//! title memory only when [`crate::watch`] (or, for memory it does not track,
+-//! the content hash) reports a change, and its copy is recorded right away.
++//! The renderer schedules each changed subresource through [`crate::texture::upload`].
++//! The submission's upload list detiles its source and copies it before the draw.
+ 
+ use super::{
+     HeapProperties, RESOURCE_IIDS, ResourceDesc, create_committed, host_resource, resource_release,
+@@ -168,14 +166,9 @@ impl Sampler {
+     fn sample(&self, host: &Host, texture: &TitleTexture, upload: bool) -> [f32; TEXELS] {
+         let list = host.new_list().expect("BC4 command list");
+         let image = host_resource(texture.0).unwrap();
++        let before = crate::texture::uploads(texture.0);
+         if upload {
+-            // The production path refreshes the staging buffer now and
+-            // records its copy only if the watched memory (or its hash)
+-            // changed; the list keeps the staging buffer until it is reset.
+-            assert!(
+-                crate::texture::upload_changed(&list, texture.0, image),
+-                "the changed title memory was not uploaded"
+-            );
++            crate::texture::upload(&list, texture.0, &image);
+         }
+         crate::list::ensure_state(
+             &list,
+@@ -211,6 +204,10 @@ impl Sampler {
+         }
+         list.close();
+         host.execute(&[&list]);
++        assert_eq!(
++            crate::texture::uploads(texture.0) - before, u64::from(upload),
++            "submission-time uploads of the BC4 probe texture"
++        );
+         // SAFETY: execute waits for this list. The readback buffer holds 32
+         // aligned floats, and the copy completes before its mapped span is read.
+         unsafe {
+@@ -322,7 +319,7 @@ pub fn run(fill: impl FnOnce(&mut [u8; 16]), require_hardware: bool) {
+     // SAFETY: the layout places two consecutive BC4 blocks in this owned
+     // texture. A mutable borrow spans only the writes, never a GPU submission.
+     let address = unsafe { memory.cast_mut().add(first as usize).cast::<[u8; 16]>() };
+-    let sampler = Sampler::new(host, host_resource(raw).expect("BC4 host texture"));
++    let sampler = Sampler::new(host, &host_resource(raw).expect("BC4 host texture"));
+     let sentinel = [51u8, 51, 0, 0, 0, 0, 0, 0];
+     {
+         // SAFETY: the two blocks lie in this texture and no work has been
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+index 8d57a28..8b94012 100644
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -744,7 +744,7 @@ fn bitmap(memory: bool) -> Option<&'static Bitmap> {
+     BITMAPS[usize::from(memory)]
+         .get_or_init(|| {
+             // Written pages, then one read mark per heap index.
+-            let bits = victory_shader::emit::VIEW_READS + victory_shader::emit::HEAP_VIEWS;
++            let bits = victory_shader::emit::VIEW_READS + victory_shader::emit::HEAP_VIEWS_MAX;
+             let bytes = u64::from(bits / 8);
+             let (buffer, data) = host()?.shared_buffer(bytes)?;
+             crate::host::name(&buffer, || "views' written pages and read slots".into());
+@@ -777,7 +777,7 @@ static READS: Mutex<(Vec<u32>, Vec<u32>)> = Mutex::new((Vec::new(), Vec::new()))
+ /// at (`victory_shader::emit`, "Read marks"), each once until
+ /// [`forget_read`]. Clears the slots forgotten since first.
+ pub(crate) fn take_reads() -> Vec<u32> {
+-    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
++    let words = (victory_shader::emit::HEAP_VIEWS_MAX / 32) as usize;
+     let first = (victory_shader::emit::VIEW_READS / 32) as usize;
+     // Both bitmaps: shaders that use title memory mark their reads in theirs.
+     let mut maps: Vec<&mut [u32]> = [false, true]
+@@ -818,7 +818,7 @@ pub(crate) fn take_reads() -> Vec<u32> {
+ /// has seen every mark: its own record of slots seen keeps a slot read
+ /// again from being reported as new.
+ pub(crate) fn reads_since() -> Vec<u32> {
+-    let words = (victory_shader::emit::HEAP_VIEWS / 32) as usize;
++    let words = (victory_shader::emit::HEAP_VIEWS_MAX / 32) as usize;
+     let first = (victory_shader::emit::VIEW_READS / 32) as usize;
+     let mut slots = Vec::new();
+     for b in [false, true].into_iter().filter_map(bitmap) {
+diff --git a/crates/victory-gpu/src/texture.rs b/crates/victory-gpu/src/texture.rs
+index 0bad914..83d1fc5 100644
+--- a/crates/victory-gpu/src/texture.rs
++++ b/crates/victory-gpu/src/texture.rs
+@@ -403,7 +403,7 @@ pub(crate) fn record_upload(
+ /// The uploads [`record_upload`] recorded into `resource`'s host texture
+ /// (tests: counts of their own texture, whatever other tests upload
+ /// meanwhile).
+-#[cfg(test)]
++#[cfg(any(test, feature = "texture-probe"))]
+ pub(crate) fn uploads(resource: This) -> u64 {
+     let staging = crate::resource::host_copy(resource).and_then(|c| c.staging.lock().unwrap_or_else(|e| e.into_inner()).clone());
+     staging.map_or(0, |s| s.uploads.load(std::sync::atomic::Ordering::Relaxed))
+diff --git a/crates/victory-shader/src/emit/host.rs b/crates/victory-shader/src/emit/host.rs
+index 4e826d5..05208c6 100644
+--- a/crates/victory-shader/src/emit/host.rs
++++ b/crates/victory-shader/src/emit/host.rs
+@@ -1169,6 +1169,8 @@ impl Host {
+             list.SetGraphicsRootSignature(root);
+             for (param, arg) in &d.roots {
+                 match arg {
++                    // There is nothing to bind for a stage with no user data.
++                    Root::Constants(data) if data.is_empty() => {}
+                     Root::Constants(data) => list.SetGraphicsRoot32BitConstants(
+                         *param,
+                         data.len() as u32,
+@@ -1949,6 +1951,8 @@ impl Host {
+             list.SetComputeRootSignature(root);
+             for (param, arg) in &d.roots {
+                 match arg {
++                    // There is nothing to bind for a stage with no user data.
++                    Root::Constants(data) if data.is_empty() => {}
+                     Root::Constants(data) => list.SetComputeRoot32BitConstants(
+                         *param,
+                         data.len() as u32,
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 1dd6352..1022cb7 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -10879,6 +10879,7 @@ impl<'a> Lower<'a> {
+                     _ if read
+                         && !bit
+                         && self.mask_data == MaskData::Console
++                        && self.uniform_join(b)
+                         && (self.x.st.masks.contains_key(&arg)
+                             || self.x.st.highs.contains_key(&arg)) =>
+                     {
+diff --git a/crates/victory-shader/src/emit/shader.rs b/crates/victory-shader/src/emit/shader.rs
+index 4994353..1ce6817 100644
+--- a/crates/victory-shader/src/emit/shader.rs
++++ b/crates/victory-shader/src/emit/shader.rs
+@@ -145,7 +145,7 @@ pub const VIEW_MARK_NONE: u32 = u32::MAX;
+ pub const VIEW_WRITE_BITS: u32 = 1 << 22;
+ /// The first bit of the read marks of texture views (`emit`, "Read
+ /// marks"), after the written pages in the same bitmap: one bit per
+-/// resource-heap index, [`HEAP_VIEWS`] of them.
++/// resource-heap index, [`HEAP_VIEWS_MAX`] of them.
+ pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
+ 
+ /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
+@@ -1210,6 +1210,18 @@ mod tests {
+         }
+     }
+ 
++    // Keep the tested operation live through the emitter's dead-code pass.
++    fn store_scalar(s: &mut Shader, value: V) {
++        let buffer = s.root_uav_handle(0);
++        let at = s.m.i32(0);
++        let offset = s.m.undef(s.t.i32);
++        let unused = s.m.undef(s.t.f32);
++        let mask = s.m.i8(1);
++        let alignment = s.m.i32(4);
++        s.op(s.entry, "rawBufferStore.f32", Attr::NoUnwind, s.t.void, 140,
++             &[buffer, at, offset, value, unused, unused, unused, mask, alignment]);
++    }
++
+     /// Builds a compute shader calling `opcode` and returns its container
+     /// plus the derivative flag as detected by `op`. `Some(v)` overrides
+     /// the flag before the container is written.
+@@ -1227,7 +1239,8 @@ mod tests {
+         let zero = s.m.f32(0);
+         let args = vec![zero; args];
+         let ret = s.t.f32;
+-        s.op(block, name, attr, ret, opcode, &args);
++        let value = s.op(block, name, attr, ret, opcode, &args);
++        store_scalar(&mut s, value);
+         let detected = s.compute_derivatives;
+         if let Some(v) = validator18 {
+             s.compute_derivatives = v;
+@@ -1238,32 +1251,7 @@ mod tests {
+ 
+     #[test]
+     fn compute_implicit_sample_validates() {
+-        let mut s = Shader::new(false);
+-        s.threads = Some([32, 1, 1]);
+-        s.wave_size = Some(32);
+-        s.samplers = 1;
+-        let block = s.entry;
+-        let index = s.m.i32(0);
+-        let texture = s.heap_handle(block, index, false, false, (2, 1033));
+-        let sampler = s.sampler_handle(block, 0);
+-        let zero = s.m.f32(0);
+-        let fu = s.m.undef(s.t.f32);
+-        let iu = s.m.undef(s.t.i32);
+-        let args = [texture, sampler, zero, zero, fu, fu, iu, iu, iu, fu];
+-        let ret = s.t.res_ret;
+-        s.op(block, "sample.f32", Attr::ReadOnly, ret, 60, &args);
+-        assert!(s.compute_derivatives);
+-        s.m.terminate(block, Term::Ret);
+-        let mut dxil = s.finish();
+-        let path = validator::Validator::default_path();
+-        let Ok(mut validator) = validator::Validator::load(path.as_deref()) else {
+-            eprintln!("no dxil.dll; skipped");
+-            return;
+-        };
+-        validator.validate(&mut dxil).unwrap();
+-
+-        // The same module declared as validator 1.6 must be rejected.
+-        let mut legacy = {
++        let shader = |legacy: bool| {
+             let mut s = Shader::new(false);
+             s.threads = Some([32, 1, 1]);
+             s.wave_size = Some(32);
+@@ -1277,12 +1265,23 @@ mod tests {
+             let iu = s.m.undef(s.t.i32);
+             let args = [texture, sampler, zero, zero, fu, fu, iu, iu, iu, fu];
+             let ret = s.t.res_ret;
+-            s.op(block, "sample.f32", Attr::ReadOnly, ret, 60, &args);
+-            s.compute_derivatives = false;
++            let sample = s.op(block, "sample.f32", Attr::ReadOnly, ret, 60, &args);
++            let value = s.m.extract(block, sample, 0);
++            store_scalar(&mut s, value);
++            assert!(s.compute_derivatives);
++            if legacy {
++                s.compute_derivatives = false;
++            }
+             s.m.terminate(block, Term::Ret);
+             s.finish()
+         };
+-        assert!(validator.validate(&mut legacy).is_err());
++        let path = validator::Validator::default_path();
++        let Ok(mut validator) = validator::Validator::load(path.as_deref()) else {
++            eprintln!("no dxil.dll; skipped");
++            return;
++        };
++        validator.validate(&mut shader(false)).unwrap();
++        assert!(validator.validate(&mut shader(true)).is_err());
+     }
+ 
+     #[test]

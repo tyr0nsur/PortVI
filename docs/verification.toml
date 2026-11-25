@@ -27,6 +27,20 @@ verified = 45
 total = 46
 evidence = "docs/engineering-review.md#loop-carried-masks-and-scalar-joins"
 
+[descriptors]
+title = "Descriptor reads · RTX 4060"
+unit = "D3D12 pipelines created"
+verified = 36
+total = 36
+evidence = "docs/engineering-review.md#descriptor-words-as-shader-data"
+
+[descriptor_fields]
+title = "Buffer formats · RTX 4060"
+unit = "rewritten formats matched"
+verified = 24
+total = 24
+evidence = "docs/engineering-review.md#descriptor-words-as-shader-data"
+
 [fp64]
 title = "FP64 to FP32 · RTX 4060"
 unit = "register-pair conversions matched"

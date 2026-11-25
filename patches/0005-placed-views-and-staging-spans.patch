@@ -1,10 +1,11 @@
 diff --git a/crates/victory-gpu/src/descriptor.rs b/crates/victory-gpu/src/descriptor.rs
-index 22ea4a7..05692e9 100644
+index a48e52a..1d06d04 100644
 --- a/crates/victory-gpu/src/descriptor.rs
 +++ b/crates/victory-gpu/src/descriptor.rs
-@@ -469,4 +469,21 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
+@@ -564,6 +564,23 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
+     (!desc.is_null()).then(|| unsafe { desc.read_unaligned() })
  }
-
+ 
 +/// Read defined resource fields without copying ABI padding into the interned view.
 +fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
 +    if desc.is_null() {
@@ -24,21 +25,27 @@ index 22ea4a7..05692e9 100644
 +
  /// Device method.
  pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-@@ -508,5 +525,5 @@ pub(crate) extern "system" fn create_placed_srv(
+     if let Some([lo, hi, size, _]) = words(desc) {
+@@ -603,7 +620,7 @@ pub(crate) extern "system" fn create_placed_srv(
+     desc: *const [u32; 16],
      handle: u64,
  ) {
 -    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
 +    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), words(desc)) {
          record(handle, View::Placed(false, resource, desc));
      }
-@@ -519,5 +536,5 @@ pub(crate) extern "system" fn create_placed_uav(
+ }
+@@ -614,7 +631,7 @@ pub(crate) extern "system" fn create_placed_uav(
+     desc: *const [u32; 16],
      handle: u64,
  ) {
 -    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
 +    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), words(desc)) {
          record(handle, View::Placed(true, resource, desc));
      }
-@@ -874,3 +891,42 @@ mod tests {
+ }
+@@ -986,4 +1003,43 @@ pub(crate) mod tests {
+         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
          assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
      }
 +
@@ -82,17 +89,20 @@ index 22ea4a7..05692e9 100644
 +    }
  }
 diff --git a/crates/victory-gpu/src/texture.rs b/crates/victory-gpu/src/texture.rs
-index 9b3d38e..af1242c 100644
+index 4a502c1..0bad914 100644
 --- a/crates/victory-gpu/src/texture.rs
 +++ b/crates/victory-gpu/src/texture.rs
-@@ -241,5 +241,5 @@ fn record(list: &HostList, resource: This, texture: &ID3D12Resource, staging: &S
+@@ -439,7 +439,7 @@ fn copies(
+             let f = footprint.Footprint;
              // SAFETY: live resources.
-             let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
+             let (gpu, d) = unsafe { (buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
 -            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
-+            let len = subresource_len(footprint.Offset, f.RowPitch as usize, staging.rows[i], f.Depth, staging.size) as u64;
++            let len = subresource_len(staging.footprints[i].Offset, f.RowPitch as usize, staging.rows[i], f.Depth, staging.size) as u64;
              list.note_read(
                  || {
-@@ -521,3 +521,36 @@ mod tests {
+                     format!(
+@@ -878,4 +878,37 @@ mod tests {
+         // SAFETY: freeing the allocation above.
          unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
      }
 +

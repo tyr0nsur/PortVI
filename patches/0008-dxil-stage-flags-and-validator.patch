@@ -2,27 +2,31 @@ diff --git a/crates/victory-shader/src/emit/container.rs b/crates/victory-shader
 index 222deb7..08d6dc8 100644
 --- a/crates/victory-shader/src/emit/container.rs
 +++ b/crates/victory-shader/src/emit/container.rs
-@@ -1,6 +1,6 @@
+@@ -1,7 +1,7 @@
  //! The PC container around emitted DXIL: feature flags (`SFI0`), the
  //! signatures (`ISG1`, `OSG1`), pipeline state validation (`PSV0`) and the
 -//! program (`DXIL`), laid out as validator version 1.6 lays them out, plus
 -//! the container hash that D3D12 checks.
 +//! program (`DXIL`), laid out as validator versions 1.6 and 1.8 lay them out,
 +//! plus the container hash that D3D12 checks.
-
+ 
  /// One signature element: one row (D3D12 links stages by semantic).
-@@ -167,7 +167,9 @@ pub(crate) struct Psv<'a> {
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -166,9 +166,11 @@ pub(crate) struct Psv<'a> {
+     /// Compute: thread-group size and required wave size.
      pub threads: [u32; 3],
      pub wave_size: Option<u32>,
 +    /// Validator 1.8: runtime info 3 and the entry-point name.
 +    pub validator18: bool,
  }
-
+ 
 -/// `PSV0` with runtime info version 2 (validator 1.6).
 +/// `PSV0` with runtime info version 2, or 3 for validator 1.8.
  pub(crate) fn psv(p: &Psv) -> Vec<u8> {
      let vectors = |els: &[SigElement]| {
-@@ -185,6 +187,7 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
+         els.iter()
+@@ -184,8 +186,9 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
+             out.extend(v.to_le_bytes());
          }
      };
 -    u32s(&mut out, &[48]);
@@ -32,7 +36,9 @@ index 222deb7..08d6dc8 100644
 +    let mut info = [0u8; 52];
      info[0] = u8::from(p.flag);
      if p.stage == 0 {
-@@ -225,5 +228,9 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
+         // PSInfo.SampleFrequency: an input interpolated per sample, or the
+@@ -224,7 +227,11 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
+         info[12] = u8::from(p.flag);
          info[26..28].copy_from_slice(&(max as u16).to_le_bytes());
      }
 -    out.extend(info);
@@ -43,7 +49,9 @@ index 222deb7..08d6dc8 100644
 +    out.extend(&info[..info_size as usize]);
      u32s(&mut out, &[p.bindings.len() as u32]);
      if !p.bindings.is_empty() {
-@@ -236,6 +243,11 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
+         u32s(&mut out, &[24]);
+@@ -235,8 +242,13 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
+             );
          }
      }
 -    // Names of arbitrary semantics (system values use ""), then indices.
@@ -57,13 +65,15 @@ index 222deb7..08d6dc8 100644
 +    };
      let mut indices: Vec<u32> = Vec::new();
      let mut elements = Vec::new();
+     for e in p.inputs.iter().chain(p.outputs).chain(p.prims) {
 diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
-index ac8917c..a0c9800 100644
+index 913c508..1d68477 100644
 --- a/crates/victory-shader/src/emit/mod.rs
 +++ b/crates/victory-shader/src/emit/mod.rs
-@@ -699,4 +699,361 @@ mod tests {
+@@ -886,6 +886,363 @@ mod tests {
+         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
      }
-
+ 
 +    /// Reads the `ShaderFlags` word (entry property tag 0) from `dx.entryPoints`
 +    /// in a DXIL container emitted by [`bitcode::Module`].
 +    fn module_shader_flags(dxil_container: &[u8]) -> u64 {
@@ -382,7 +392,7 @@ index ac8917c..a0c9800 100644
 +                "{stage:?} SFI0 {sfi0:#x}: missing UAVsAtEveryStage"
 +            );
 +            assert_ne!(
-+                flags & shader::flags::UAVS_AT_EVERY_STAGE,
++                flags & shader::flags::UAVS_EVERY_STAGE,
 +                0,
 +                "{stage:?} module flags {flags:#x}: missing UAVsAtEveryStage"
 +            );
@@ -397,7 +407,7 @@ index ac8917c..a0c9800 100644
 +            "VS without declared UAVs must not set UAVsAtEveryStage in SFI0"
 +        );
 +        assert_eq!(
-+            vs_no_marks_flags & shader::flags::UAVS_AT_EVERY_STAGE,
++            vs_no_marks_flags & shader::flags::UAVS_EVERY_STAGE,
 +            0,
 +            "VS without declared UAVs must not set UAVsAtEveryStage in module flags"
 +        );
@@ -414,7 +424,7 @@ index ac8917c..a0c9800 100644
 +                "{stage:?} SFI0 {sfi0:#x}: must not set UAVsAtEveryStage"
 +            );
 +            assert_eq!(
-+                flags & shader::flags::UAVS_AT_EVERY_STAGE,
++                flags & shader::flags::UAVS_EVERY_STAGE,
 +                0,
 +                "{stage:?} module flags {flags:#x}: must not set UAVsAtEveryStage"
 +            );
@@ -423,38 +433,39 @@ index ac8917c..a0c9800 100644
 +
      #[test]
      fn immediate_sampler_slots_distinguish_comparison_uses() {
+         let words = [
 diff --git a/crates/victory-shader/src/emit/shader.rs b/crates/victory-shader/src/emit/shader.rs
-index e68e262..5c93c40 100644
+index 441dae7..a04b7e7 100644
 --- a/crates/victory-shader/src/emit/shader.rs
 +++ b/crates/victory-shader/src/emit/shader.rs
-@@ -1,5 +1,6 @@
+@@ -1,6 +1,7 @@
  //! A DXIL vertex, pixel, compute or mesh shader under construction: the module,
  //! the `dx.op` declarations it calls, its signatures and bound resources,
 -//! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 +//! and the metadata and container that wrap it up (SM 6.6; validator 1.6,
 +//! or 1.8 for compute derivatives).
-
+ 
  use super::bitcode::{Attr, Md, Module, Ty, V, pred};
-@@ -47,4 +48,5 @@ pub(crate) mod flags {
-     pub const STENCIL_REF: u64 = 1 << 11;
-     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
-+    pub const UAVS_AT_EVERY_STAGE: u64 = 1 << 16;
-     pub const ROVS: u64 = 1 << 18;
-     pub const WAVE_OPS: u64 = 1 << 19;
-@@ -126,4 +128,6 @@ pub(crate) struct Shader {
+ use super::container::{self, Binding, Psv, SigElement};
+@@ -144,6 +145,8 @@ pub(crate) struct Shader {
+     pub threads: Option<[u32; 3]>,
      /// The wave size a compute shader requires (`WaveSize`).
      pub wave_size: Option<u32>,
 +    /// Compute derivatives require validator 1.8 rather than 1.6 or 1.7.
 +    compute_derivatives: bool,
      /// Thread-group shared memory, in dwords.
      pub lds_dwords: u32,
-@@ -187,4 +191,5 @@ impl Shader {
+     lds: Option<V>,
+@@ -207,6 +210,7 @@ impl Shader {
+             nonuniform_handles: 0,
              threads: None,
              wave_size: None,
 +            compute_derivatives: false,
              lds_dwords: 0,
              lds: None,
-@@ -216,4 +221,17 @@ impl Shader {
+             main,
+@@ -236,6 +240,19 @@ impl Shader {
+         opcode: u32,
          args: &[V],
      ) -> V {
 +        // Validators before 1.8 reject gradient operations outside the
@@ -472,19 +483,9 @@ index e68e262..5c93c40 100644
 +        }
          let mut params = vec![self.t.i32];
          params.extend(args.iter().map(|&a| self.m.type_of(a)));
-@@ -794,4 +812,11 @@ impl Shader {
-             self.flags |= flags::STENCIL_REF;
-         }
-+        // Any non-pixel, non-compute stage with a declared UAV (as DXC collects
-+        // it for validator versions below 1.8, including mesh; we declare 1.6).
-+        let has_uavs =
-+            !self.root_uavs.is_empty() || self.memory_dirty.is_some() || self.view_writes.is_some();
-+        if graphics && !self.pixel && has_uavs {
-+            self.flags |= flags::UAVS_AT_EVERY_STAGE;
-+        }
-         // Entry properties: shader flags (tag 0), thread-group size (4),
-         // wave size (11).
-@@ -855,5 +880,8 @@ impl Shader {
+         let fty = self.m.func_ty(ret, params);
+@@ -902,7 +919,10 @@ impl Shader {
+         let six = i32c(&mut self, 6);
          let version = self.m.md_node(vec![Some(one), Some(six)]);
          self.m.named_md("dx.version", vec![version]);
 -        self.m.named_md("dx.valver", vec![version]);
@@ -494,29 +495,27 @@ index e68e262..5c93c40 100644
 +        self.m.named_md("dx.valver", vec![val_version]);
          // Program kinds: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
          let (name, kind) = match (self.threads, self.pixel) {
-@@ -880,4 +908,7 @@ impl Shader {
-
-         let mut features = 0u64;
-+        if self.flags & flags::UAVS_AT_EVERY_STAGE != 0 {
-+            features |= 0x4;
-+        }
-         if self.flags & flags::STENCIL_REF != 0 {
-             features |= 0x200;
-@@ -926,4 +957,5 @@ impl Shader {
+             _ if self.mesh.is_some() => ("ms", 13u32),
+@@ -976,6 +996,7 @@ impl Shader {
+             bindings: &bindings,
              threads: self.threads.unwrap_or_default(),
              wave_size: self.wave_size,
 +            validator18: self.compute_derivatives,
          });
          let hash = [0u8; 20];
-@@ -987,2 +1019,114 @@ impl Shader {
-     }
- }
-+
-+#[cfg(all(test, windows))]
-+mod tests {
-+    use super::super::bitcode::Term;
+         let psg1 = container::signature(&self.prims, false);
+@@ -1041,6 +1062,7 @@ impl Shader {
+ #[cfg(all(test, windows))]
+ mod tests {
+     use super::super::bitcode::Term;
 +    use super::super::validator;
-+    use super::*;
+     use super::*;
+ 
+     /// A program that sets a bit through the write marks' UAV, or (`heap`)
+@@ -1088,4 +1110,109 @@ mod tests {
+             }
+         }
+     }
 +
 +    /// Builds a compute shader calling `opcode` and returns its container
 +    /// plus the derivative flag as detected by `op`. `Some(v)` overrides
@@ -622,4 +621,4 @@ index e68e262..5c93c40 100644
 +        };
 +        validator.validate(&mut dxil).unwrap();
 +    }
-+}
+ }

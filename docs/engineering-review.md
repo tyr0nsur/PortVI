@@ -1,10 +1,10 @@
 # Native runtime engineering review
 
-25 November 2026. PortVI pins the original `Marvisak/VIctory` main revision `940d32f` and applies fifteen patches. The latest handles compute masks carried across branches and loops. [Current engine](https://github.com/Marvisak/VIctory/commit/940d32f69b22265690a0b5a15d6ded572ba33baf) · [Previous PortVI revision](https://github.com/tyr0nsur/PortVI/tree/27aa4bc5f32346fac9da16aad236a5beaf583f6b)
+25 November 2026. PortVI pins Marvisak’s VIctory main at `13f91ca` and applies seventeen patches. This update brings in 83 upstream commits. It also preserves the element counts and formats that shaders read from buffer descriptors, including views relocated within the host heap. [Current engine](https://github.com/Marvisak/VIctory/commit/13f91caee25f2fdf2c062be5f7a27f058e51cbca) · [Previous PortVI revision](https://github.com/tyr0nsur/PortVI/tree/f546a78b7963849363f828afb0336837b45b4e7e)
 
 ## Reproduced on this revision
 
-On Windows x64, 762 Rust workspace tests passed and 11 were marked ignored. One of the passing tests also ran in an isolated child process, bringing the total to 763 executions. Both Python frame-time tests passed. The physical-adapter median and texture probes ran separately. The open x64 program returned 73. Clippy passed for all targets and features with warnings treated as errors.
+On Windows x64, 848 distinct Rust workspace tests passed and 10 were marked ignored. One passing test also ran in an isolated child process, bringing the total to 849 executions. Both Python frame-time tests passed. The physical-adapter median and texture probes ran separately. The open x64 program returned 73. Clippy passed for all targets and features with warnings treated as errors.
 
 | Area | Reproduction and result |
 | --- | --- |
@@ -14,6 +14,33 @@ On Windows x64, 762 Rust workspace tests passed and 11 were marked ignored. One 
 | Depth bounds and console ABI | Test draws at depth 0.5 are culled outside 0.6–1.0, visible inside 0.4–0.6 and culled again outside 0.0–0.4. The engine checks host depth-bounds support before using it. The device-removal regression compares the console slot with D3D12. The queue and list tests dispatch through both generations of console tables. [D3D12 and ABI patch](../patches/0004-depth-bounds-and-console-abi.patch) |
 | Staging bounds and descriptor identity | On the two-mip BC4 fixture, the final mip starts at byte 512 of a 520-byte allocation. A padded row pitch of 256 covers eight allocated bytes there. The diagnostic and detiler now use the same bounded length. SRV and UAV records intern the defined fields of a placed resource, independent of padding. [Regression and fix](../patches/0005-placed-views-and-staging-spans.patch) |
 | Empty memory operations | On upstream, an unaligned zero-byte write dirtied an aliased 64 KiB page. A zero-length remap could also discard its alias link. The regression takes a clean page, exercises both empty calls, then confirms that a real one-byte write still reaches the alias. [Tracker fix and regression](../patches/0007-empty-memory-ranges.patch) |
+
+## Descriptor words as shader data
+
+A shader can read a buffer descriptor as four ordinary words. For a typed view, the record count is the number of elements in that view. Its format is encoded in bits 18–12 of word 3. An incorrect count can look plausible even when the shader reads the right address. We exercised this with independently specified addresses, element counts and formats. [Calvix2k’s translation and heap proposal](https://github.com/Marvisak/VIctory/pull/2363) · [steven-seagull27’s record counts](https://github.com/steven-seagull27/VIctory/commit/6a83efe6954697b01aac89cc0dd860bf50ce1649) · [Format encoding](https://github.com/steven-seagull27/VIctory/commit/f79c97a6b87677ef8827f601842eece77d2ade0d)
+
+The fixture rewrites adjacent shader-resource and unordered-access views twelve times and dispatches a shader to read back both slots. Each adapter produced the following results. The upstream run used the exact PR revision plus only the test sources.
+
+| Per adapter · RTX 4060 and Windows WARP | Address | Element count | Format |
+| --- | ---: | ---: | ---: |
+| VIctory PR 2363 at `6b89b19` | 24 / 24 | 0 / 24 | 0 / 24 |
+| PortVI | 24 / 24 | 24 / 24 | 24 / 24 |
+
+A second dispatch covered placed, structured, typed and raw buffers. All eight counts matched across the original and rewritten views. A third check moved a table into the dynamic range of the host heap and exercised a cleared slot, its reuse and the original table. The mapped metadata also passed a buffer → texture → raw-buffer transition. Claude Code helped adapt the view decoding and wrote the transition test. Buffer word 1 currently carries the high address bits. Reconstructing its stride and swizzle fields and the control bits outside the format in word 3 remains open. [PortVI implementation and tests](../patches/0017-buffer-descriptor-words.patch) · [Upstream GPU test](https://github.com/steven-seagull27/VIctory/commit/ebaee6d288fc2727239bc05a367bfe404351c99c)
+
+These commands run the two GPU readback tests on a Windows checkout. Set `VICTORY_D3D12_WARP` to `1` to repeat on WARP.
+
+```powershell
+$source = python portvi.py prepare
+Set-Location $source
+$env:VICTORY_D3D12_WARP = '0'
+cargo test -p victory-gpu --all-features --lib adjacent_buffer_descriptors_report_their_fields_after_a_rewrite -- --nocapture
+cargo test -p victory-gpu --all-features --lib shader_reads_buffer_record_counts_after_a_slot_rewrite -- --nocapture
+```
+
+The previous PortVI build stopped on 35 pixel shaders and one compute shader that read descriptors as data. The updated unmodified VIctory engine validated all 35 pixel shaders. PortVI also validated the compute shader, and the RTX 4060 created all 36 Direct3D 12 pipelines.
+
+Across the full sample of 26,084 native programs the Microsoft DXIL validator accepted 25,612, up from 25,570 in the previous PortVI build. Matching native bytecode by SHA-256, stage and occurrence count gives 42 newly valid programs and zero losses. Of those gains, 36 were the descriptor group above, three had an untracked descriptor origin, two read barycentrics directly and one selected a descriptor through control flow. This full-sample scan measured standalone validation. The 36-pipeline test separately exercised the D3D12 driver.
 
 ## D3D12 descriptor limits and DXIL validation
 
@@ -51,9 +78,19 @@ The same 46 compute programs went through the Windows SDK DXIL validator at each
 | VIctory PR 385 on that base | 46 | 13 |
 | PortVI with the completed joins | 46 | 46 |
 
-The desktop RTX 4060 (driver 32.0.16.2114) created 45 of the 46 D3D12 compute pipelines. The remaining program declares a fixed wave size of 64 and this adapter reports 32. Five authored Wave32 cases also checked two output words per lane over 20 GPU dispatches, matching all 1,280 reference words. The Wave64 loop readbacks still need a native 64-lane device. Across the full sample, 25,570 programs passed standalone DXIL validation, up from 25,524. These are translation and device measurements. Scene frame times have their own capture protocol below.
+The desktop RTX 4060 (driver 32.0.16.2114) created 45 of the 46 D3D12 compute pipelines. The remaining program declares a fixed wave size of 64 and this adapter reports 32. Five authored Wave32 cases also checked two output words per lane over 20 GPU dispatches, matching all 1,280 reference words. The Wave64 loop readbacks still need a native 64-lane device. In the preceding integration, fixing these joins raised the full-sample validation count from 25,524 to 25,570. Scene frame times have their own capture protocol below.
 
-## Latest checks against Leonida and XCL
+## Upstream changes through 19:03 CET, 25 November
+
+| Project | Changes since the previous review |
+| --- | --- |
+| VIctory · 83 commits | The renderer defers texture uploads to submission, batches work and evicts resources under VRAM pressure. The shader compiler also gained stage flags, descriptor handling and dead-code elimination. PortVI rebased its patches and checked depth bounds across command-list segments and the stale-texture control on the new submission path. The maintainers report about one rendered prologue frame per second on an RX 6700 XT. [Commit range](https://github.com/Marvisak/VIctory/compare/940d32f69b22265690a0b5a15d6ded572ba33baf...13f91caee25f2fdf2c062be5f7a27f058e51cbca) · [Maintainers’ measurement](https://github.com/Marvisak/VIctory/blob/13f91caee25f2fdf2c062be5f7a27f058e51cbca/README.md) · [PortVI integration tests](../patches/0016-current-engine-integration.patch) |
+| Leonida · 30 commits | The Vulkan implementation removed a redundant branch around a workgroup barrier and fixed depth-copy staging. The barrier case is relevant to PortVI’s outstanding native Wave64 hardware coverage. [Commit range](https://github.com/ubiquitarianism/leonida/compare/b0f3d3998f0401eb7df8ddbb7a303d1e6bee9fb8...b9320a118d46b24de665e30e577425c131b4a2ee) · [Barrier change](https://github.com/ubiquitarianism/leonida/commit/0681b9d280ee1adac2d123fb47265da4d9e35444) |
+| XCL · 35 commits | Its D3D12 runtime bounded scratch allocations across command recordings and its translator now reduces over live lanes in wave32 vertex and pixel shaders. Both changes give us specific memory and lane-behavior cases to test on PortVI. [Commit range](https://github.com/xcl-dev/xcl/compare/06c9f5505f63f10c5ec49ef932d75b2c28177324...68a284a596bd558b6bd9db6eedda6d6aa178c360) · [Live-lane reduction](https://github.com/xcl-dev/xcl/commit/12f25f147c40f883a07cf022f520792dcee4bab9) |
+
+During the hardware runs, VIctory stayed at the pinned revision. Leonida added two commits documenting its maintainer workflow. XCL advanced another 73 commits through `3f27770`, including a geometry shader change that combines four scalar vertex stores into one vector store. Its authors measured 3,300 fewer DXIL bytes across eight geometry shaders. [Leonida follow-up](https://github.com/ubiquitarianism/leonida/pull/2030) · [XCL follow-up range](https://github.com/xcl-dev/xcl/compare/68a284a596bd558b6bd9db6eedda6d6aa178c360...3f2777019544c0ada2cd294aa792d3c378ff0df8) · [XCL geometry measurement](https://github.com/xcl-dev/xcl/pull/2273)
+
+### Earlier checks against Leonida and XCL
 
 Leonida also merged a draw test for dual-source blending. XCL added parallel compilation for pieces of large direct compute dispatches and identified active pipelines in its device-removal reports. The XCL dispatch change targets pipeline creation time. It has a separate fallback for indirect dispatches and large loops. [Leonida draw test](https://github.com/ubiquitarianism/leonida/pull/1703) · [XCL compute dispatches](https://github.com/xcl-dev/xcl/pull/2080) · [XCL device-removal reports](https://github.com/xcl-dev/xcl/pull/1592)
 

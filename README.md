@@ -18,7 +18,7 @@
   <a href="docs/engineering-review.md">Engineering notes</a>
 </p>
 
-PortVI runs x86-64 console code directly on the Windows host CPU. Its engine is pinned directly to Marvisak’s VIctory. PortVI binds platform calls, translates console shaders to DXIL for Direct3D 12 and validates selected results on physical hardware. [Pinned engine](https://github.com/Marvisak/VIctory/commit/940d32f69b22265690a0b5a15d6ded572ba33baf)
+PortVI runs x86-64 console code directly on the Windows host CPU. It builds on Marvisak’s VIctory, binds platform calls and translates console shaders to DXIL for Direct3D 12. We verify selected results on physical hardware. [Pinned engine](https://github.com/Marvisak/VIctory/commit/13f91caee25f2fdf2c062be5f7a27f058e51cbca)
 
 ## Development dashboard
 
@@ -30,6 +30,8 @@ The cards show the results of individual tests. The mesh draw checks all four co
   <a href="docs/engineering-review.md#reproduced-on-this-revision"><img src="docs/assets/progress-shader.svg" width="366" alt="Median shader · RTX 4060 — 13 / 13 test vectors matched (100%)"></a>
   <a href="docs/engineering-review.md#loop-carried-masks-and-scalar-joins"><img src="docs/assets/progress-joins.svg" width="366" alt="Compute joins · DXIL validation — 46 / 46 previously blocked programs validated (100%)"></a>
   <a href="docs/engineering-review.md#loop-carried-masks-and-scalar-joins"><img src="docs/assets/progress-join_pipelines.svg" width="366" alt="Compute joins · RTX 4060 — 45 / 46 D3D12 pipelines created (98%)"></a>
+  <a href="docs/engineering-review.md#descriptor-words-as-shader-data"><img src="docs/assets/progress-descriptors.svg" width="366" alt="Descriptor reads · RTX 4060 — 36 / 36 D3D12 pipelines created (100%)"></a>
+  <a href="docs/engineering-review.md#descriptor-words-as-shader-data"><img src="docs/assets/progress-descriptor_fields.svg" width="366" alt="Buffer formats · RTX 4060 — 24 / 24 rewritten formats matched (100%)"></a>
   <a href="docs/engineering-review.md#floating-point-conversion"><img src="docs/assets/progress-fp64.svg" width="366" alt="FP64 to FP32 · RTX 4060 — 14 / 14 register-pair conversions matched (100%)"></a>
   <a href="docs/engineering-review.md#linked-mesh-and-pixel-shaders"><img src="docs/assets/progress-mesh.svg" width="366" alt="Linked mesh draw · RTX 4060 — 256 / 256 pixels matched all four channels (100%)"></a>
   <a href="docs/engineering-review.md#bc4-storage-and-gpu-readback"><img src="docs/assets/progress-texture.svg" width="366" alt="BC4 readback · RTX 4060 — 32 / 32 streamed texels matched (100%)"></a>
@@ -39,9 +41,11 @@ The cards show the results of individual tests. The mesh draw checks all four co
 </p>
 <!-- verification:end -->
 
-**Windows regression run** · On Windows x64, 762 Rust workspace tests and two frame-time analyzer tests passed. A source-built x64 probe bound both imports and returned exit status 73. [Test breakdown](docs/engineering-review.md#reproduced-on-this-revision)
+**Windows regression run** · On Windows x64, 848 distinct Rust workspace tests and two frame-time analyzer tests passed. A source-built x64 probe bound both imports and returned exit status 73. [Test breakdown](docs/engineering-review.md#reproduced-on-this-revision)
 
 **Compute shaders** · All 46 programs blocked by loop or branch masks now pass Microsoft’s DXIL validator. The RTX 4060 created 45 of their D3D12 pipelines. The remaining program requests a 64-lane wave. [Before-and-after results and GPU tests](docs/engineering-review.md#loop-carried-masks-and-scalar-joins)
+
+**Descriptor reads** · The RTX 4060 created pipelines for all 35 pixel shaders and one compute shader previously blocked on descriptor reads. In a separate test, the RTX 4060 and WARP each read the correct address, element count and format for all 24 rewritten buffer views. [Results and runnable tests](docs/engineering-review.md#descriptor-words-as-shader-data)
 
 **Texture streaming** · A DirectStorage request decoded two BC4 blocks directly into a console texture. The RTX 4060 matched all 32 texels after upload and detected all 32 stale texels when the upload was deliberately skipped. [Run the fixture](docs/engineering-review.md#bc4-storage-and-gpu-readback)
 
@@ -107,7 +111,7 @@ The `engine` submodule pins the upstream revision. `prepare` prints the path of 
 
 ```powershell
 $source = python portvi.py prepare
-$patchPath = Join-Path $PWD 'patches/0015-description.patch'
+$patchPath = Join-Path $PWD 'patches/0018-description.patch'
 git -C $source diff --output=$patchPath
 python portvi.py test
 ```
@@ -123,4 +127,4 @@ Add the reproducible result to the engineering notes or its tracking issue. Upda
 
 ## Credits and license
 
-Marvisak and the VIctory contributors wrote the native engine. PortVI pins the original repository at `940d32f`. Earlier PortVI revisions used LooperSalty’s integration of fxceless’s fork. Their work informed the texture and depth-bounds changes carried forward here. PortVI’s changes and test tools are available under GPL-3.0-or-later. [Current engine](https://github.com/Marvisak/VIctory/commit/940d32f69b22265690a0b5a15d6ded572ba33baf) · [Earlier integration](https://github.com/LooperSalty/victory/commit/fd021bf26a7003749d668e5d9bf6b234bfab2e47) · [fxceless’s fork](https://github.com/fxceless/victory-fork) · [License](LICENSE)
+Marvisak and the VIctory contributors wrote the native engine. PortVI pins the original repository at `13f91ca`. Earlier PortVI revisions used LooperSalty’s integration of fxceless’s fork. Their work informed the texture and depth-bounds changes carried forward here. PortVI’s changes and test tools are available under GPL-3.0-or-later. [Current engine](https://github.com/Marvisak/VIctory/commit/13f91caee25f2fdf2c062be5f7a27f058e51cbca) · [Earlier integration](https://github.com/LooperSalty/victory/commit/fd021bf26a7003749d668e5d9bf6b234bfab2e47) · [fxceless’s fork](https://github.com/fxceless/victory-fork) · [License](LICENSE)
