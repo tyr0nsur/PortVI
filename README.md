@@ -20,7 +20,7 @@
   <a href="docs/engineering-review.md">Engineering notes</a>
 </p>
 
-PortVI is an experimental Windows x64 runtime for native console software compatibility. It runs x86-64 console code directly on the Windows host CPU. It builds on Marvisak’s VIctory, binds platform calls and translates console shaders to DXIL for Direct3D 12. We verify selected results on physical hardware. [Pinned engine](https://github.com/Marvisak/VIctory/commit/13f91caee25f2fdf2c062be5f7a27f058e51cbca)
+PortVI is an experimental Windows x64 runtime for native console software compatibility. It runs x86-64 console code directly on the Windows host CPU. It builds on Marvisak’s VIctory, binds platform calls and translates console shaders to DXIL for Direct3D 12. We verify selected results on physical hardware. [Pinned engine](https://github.com/Marvisak/VIctory/commit/61bfc773d3296252918572921237075d8a748649)
 
 **Current status.** PortVI has verified native loader and Direct3D 12 test fixtures, including hardware results on the NVIDIA GeForce RTX 4060. Scene frame times remain unmeasured. [Project status and evidence](docs/project-status.md) · [Contribute hardware results](CONTRIBUTING.md)
 
@@ -48,7 +48,7 @@ The cards show the results of individual tests. The mesh draw checks all four co
 </p>
 <!-- verification:end -->
 
-**Windows regression run** · On Windows x64, 872 distinct Rust workspace tests and two frame-time analyzer tests passed. A source-built x64 probe bound four imports, allocated and freed a Windows Automation string containing an embedded zero, and returned 73. [Test breakdown](docs/engineering-review.md#reproduced-on-this-revision)
+**Windows regression run** · On Windows x64, 885 distinct Rust workspace tests and two frame-time analyzer tests passed. A source-built x64 probe bound four imports, allocated and freed a Windows Automation string containing an embedded zero, and returned 73. [Test breakdown](docs/engineering-review.md#reproduced-on-this-revision)
 
 **Component tests** · Microsoft’s validator accepted 26 of 29 compute shaders from an upscaler library. The RTX 4060 created 25 pipelines, up from 24. PortVI also resolved all 611 distinct static imports across 16 local libraries. [Before and after](docs/engineering-review.md#component-tests)
 
@@ -138,4 +138,4 @@ Add the reproducible result to the engineering notes or its tracking issue. Upda
 
 ## Credits and license
 
-Marvisak and the VIctory contributors wrote the native engine. PortVI pins the original repository at `13f91ca`. Earlier PortVI revisions used LooperSalty’s integration of fxceless’s fork. Their work informed the texture and depth-bounds changes carried forward here. PortVI’s changes and test tools are available under GPL-3.0-or-later. [Current engine](https://github.com/Marvisak/VIctory/commit/13f91caee25f2fdf2c062be5f7a27f058e51cbca) · [Earlier integration](https://github.com/LooperSalty/victory/commit/fd021bf26a7003749d668e5d9bf6b234bfab2e47) · [fxceless’s fork](https://github.com/fxceless/victory-fork) · [License](LICENSE)
+Marvisak and the VIctory contributors wrote the native engine. PortVI pins the original repository at `61bfc77`. Earlier PortVI revisions used LooperSalty’s integration of fxceless’s fork. Their work informed the texture and depth-bounds changes carried forward here. PortVI’s changes and test tools are available under GPL-3.0-or-later. [Current engine](https://github.com/Marvisak/VIctory/commit/61bfc773d3296252918572921237075d8a748649) · [Earlier integration](https://github.com/LooperSalty/victory/commit/fd021bf26a7003749d668e5d9bf6b234bfab2e47) · [fxceless’s fork](https://github.com/fxceless/victory-fork) · [License](LICENSE)

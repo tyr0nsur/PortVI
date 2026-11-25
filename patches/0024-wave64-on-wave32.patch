@@ -93,11 +93,48 @@ index 242ea26261c71c513d2ee092ee1e97106c682445..36cf412d0f8362a556223bff367940ee
          // SAFETY: as above; unset so a later test's `run` is not refused.
          unsafe { std::env::remove_var("VICTORY_EMIT_DUMP") };
          assert!(
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index bf63c60859f79b02e25f22e87e09f7ab10bee916..3ab1e6fa71d03e8f53444152b3c0165b875d3424 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -2631,7 +2631,7 @@ mod tests {
+         // SAFETY: plain queries of live heaps.
+         unsafe {
+             let views = victory_shader::emit::heap_views();
+-            let limit = victory_shader::emit::host::Host { device: host().unwrap().device.clone() }.view_heap_limit();
++            let limit = victory_shader::emit::host::Host::from_device(host().unwrap().device.clone()).view_heap_limit();
+             assert_eq!(views, limit, "translated for what the device makes");
+             assert!(heap.heap.GetDesc().NumDescriptors >= views);
+             assert_eq!(heap.dynamic, DYNAMIC);
+diff --git a/crates/victory-gpu/src/descriptor/tests/buffer_data.rs b/crates/victory-gpu/src/descriptor/tests/buffer_data.rs
+index 4f26969bff904e52f37a05d8e096a1e7cb47d686..90b99160d9a008ef7eb3ac67711d17ee20ea1dec 100644
+--- a/crates/victory-gpu/src/descriptor/tests/buffer_data.rs
++++ b/crates/victory-gpu/src/descriptor/tests/buffer_data.rs
+@@ -64,9 +64,7 @@ fn adjacent_buffer_descriptors_report_their_fields_after_a_rewrite() {
+ 
+     let shader = descriptor_reader(2);
+     assert!(shader.view_addresses && shader.root_srvs.is_empty() && !shader.memory);
+-    let host = victory_shader::emit::host::Host {
+-        device: device.device.clone(),
+-    };
++    let host = victory_shader::emit::host::Host::from_device(device.device.clone());
+     let (root, pso) = host.compute_pipeline(&shader).unwrap();
+     let mirror = guest_heap.host().expect("host view heap");
+     let addresses = mirror.view_addresses().expect("view-address table");
+@@ -303,7 +301,7 @@ fn shader_reads_high_address_and_stride_of_each_buffer_view_kind() {
+     };
+ 
+     let shader = descriptor_reader(SLOTS);
+-    let host = victory_shader::emit::host::Host { device: device.device.clone() };
++    let host = victory_shader::emit::host::Host::from_device(device.device.clone());
+     let (root, pso) = host.compute_pipeline(&shader).unwrap();
+     let mirror = guest_heap.host().expect("host view heap");
+     let addresses = mirror.view_addresses().expect("view-address table");
 diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
-index d605bdb75356dc5a98add2af420b15b797cfe7a3..b972cd4b8404bc721427d71579d233bc9a369024 100644
+index 0a9b8e544ff802d6c9b8836cd8ce669f0f05fc24..eb38a5f476c9dc6daaebb55e4edc1c7ccafe479f 100644
 --- a/crates/victory-gpu/src/host.rs
 +++ b/crates/victory-gpu/src/host.rs
-@@ -1052,6 +1052,29 @@ impl Host {
+@@ -1050,6 +1050,27 @@ impl Host {
          })
      }
  
@@ -108,9 +145,7 @@ index d605bdb75356dc5a98add2af420b15b797cfe7a3..b972cd4b8404bc721427d71579d233bc
 +    pub(crate) fn wave32(&self) -> bool {
 +        static WAVE32: OnceLock<bool> = OnceLock::new();
 +        *WAVE32.get_or_init(|| {
-+            let host = victory_shader::emit::host::Host {
-+                device: self.device.clone(),
-+            };
++            let host = victory_shader::emit::host::Host::from_device(self.device.clone());
 +            match host.wave32() {
 +                Ok(wave32) => {
 +                    tracing::info!(wave32, "host waves of 32 lanes at most");
@@ -297,7 +332,7 @@ index 568bda0112230edb9b6ad63128571b07a10ef77e..724e6ef47768cfa025d1620fcbebf592
          stage: HwStage::Cs,
 diff --git a/crates/victory-shader/src/emit/halves_tests.rs b/crates/victory-shader/src/emit/halves_tests.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..24bb487d92cb213b230b88352f0bfaab5da33198
+index 0000000000000000000000000000000000000000..eb3589d65c6ad37ffe3beb4ebc78b944b0080fc1
 --- /dev/null
 +++ b/crates/victory-shader/src/emit/halves_tests.rs
 @@ -0,0 +1,568 @@
@@ -337,7 +372,7 @@ index 0000000000000000000000000000000000000000..24bb487d92cb213b230b88352f0bfaab
 +/// Per thread `l` of a group of 64 (one console wave64), eight dwords at
 +/// `l * 32`: its thread id, `v_mbcnt` of all lanes (its lane), `l ^ 5`
 +/// through `ds_swizzle` (xor mode, within 32 lanes), `l ^ 9` through
-+/// `ds_bpermute_b32` (within the half), `0x777` written by `v_writelane` to
++/// `ds_bpermute_b32` (the address `l ^ 41` keeps the caller’s half), `0x777` written by `v_writelane` to
 +/// lane 40 only, whether the constant mask -4 (every lane but 0 and 1; lane
 +/// 32 is bit 0 of its high dword) has its lane, and `l ^ 1` through DPP
 +/// (`quad_perm:[1,0,3,2]`).
@@ -351,7 +386,7 @@ index 0000000000000000000000000000000000000000..24bb487d92cb213b230b88352f0bfaab
 +        0x0002_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1
 +        0xD8D4_141F,
 +        0x0200_0000, // ds_swizzle_b32 v2, v0 offset:swizzle(BITMASK_PERM xor 5)
-+        0x3A08_0089, // v_xor_b32 v4, 9, v0
++        0x3A08_00A9, // v_xor_b32 v4, 41, v0 (request a lane in the opposite half)
 +        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
 +        0xDACC_0000,
 +        0x0300_0004, // ds_bpermute_b32 v3, v4, v0
@@ -484,7 +519,7 @@ index 0000000000000000000000000000000000000000..24bb487d92cb213b230b88352f0bfaab
 +                "v_mbcnt_lo_u32_b32 v1, -1, 0",
 +                "v_mbcnt_hi_u32_b32 v1, -1, v1",
 +                "ds_swizzle_b32 v2, v0",
-+                "v_xor_b32 v4, 9, v0",
++                "v_xor_b32 v4, 41, v0",
 +                "ds_bpermute_b32 v3, v4, v0",
 +                "v_writelane_b32 v5, s8, 40",
 +                "v_cndmask_b32 v6, 0, 1, s[20:21]",
@@ -870,12 +905,52 @@ index 0000000000000000000000000000000000000000..24bb487d92cb213b230b88352f0bfaab
 +    assert!(failed.is_empty(), "{}", failed.join("\n"));
 +}
 diff --git a/crates/victory-shader/src/emit/host.rs b/crates/victory-shader/src/emit/host.rs
-index 05208c63517aaf739990059cfd7e96d0ea8c7e35..fe7f7b720ffc9a15bdc5556e20f6c1f30a5957ad 100644
+index f6d980b06ddef3d9219cd6daa37a79d37903faa8..19de881228392d913487d6cb32ed72e3ea623361 100644
 --- a/crates/victory-shader/src/emit/host.rs
 +++ b/crates/victory-shader/src/emit/host.rs
-@@ -91,6 +91,28 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
-     ))
+@@ -88,36 +88,11 @@ fn create_device(warp: bool) -> Result<ID3D12Device, String> {
+         D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+         let device = device.ok_or("no device")?;
+         if !warp {
+-            // The adapter the device was actually made on, by its LUID:
+-            // never the software rasteriser, whatever was enumerated.
+-            let made: IDXGIAdapter1 = factory
+-                .EnumAdapterByLuid(device.GetAdapterLuid())
+-                .map_err(err)?;
+-            let desc = made.GetDesc1().map_err(err)?;
+-            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+-                || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
+-            {
+-                return Err("the hardware device is the software adapter".to_owned());
+-            }
++            let _desc = physical_adapter(&factory, &device)?;
+             #[cfg(test)]
+-            eprintln!("physical adapter: {}", adapter_report(&desc));
+-        }
+-        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+-            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+-        };
+-        device
+-            .CheckFeatureSupport(
+-                D3D12_FEATURE_SHADER_MODEL,
+-                (&raw mut sm).cast(),
+-                size_of_val(&sm) as u32,
+-            )
+-            .map_err(err)?;
+-        if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+-            return Err(format!(
+-                "the device supports SM {:#x} only",
+-                sm.HighestShaderModel.0
+-            ));
++            eprintln!("physical adapter: {}", adapter_report(&_desc));
+         }
++        require_sm66(&device)?;
+         Ok(device)
+     }
  }
+@@ -173,6 +148,53 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
+ /// WARP pipeline compiles / dispatches crash with `0xC0000005` on Windows 11.
+ static WARP_LOCK: Mutex<()> = Mutex::new(());
  
 +/// The adapter `device` was actually made on, by its LUID: never the
 +/// software rasteriser (flagged, or the basic render driver), whatever was
@@ -899,27 +974,38 @@ index 05208c63517aaf739990059cfd7e96d0ea8c7e35..fe7f7b720ffc9a15bdc5556e20f6c1f3
 +    Ok(desc)
 +}
 +
++/// Refuses `device` unless it takes SM 6.6: the one check [`Host::new`]
++/// (through [`create_device`], WARP or hardware) and
++/// [`Host::each_hardware`] both make.
++fn require_sm66(device: &ID3D12Device) -> Result<(), String> {
++    let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
++        HighestShaderModel: D3D_SHADER_MODEL_6_6,
++    };
++    // SAFETY: the query writes its own structure of the given size.
++    unsafe {
++        device.CheckFeatureSupport(
++            D3D12_FEATURE_SHADER_MODEL,
++            (&raw mut sm).cast(),
++            size_of_val(&sm) as u32,
++        )
++    }
++    .map_err(err)?;
++    if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
++        return Err(format!(
++            "the device supports SM {:#x} only",
++            sm.HighestShaderModel.0
++        ));
++    }
++    Ok(())
++}
++
  /// An adapter's model and PCI IDs, as the physical-adapter tests print them.
  #[cfg(test)]
  fn adapter_report(desc: &DXGI_ADAPTER_DESC1) -> String {
-@@ -130,38 +152,84 @@ impl Host {
-             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-             let device = device.ok_or("no device")?;
-             if !warp {
--                // The adapter the device was actually made on, by its LUID:
--                // never the software rasteriser, whatever was enumerated.
--                let made: IDXGIAdapter1 = factory
--                    .EnumAdapterByLuid(device.GetAdapterLuid())
--                    .map_err(err)?;
--                let desc = made.GetDesc1().map_err(err)?;
-+                let _desc = physical_adapter(&factory, &device)?;
-+                #[cfg(test)]
-+                eprintln!("physical adapter: {}", adapter_report(&_desc));
-+            }
-+            Self::sm66(device)
-+        }
-+    }
-+
+@@ -231,6 +253,62 @@ impl Host {
+         Host { device, warp }
+     }
+ 
 +    /// Every hardware adapter (as [`hardware_adapter`] tells them, and whose
 +    /// device [`physical_adapter`] confirms) whose device takes SM 6.6, by
 +    /// name: tests that compare GPUs of different wave widths run on each.
@@ -938,13 +1024,11 @@ index 05208c63517aaf739990059cfd7e96d0ea8c7e35..fe7f7b720ffc9a15bdc5556e20f6c1f3
 +                let Ok(desc) = adapter.GetDesc1() else {
 +                    continue;
 +                };
-                 if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
--                    || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
++                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
 +                    || desc.DedicatedVideoMemory == 0
-                 {
--                    return Err("the hardware device is the software adapter".to_owned());
++                {
 +                    continue;
-                 }
++                }
 +                let mut device: Option<ID3D12Device> = None;
 +                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
 +                    continue;
@@ -955,24 +1039,7 @@ index 05208c63517aaf739990059cfd7e96d0ea8c7e35..fe7f7b720ffc9a15bdc5556e20f6c1f3
 +                let Ok(_made) = physical_adapter(&factory, &device) else {
 +                    continue;
 +                };
-                 #[cfg(test)]
--                eprintln!("physical adapter: {}", adapter_report(&desc));
--            }
--            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
--                HighestShaderModel: D3D_SHADER_MODEL_6_6,
--            };
--            device
--                .CheckFeatureSupport(
--                    D3D12_FEATURE_SHADER_MODEL,
--                    (&raw mut sm).cast(),
--                    size_of_val(&sm) as u32,
--                )
--                .map_err(err)?;
--            if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
--                return Err(format!(
--                    "the device supports SM {:#x} only",
--                    sm.HighestShaderModel.0
--                ));
++                #[cfg(test)]
 +                eprintln!("physical adapter: {}", adapter_report(&_made));
 +                let end = desc
 +                    .Description
@@ -980,40 +1047,25 @@ index 05208c63517aaf739990059cfd7e96d0ea8c7e35..fe7f7b720ffc9a15bdc5556e20f6c1f3
 +                    .position(|&c| c == 0)
 +                    .unwrap_or(desc.Description.len());
 +                let name = String::from_utf16_lossy(&desc.Description[..end]);
-+                if let Ok(host) = Self::sm66(device) {
-+                    hosts.push((name, host));
++                // A physical (non-software) adapter: never serialised as WARP.
++                if require_sm66(&device).is_ok() {
++                    hosts.push((
++                        name,
++                        Host {
++                            device,
++                            warp: false,
++                        },
++                    ));
 +                }
-             }
--            Ok(Host { device })
-         }
++            }
++        }
 +        hosts
 +    }
 +
-+    /// `device`, if it takes SM 6.6.
-+    fn sm66(device: ID3D12Device) -> Result<Self, String> {
-+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
-+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
-+        };
-+        // SAFETY: the query writes its own structure of the given size.
-+        unsafe {
-+            device.CheckFeatureSupport(
-+                D3D12_FEATURE_SHADER_MODEL,
-+                (&raw mut sm).cast(),
-+                size_of_val(&sm) as u32,
-+            )
-+        }
-+        .map_err(err)?;
-+        if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
-+            return Err(format!(
-+                "the device supports SM {:#x} only",
-+                sm.HighestShaderModel.0
-+            ));
-+        }
-+        Ok(Host { device })
-     }
- 
      /// The root signature translated shaders expect: user data per stage
-@@ -611,6 +679,23 @@ impl Host {
+     /// at `b0`, immediate samplers per stage at `s<n>`, heaps directly
+     /// indexed.
+@@ -689,6 +767,23 @@ impl Host {
              .then_some((options.WaveLaneCountMin, options.WaveLaneCountMax))
      }
  
@@ -1037,7 +1089,7 @@ index 05208c63517aaf739990059cfd7e96d0ea8c7e35..fe7f7b720ffc9a15bdc5556e20f6c1f3
      /// Whether this device fuses DXIL `FMad`, which the lowering emits for
      /// the console's fused `v_fma_f32`/`v_fmac_f32`/`v_fma_mix*`: where it
      /// does not, their results can differ in kind (NaN where an overflowing
-@@ -811,6 +896,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
+@@ -891,6 +986,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
          outputs: Vec::new(),
          prims: Vec::new(),
          mesh_stride: 0,
@@ -1058,7 +1110,7 @@ index 9d891ec847819d6b78daf09425872f915858c8cd..ec0d6f1b9bfdd50c98930478511e86ed
      Ok(HostShader {
          stage: HwStage::Cs,
 diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
-index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d742241e754952 100644
+index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d434924c4 100644
 --- a/crates/victory-shader/src/emit/lower.rs
 +++ b/crates/victory-shader/src/emit/lower.rs
 @@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
@@ -1069,17 +1121,17 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
  mod permlane;
  
  type Why = &'static str;
-@@ -67,6 +68,9 @@ pub(crate) struct Lowered {
-     /// Whether it declares rasterizer-ordered views.
+@@ -73,6 +74,9 @@ pub(crate) struct Lowered {
+     /// Whether the module contains the 32-lane half mask (`!31`).
      #[cfg(test)]
-     pub rovs: bool,
+     pub has_half_wave_mask: bool,
 +    /// The wave size it declares (`WaveSize`).
 +    #[cfg(test)]
 +    pub wave_size: Option<u32>,
  }
  
  pub(crate) struct Parts<'a> {
-@@ -82,6 +86,8 @@ pub(crate) struct Parts<'a> {
+@@ -88,6 +92,8 @@ pub(crate) struct Parts<'a> {
      pub mesh_stride: u32,
      /// Writes through buffer views mark their pages (`emit`, "Write marks").
      pub view_marks: bool,
@@ -1088,7 +1140,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
  }
  
  enum Stop {
-@@ -135,8 +141,11 @@ pub(crate) fn lower_pruned(
+@@ -141,8 +147,11 @@ pub(crate) fn lower_pruned(
      keep: Option<&KeptOutputs>,
  ) -> Result<Lowered, ShaderError> {
      let mut bad = HashMap::new();
@@ -1101,7 +1153,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
              Ok(l) => return Ok(l),
              Err(Stop::Retry(v, why)) => {
                  if bad.insert(v, why).is_some() {
-@@ -276,8 +285,18 @@ struct Lower<'a> {
+@@ -282,8 +291,18 @@ struct Lower<'a> {
      /// src0 of the current instruction as DPP fetched it.
      src0: Option<V>,
      /// Compute code that reads other lanes: thread ids follow the host
@@ -1121,7 +1173,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
      /// Pixel: an ordered section (POPS), whose UAVs the host makes
      /// rasterizer-ordered views.
      pops: bool,
-@@ -608,6 +627,7 @@ impl<'a> Lower<'a> {
+@@ -614,6 +633,7 @@ impl<'a> Lower<'a> {
          x: &'a Parts<'a>,
          bad: &'a HashMap<Value, Why>,
          keep: Option<&KeptOutputs>,
@@ -1129,7 +1181,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
      ) -> Self {
          let p = x.p;
          let mut phi_at = HashMap::new();
-@@ -634,6 +654,7 @@ impl<'a> Lower<'a> {
+@@ -640,6 +660,7 @@ impl<'a> Lower<'a> {
          let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
              || insts().any(|i| i.name().starts_with("image_bvh"));
          let mut console_lanes = false;
@@ -1137,7 +1189,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
          if let StageIo::Cs(cs) = x.native.io {
              s.threads = Some(cs.threads);
              s.lds_dwords = cs.lds_bytes() / 4;
-@@ -645,6 +666,10 @@ impl<'a> Lower<'a> {
+@@ -651,6 +672,10 @@ impl<'a> Lower<'a> {
                  n.starts_with("ds_swizzle")
                      || n.contains("permute")
                      || n.starts_with("v_mbcnt")
@@ -1148,7 +1200,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
                      || matches!(n, "v_readlane_b32" | "v_writelane_b32" | "v_permlane16_b32" | "v_permlanex16_b32")
                      || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                      || reads_mask_as_data(x.st, i)
-@@ -714,9 +739,15 @@ impl<'a> Lower<'a> {
+@@ -720,9 +745,15 @@ impl<'a> Lower<'a> {
                      needs_console
                  };
              let wave = if x.native.wave64 { 64 } else { 32 };
@@ -1167,7 +1219,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
              }
          }
          let mut no_barrier = HashSet::new();
-@@ -816,6 +847,10 @@ impl<'a> Lower<'a> {
+@@ -822,6 +853,10 @@ impl<'a> Lower<'a> {
              heap: [false; 2],
              src0: None,
              console_lanes,
@@ -1178,7 +1230,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
              pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                  if db_shader_control & 1 << 16 != 0),
              root_memory,
-@@ -1263,6 +1298,7 @@ impl<'a> Lower<'a> {
+@@ -1269,6 +1304,7 @@ impl<'a> Lower<'a> {
      /// expanded gives on that wave.
      fn shape(&mut self, shape: super::wave::Shape) -> Result<V, Why> {
          use super::wave::{Op, Shape};
@@ -1186,7 +1238,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
          let (op, src, mask, ident, prefix) = match shape {
              Shape::K(k) => return Ok(self.s.m.i32(k)),
              Shape::Value(v) => return self.i32_of(v),
-@@ -1283,6 +1319,7 @@ impl<'a> Lower<'a> {
+@@ -1289,6 +1325,7 @@ impl<'a> Lower<'a> {
              Shape::Prefix(op, src, mask, ident, inclusive) => {
                  (op, src, mask, ident, Some(inclusive))
              }
@@ -1194,7 +1246,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
              Shape::Half(_, src, mask, ident, hi) => {
                  // The high half is a console lane's: compute only.
                  if self.mask_data != MaskData::Console {
-@@ -1352,6 +1389,7 @@ impl<'a> Lower<'a> {
+@@ -1358,6 +1395,7 @@ impl<'a> Lower<'a> {
          {
              return Err("a wave reduction in a mesh shader");
          }
@@ -1202,7 +1254,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
          let c = self.cur;
          let &m = self
              .x
-@@ -1445,6 +1483,9 @@ impl<'a> Lower<'a> {
+@@ -1451,6 +1489,9 @@ impl<'a> Lower<'a> {
              }
          }
          self.cur = self.s.entry;
@@ -1212,16 +1264,16 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
          self.find_sections();
          self.inputs()?;
          if let Some(mesh) = self.s.mesh {
-@@ -1535,6 +1576,8 @@ impl<'a> Lower<'a> {
-             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+@@ -1545,6 +1586,8 @@ impl<'a> Lower<'a> {
+             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
              #[cfg(test)]
-             rovs: self.s.flags & flags::ROVS != 0,
+             has_half_wave_mask: self.s.m.has_i32_const(!31),
 +            #[cfg(test)]
 +            wave_size: self.s.wave_size,
              dxil: self.s.finish(),
              user_data,
              samplers: self.samplers,
-@@ -1955,6 +1998,7 @@ impl<'a> Lower<'a> {
+@@ -1965,6 +2008,7 @@ impl<'a> Lower<'a> {
                      Some(&b) if b == self.cur_ir => self.cur,
                      Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
                  };
@@ -1229,7 +1281,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
                  if !self.balloting.insert(lo) {
                      return Err("a lane mask whose lanes depend on its own value");
                  }
-@@ -2712,17 +2756,21 @@ impl<'a> Lower<'a> {
+@@ -2722,17 +2766,21 @@ impl<'a> Lower<'a> {
          self.s.m.bin(c, Bin::Shl, byte, three)
      }
  
@@ -1260,7 +1312,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
          let (k31, k32, one, z) = (
              self.s.m.i32(31),
              self.s.m.i32(32),
-@@ -2949,36 +2997,16 @@ impl<'a> Lower<'a> {
+@@ -2959,36 +3007,16 @@ impl<'a> Lower<'a> {
      /// thread is relabelled so that its host lane is its console lane: the
      /// flat id is the wave's first lane's, rounded down to the wave size,
      /// plus the lane index. (A bijection while each host wave holds a
@@ -1301,16 +1353,49 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
          let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
          Val::I32(match c {
              0 => self.s.m.bin(e, Bin::URem, f, xk),
-@@ -3235,7 +3263,7 @@ impl<'a> Lower<'a> {
+@@ -3239,40 +3267,10 @@ impl<'a> Lower<'a> {
+             return Ok(());
+         }
+         if name == "ds_bpermute_b32" {
+-            // Each lane reads `data` of the lane its address plus the offset
+-            // names in dwords within its own 32-lane half (RDNA 2 ISA,
+-            // section 10.4.4: wave64 permutes lanes 0..31 and 32..63
+-            // independently); 0 from a lane EXEC leaves out.
+             self.cross_lane(false)?;
              let a = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
              let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
-             let k = |l: &mut Self, v: u32| l.s.m.i32(v);
--            let (o, two, last) = (k(self, offset), k(self, 2), k(self, self.wave() - 1));
-+            let (o, two, last) = (k(self, offset), k(self, 2), k(self, self.permute_lanes()));
-             let at = self.s.m.bin(c, Bin::Add, a, o);
-             let lane = self.s.m.bin(c, Bin::LShr, at, two);
-             let lane = self.s.m.bin(c, Bin::And, lane, last);
-@@ -5868,7 +5896,7 @@ impl<'a> Lower<'a> {
+-            let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+-            let (o, two, mask31) = (k(self, offset), k(self, 2), k(self, 31));
+-            let at = self.s.m.bin(c, Bin::Add, a, o);
+-            let lane = self.s.m.bin(c, Bin::LShr, at, two);
+-            let within_half = self.s.m.bin(c, Bin::And, lane, mask31);
+-            let lane = if self.x.native.wave64 {
+-                let me = self.lane_index();
+-                let not31 = k(self, !31);
+-                let base = self.s.m.bin(c, Bin::And, me, not31);
+-                self.s.m.bin(c, Bin::Or, base, within_half)
+-            } else {
+-                within_half
+-            };
+-            let r = self.read_lane(x, lane);
+-            let on = guard.unwrap_or_else(|| self.s.m.bool(true));
+-            let i32t = self.s.t.i32;
+-            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+-            let ballot = self
+-                .s
+-                .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+-            let (lo, hi) = (
+-                self.s.m.extract(c, ballot, 0),
+-                self.s.m.extract(c, ballot, 1),
+-            );
+-            let running = self.lane_bit_of(c, lane, lo, hi);
+-            let z = k(self, 0);
+-            let r = self.s.m.select(c, running, r, z);
++            let r = self.bpermute_lane(a, x, offset, guard);
+             let reg = dst_reg.ok_or("a permute result")?;
+             self.write(inst, Reg::V(reg), r, guard);
+             return Ok(());
+@@ -5888,7 +5886,7 @@ impl<'a> Lower<'a> {
              };
              self.src0 = Some(x);
          }
@@ -1319,7 +1404,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
          self.src0 = None;
          r
      }
-@@ -5979,9 +6007,15 @@ impl<'a> Lower<'a> {
+@@ -5999,9 +5997,15 @@ impl<'a> Lower<'a> {
              }
          }
          if let Some((rows, banks)) = masks {
@@ -1337,7 +1422,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
              let ri = self.s.m.bin(c, Bin::And, ri, three);
              let bi = self.s.m.bin(c, Bin::LShr, lane, two);
              let bi = self.s.m.bin(c, Bin::And, bi, three);
-@@ -6000,7 +6034,7 @@ impl<'a> Lower<'a> {
+@@ -6020,7 +6024,7 @@ impl<'a> Lower<'a> {
          Ok((r, enable))
      }
  
@@ -1346,7 +1431,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
          let Fields::Valu(v) = &inst.fields else {
              unreachable!()
          };
-@@ -6692,6 +6726,9 @@ impl<'a> Lower<'a> {
+@@ -6712,6 +6716,9 @@ impl<'a> Lower<'a> {
                      self.s.flags |= flags::WAVE_OPS;
                  } else {
                      self.cross_lane(false)?;
@@ -1356,7 +1441,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
                  }
                  let r = self.read_lane(a, lane);
                  int(self, r)
-@@ -6707,96 +6744,12 @@ impl<'a> Lower<'a> {
+@@ -6727,96 +6734,12 @@ impl<'a> Lower<'a> {
                      None => self.s.m.i32(0),
                  };
                  self.cross_lane(false)?;
@@ -1455,7 +1540,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
              "v_readfirstlane_b32"
                  if inst
                      .writes
-@@ -6808,7 +6761,25 @@ impl<'a> Lower<'a> {
+@@ -6828,7 +6751,25 @@ impl<'a> Lower<'a> {
                  int(self, a)
              }
              "v_readfirstlane_b32" => {
@@ -1481,7 +1566,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
                  self.s.flags |= flags::WAVE_OPS;
                  let r = self.s.op(
                      c,
-@@ -7902,7 +7873,7 @@ impl<'a> Lower<'a> {
+@@ -7922,7 +7863,7 @@ impl<'a> Lower<'a> {
                  } else if self.s.mesh.is_none() {
                      self.cross_lane(false)?;
                  }
@@ -1490,7 +1575,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
                  let below = if name == "v_mbcnt_lo_u32_b32" {
                      lane
                  } else {
-@@ -11115,6 +11086,7 @@ mod tests {
+@@ -11135,6 +11076,7 @@ mod tests {
              outputs: vec![],
              prims: vec![],
              mesh_stride: 0,
@@ -1498,7 +1583,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
              view_marks: false,
          })
          .map(|_| ())
-@@ -11165,6 +11137,7 @@ mod tests {
+@@ -11185,6 +11127,7 @@ mod tests {
              outputs: vec![],
              prims: vec![],
              mesh_stride: 0,
@@ -1506,7 +1591,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
              view_marks: false,
          })
      }
-@@ -11311,6 +11284,7 @@ mod tests {
+@@ -11331,6 +11274,7 @@ mod tests {
              prims: vec![],
              mesh_stride: 0,
              view_marks: false,
@@ -1514,7 +1599,7 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
          })
      }
  
-@@ -11500,6 +11474,7 @@ mod tests {
+@@ -11520,6 +11464,7 @@ mod tests {
              outputs: vec![],
              prims: vec![],
              mesh_stride: 0,
@@ -1522,12 +1607,20 @@ index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d74224
              view_marks: false,
          })
          .unwrap();
+@@ -12338,6 +12283,7 @@ mod tests {
+                 prims: vec![],
+                 mesh_stride: 0,
+                 view_marks: false,
++                host_wave32: false,
+             })
+             .unwrap();
+             assert!(lowered.wave_ops);
 diff --git a/crates/victory-shader/src/emit/lower/halves.rs b/crates/victory-shader/src/emit/lower/halves.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..d9a463f0abd6def3448d3833ff22c86e196eb6d8
+index 0000000000000000000000000000000000000000..31a96b74c6df270a91ffeef91b505ae26ce0ee20
 --- /dev/null
 +++ b/crates/victory-shader/src/emit/lower/halves.rs
-@@ -0,0 +1,452 @@
+@@ -0,0 +1,479 @@
 +//! Console wave64 compute programs on a host whose waves have at most 32
 +//! lanes (NVIDIA, Intel: `WaveLaneCountMax` 32). Such a host refuses
 +//! `WaveSize(64)`, which a wave64 program that needs the console's lanes
@@ -1585,6 +1678,44 @@ index 0000000000000000000000000000000000000000..d9a463f0abd6def3448d3833ff22c86e
 +const HALF: u32 = 32;
 +
 +impl Lower<'_> {
++    /// Each lane reads `data` of the lane its address plus the offset
++    /// names in dwords within its own 32-lane half (RDNA 2 ISA,
++    /// section 10.4.4: wave64 permutes lanes 0..31 and 32..63
++    /// independently); 0 from a lane EXEC leaves out. Native wave64
++    /// keeps the current hardware lane's half; in halves (wave64 on
++    /// a 32-lane host) the host wave is that half, so the operand
++    /// is the local lane 0..31; native wave32 is local too.
++    pub(super) fn bpermute_lane(&mut self, a: V, x: V, offset: u32, guard: Option<V>) -> V {
++        let c = self.cur;
++        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
++        let (o, two, mask31) = (k(self, offset), k(self, 2), k(self, 31));
++        let at = self.s.m.bin(c, Bin::Add, a, o);
++        let lane = self.s.m.bin(c, Bin::LShr, at, two);
++        let within_half = self.s.m.bin(c, Bin::And, lane, mask31);
++        let lane = if self.x.native.wave64 && !self.halves {
++            let me = self.lane_index();
++            let not31 = k(self, !31);
++            let base = self.s.m.bin(c, Bin::And, me, not31);
++            self.s.m.bin(c, Bin::Or, base, within_half)
++        } else {
++            within_half
++        };
++        let r = self.read_lane(x, lane);
++        let on = guard.unwrap_or_else(|| self.s.m.bool(true));
++        let i32t = self.s.t.i32;
++        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
++        let ballot = self
++            .s
++            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
++        let (lo, hi) = (
++            self.s.m.extract(c, ballot, 0),
++            self.s.m.extract(c, ballot, 1),
++        );
++        let running = self.lane_bit_of(c, lane, lo, hi);
++        let z = k(self, 0);
++        self.s.m.select(c, running, r, z)
++    }
++
 +    /// Whether a wave64 program whose lanes follow the console's runs in
 +    /// halves: the host's waves are 32 lanes at most.
 +    pub(super) fn halves_wanted(x: &Parts, needs_wave: bool) -> bool {
@@ -1686,17 +1817,6 @@ index 0000000000000000000000000000000000000000..d9a463f0abd6def3448d3833ff22c86e
 +    /// Refuses a read into the other half of the console wave in halves.
 +    pub(super) fn same_half(&self, what: Why) -> Result<(), Why> {
 +        if self.halves { Err(what) } else { Ok(()) }
-+    }
-+
-+    /// The lane mask `ds_bpermute_b32` takes its source lane modulo: in
-+    /// halves the host wave, which is the half the console permutes within;
-+    /// else the console wave, as before.
-+    pub(super) fn permute_lanes(&self) -> u32 {
-+        if self.halves {
-+            HALF - 1
-+        } else {
-+            self.wave() - 1
-+        }
 +    }
 +}
 +
@@ -2425,10 +2545,10 @@ index 017b2f3398bb134666a07fc1827a3ddfe8982cdc..d2a2f0238d0dad2af4f38236f8c875da
      })
      .expect("lower");
 diff --git a/crates/victory-shader/src/emit/synthetic_tests.rs b/crates/victory-shader/src/emit/synthetic_tests.rs
-index 999c2f05a8ed57e03b7be5bed89f5fd59cecf5ae..f78efcbb49858ad9018f24d73170ebc72e23252b 100644
+index 3d00d0d35259bc18496cf23372ded9a5f142f488..b73e179ee09fd336ea560d04f84368c4ace96da4 100644
 --- a/crates/victory-shader/src/emit/synthetic_tests.rs
 +++ b/crates/victory-shader/src/emit/synthetic_tests.rs
-@@ -141,6 +141,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
+@@ -142,6 +142,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
          outputs: Vec::new(),
          prims: Vec::new(),
          mesh_stride: 0,

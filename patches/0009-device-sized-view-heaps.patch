@@ -1,5 +1,5 @@
 diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
-index 15249f4..bce4175 100644
+index 3046e06ae0251b58c7253ef62b3d605feed44bbf..308c9eb18db92d5b8ffbe3b23035e843b0614fa0 100644
 --- a/crates/victory-gpu/src/descriptor/host.rs
 +++ b/crates/victory-gpu/src/descriptor/host.rs
 @@ -19,10 +19,14 @@ pub(crate) struct HostHeap {
@@ -221,7 +221,7 @@ index 15249f4..bce4175 100644
          unsafe {
              let at = (*data as *mut u32).add(2 * index as usize);
              at.write_volatile(entry.0);
-@@ -2017,6 +2061,29 @@ mod tests {
+@@ -2061,6 +2105,29 @@ mod tests {
          assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
      }
  
@@ -251,7 +251,7 @@ index 15249f4..bce4175 100644
      /// Dynamic slots stay taken until given back, and runs do not wrap.
      #[test]
      fn dynamic_slots_are_held_until_released() {
-@@ -2024,10 +2091,17 @@ mod tests {
+@@ -2068,10 +2135,17 @@ mod tests {
              return; // no host GPU
          };
          // Every index a translated shader can reach exists (clamped below
@@ -271,7 +271,7 @@ index 15249f4..bce4175 100644
              let samplers = HostHeap::new(true, 128).unwrap();
              assert!(samplers.heap.GetDesc().NumDescriptors >= victory_shader::emit::HEAP_SAMPLERS);
          }
-@@ -2086,6 +2160,55 @@ mod tests {
+@@ -2130,6 +2204,55 @@ mod tests {
          assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
      }
  
@@ -328,16 +328,14 @@ index 15249f4..bce4175 100644
      fn dynamic_search_can_find_a_run_across_the_cursor() {
          let Some(heap) = HostHeap::new(false, 4) else {
 diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
-index f6f2dac..5868136 100644
+index 3fc15c26db4976579feb8a57402e0f6050e42739..c33f350d37f30cdeb9f466c1ee128b0a4433c557 100644
 --- a/crates/victory-gpu/src/host.rs
 +++ b/crates/victory-gpu/src/host.rs
-@@ -223,14 +223,26 @@ fn create() -> windows::core::Result<Host> {
+@@ -223,11 +223,24 @@ fn create() -> windows::core::Result<Host> {
          let cpu_view_size =
              device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
          tracing::info!("host D3D12 device ready");
-+        let shader_host = victory_shader::emit::host::Host {
-+            device: device.clone(),
-+        };
++        let shader_host = victory_shader::emit::host::Host::from_device(device.clone());
 +        // Translated shaders index view heaps as large as this device makes
 +        // them (`HEAP_VIEWS_MAX`, or 1,000,000 on NVIDIA and on resource
 +        // binding tiers 1-2): measured once on the device made here (the hardware
@@ -354,17 +352,14 @@ index f6f2dac..5868136 100644
          // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
          // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
          // host chooses (the RX 6700 XT does, WARP does not).
--        match (victory_shader::emit::host::Host {
--            device: device.clone(),
--        })
--        .fuses_fmad()
+-        match victory_shader::emit::host::Host::from_device(device.clone()).fuses_fmad()
 -        {
 +        match shader_host.fuses_fmad() {
              Ok(true) => {}
              Ok(false) => tracing::warn!(
                  "the host GPU does not fuse multiply-adds: results of the console's fused v_fma and v_fmac can differ in kind here"
 diff --git a/crates/victory-gpu/src/pipeline/library.rs b/crates/victory-gpu/src/pipeline/library.rs
-index 9946221..d9a923b 100644
+index 9946221283ecbe5ad2f2ac710e77be0228879f77..d9a923bac3a4c629fcfaf40b1cd31a4cf555ff17 100644
 --- a/crates/victory-gpu/src/pipeline/library.rs
 +++ b/crates/victory-gpu/src/pipeline/library.rs
 @@ -183,6 +183,7 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
@@ -384,7 +379,7 @@ index 9946221..d9a923b 100644
          include_bytes!("library.rs"),
      ] {
 diff --git a/crates/victory-gpu/src/shader_cache.rs b/crates/victory-gpu/src/shader_cache.rs
-index 5d5c34f..812bcaa 100644
+index 5d5c34f4ca977606ba8ad76927228eb73749cb17..812bcaac121fae20eb16176d6ca19dd62c4c8e14 100644
 --- a/crates/victory-gpu/src/shader_cache.rs
 +++ b/crates/victory-gpu/src/shader_cache.rs
 @@ -84,14 +84,30 @@ fn key(translator: &str, encoding: &[u8], limit: u32, options: Options) -> [u8;
@@ -436,10 +431,10 @@ index 5d5c34f..812bcaa 100644
          assert!(
              std::str::from_utf8(ENCODING)
 diff --git a/crates/victory-shader/src/emit/host.rs b/crates/victory-shader/src/emit/host.rs
-index 36a84b4..455bc84 100644
+index 51e0edfffe50ab8065c61d2d8e207940c32f668f..13f72831abab31e90eee23c2e41f1006ced32bc4 100644
 --- a/crates/victory-shader/src/emit/host.rs
 +++ b/crates/victory-shader/src/emit/host.rs
-@@ -552,6 +552,44 @@ impl Host {
+@@ -630,6 +630,44 @@ impl Host {
          unsafe { device.CreatePipelineState(&desc) }.map_err(err)
      }
  
@@ -484,7 +479,7 @@ index 36a84b4..455bc84 100644
      /// Whether this device fuses DXIL `FMad`, which the lowering emits for
      /// the console's fused `v_fma_f32`/`v_fmac_f32`/`v_fma_mix*`: where it
      /// does not, their results can differ in kind (NaN where an overflowing
-@@ -1289,8 +1327,8 @@ pub enum View<'a> {
+@@ -1370,8 +1408,8 @@ pub enum View<'a> {
      NullPair,
      /// The second slot of a [`View::Memory`] or [`View::NullPair`].
      Pair,
@@ -495,7 +490,7 @@ index 36a84b4..455bc84 100644
      /// below it.
      NullBuffers,
  }
-@@ -1495,7 +1533,7 @@ impl Host {
+@@ -1577,7 +1615,7 @@ impl Host {
                  Ok::<_, String>(zeros)
              };
              let slots = match d.views.last() {
@@ -504,7 +499,7 @@ index 36a84b4..455bc84 100644
                  _ => d.views.len(),
              };
              let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, slots)?;
-@@ -1831,7 +1869,7 @@ impl Host {
+@@ -1913,7 +1951,7 @@ impl Host {
                      }
                      View::Pair => {}
                      View::NullBuffers => {
@@ -514,10 +509,10 @@ index 36a84b4..455bc84 100644
                          srv_at.ptr += (null - i) * view_size;
                          uav_at.ptr += (null - 1 - i) * view_size;
 diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
-index d4b2fee..b88599a 100644
+index ca5594f87f4dd6225c568e78eebda571fbe6cd73..e06463314b14ba44a2b894381c66a72e7a5f6c8e 100644
 --- a/crates/victory-shader/src/emit/lower.rs
 +++ b/crates/victory-shader/src/emit/lower.rs
-@@ -5310,7 +5310,7 @@ impl<'a> Lower<'a> {
+@@ -5330,7 +5330,7 @@ impl<'a> Lower<'a> {
              return index;
          }
          let c = self.cur;
@@ -526,7 +521,7 @@ index d4b2fee..b88599a 100644
          let over = self.s.m.cmp(c, pred::IUGT, index, last);
          let index = self.s.m.select(c, over, last, index);
          let four = self.s.m.i32(4);
-@@ -5323,7 +5323,7 @@ impl<'a> Lower<'a> {
+@@ -5343,7 +5343,7 @@ impl<'a> Lower<'a> {
          let zero = self.s.m.i32(0);
          let none = self.s.m.cmp(c, pred::EQ, stride, zero);
          // The null unordered access view sits just below the null SRV.
@@ -536,7 +531,7 @@ index d4b2fee..b88599a 100644
          self.s.m.select(c, none, null, index)
      }
 diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
-index 1d68477..eb49b01 100644
+index 1d684773605d6cfc0d9b61375dad3aeb53a84a5a..eb49b015396431089abfd6d8ba113c6fe8997a62 100644
 --- a/crates/victory-shader/src/emit/mod.rs
 +++ b/crates/victory-shader/src/emit/mod.rs
 @@ -83,17 +83,21 @@
@@ -580,7 +575,7 @@ index 1d68477..eb49b01 100644
  
  /// The loop limit without an override: 2^20.
 diff --git a/crates/victory-shader/src/emit/shader.rs b/crates/victory-shader/src/emit/shader.rs
-index a04b7e7..cd70394 100644
+index a04b7e7151e79a28169c16a5e21367677cafec5b..cd70394b87ac89d0a58ec61e8bf6dcdca25c8efe 100644
 --- a/crates/victory-shader/src/emit/shader.rs
 +++ b/crates/victory-shader/src/emit/shader.rs
 @@ -28,16 +28,72 @@ pub const VIEW_SIGNED: u32 = 1 << 30;
@@ -672,7 +667,7 @@ index a04b7e7..cd70394 100644
          let index = self.m.select(block, over, last, index);
          let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
 diff --git a/crates/victory-shader/src/emit/stride_tests.rs b/crates/victory-shader/src/emit/stride_tests.rs
-index 20615b2..33892d6 100644
+index 20615b2e509421724ae43436e909ee40ce38667a..33892d605b294244f21f0c5ed24f01b7137e1329 100644
 --- a/crates/victory-shader/src/emit/stride_tests.rs
 +++ b/crates/victory-shader/src/emit/stride_tests.rs
 @@ -309,16 +309,6 @@ fn a_heap_buffer_read_by_element_takes_the_views_stride() {
