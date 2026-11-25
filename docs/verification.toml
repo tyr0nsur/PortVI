@@ -13,6 +13,13 @@ verified = 25
 total = 29
 evidence = "docs/engineering-review.md#component-tests"
 
+[split_rows]
+title = "Row shuffles · RTX 4060"
+unit = "lane values matched"
+verified = 143360
+total = 143360
+evidence = "docs/engineering-review.md#wave64-on-a-32-lane-gpu"
+
 [bcpack]
 title = "BCPack · independent encoder"
 unit = "synthetic streams decoded exactly"
