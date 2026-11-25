@@ -1,10 +1,10 @@
 # Native runtime engineering review
 
-25 November 2026. PortVI now pins the original `Marvisak/VIctory` main revision `940d32f`. Eleven patches apply to that gitlink. The previous integration and its sixteen patches remain available for reproducing the earlier comparisons. [Current engine](https://github.com/Marvisak/VIctory/commit/940d32f69b22265690a0b5a15d6ded572ba33baf) · [Previous PortVI revision](https://github.com/tyr0nsur/PortVI/tree/d0cb833051d5c100a790246c71d8363c7a5315c3)
+25 November 2026. PortVI pins the original `Marvisak/VIctory` main revision `940d32f` and applies fourteen patches. The last three cover floating-point conversion, linked mesh rendering and compute lane masks. [Current engine](https://github.com/Marvisak/VIctory/commit/940d32f69b22265690a0b5a15d6ded572ba33baf) · [Previous PortVI revision](https://github.com/tyr0nsur/PortVI/tree/20d4174eef8c77e89ba4664b83be2ef11a2f9a22)
 
 ## Reproduced on this revision
 
-On Windows x64 the full workspace finished with 731 Rust tests passing and 11 marked ignored. Two Python frame-time tests passed. The physical-adapter median test was then run explicitly, alongside the physical texture probe. The open x64 program returned 73, and the workspace also passed Clippy with all targets and features and warnings treated as errors.
+On Windows x64, 748 Rust workspace tests passed and 11 were marked ignored. One of the passing tests also ran in an isolated child process, bringing the total to 749 executions. Both Python frame-time tests passed. The physical-adapter median and texture probes ran separately. The open x64 program returned 73. Clippy passed for all targets and features with warnings treated as errors.
 
 | Area | Reproduction and result |
 | --- | --- |
@@ -23,10 +23,30 @@ For structured shader-resource views, the translator emits byte-addressed loads.
 
 The emitter sets the DXIL module and container feature flags when a vertex or mesh stage declares an unordered-access view. Compute shaders that use derivatives select validator 1.8 and emit the matching pipeline-state metadata. The tests also check a vertex shader without the declared view, rejection under the earlier derivative profile and a compute dot product that still validates under 1.6. [BastienRodz’s UAV change](https://github.com/Marvisak/VIctory/pull/1989) · [Halfect’s compute derivative change](https://github.com/Marvisak/VIctory/pull/1065) · [Imported code and tests](../patches/0008-dxil-stage-flags-and-validator.patch)
 
+## Linked mesh and pixel shaders
+
+Direct3D 12 allows 32 KiB for the combined vertex and primitive outputs of a mesh shader. Each stage can translate individually while its pipeline still exceeds that budget. When the mesh stage is over budget, PortVI reads the pixel stage’s channel usage and removes unused mesh outputs. It keeps the declared vertex and primitive counts, checks that each required arbitrary channel has a compatible producer, and measures the emitted pair again. The linked cache includes both original containers, translator options, loop limit and device heap bounds. This adapts Texbirds’s work. [Upstream proposal](https://github.com/Marvisak/VIctory/pull/2398) · [DirectX mesh shader specification](https://microsoft.github.io/DirectX-Specs/d3d/MeshShader.html) · [Runtime, translator and tests](../patches/0013-linked-mesh-outputs.patch)
+
+The public fixture declares 128 vertices and 128 primitives. Its standalone mesh output occupies 34,816 bytes. Paired with a pixel shader that reads four arbitrary channels, it uses 4,096 bytes. In a depth-only pipeline it uses 2,048 bytes. The runtime’s normal pipeline creation path dispatched the linked draw and read back (1, 0.5, 0.25, 1) at all 256 pixels on the RTX 4060 and WARP. The suite also exercises a consumer that still needs too much output, a declared channel the producer never writes, swapped stages and a second pipeline creation that reuses the linked pair.
+
+## Floating-point conversion
+
+PortVI translates `v_cvt_f32_f64` for round-to-nearest-even. The GPU suite checks fourteen register pairs against a CPU conversion, including signed zero, ties in both directions, the smallest representable FP32 subnormal, infinities and a NaN. A separate test covers inline operands and a literal encoding of −2.25. Directed rounding and a dynamically selected mode produce an explicit translation refusal. Calvix2k contributed the conversion and default-cybe contributed binary64 inline constants. [Original conversion](https://github.com/Marvisak/VIctory/pull/2348) · [Inline constants](https://github.com/Marvisak/VIctory/pull/1559) · [Our hardware reproduction](https://github.com/Marvisak/VIctory/pull/2348#issuecomment-7164049522) · [PortVI tests and fixes](../patches/0012-fp64-operands-and-rounding.patch)
+
+## Compute lane masks
+
+A compute shader can save its active lanes, use the resulting scalar condition to choose a value, then restore the original lanes. PortVI tracks that condition and lane masks used as ordinary numbers across control-flow joins. The emitted DXIL declares the wave size that these calculations require. Leaving that declaration out produced different values across subgroups on WARP during testing.
+
+On the RTX 4060 the tests checked 32-lane outputs against a CPU reference, including an empty mask, a mask with only lane 31 and a branch joining a mask with a constant. The 64-lane programs passed the DXIL validator. The RTX 4060 reported 32 lanes and WARP reported four, so hardware readback of the 64-lane cases is open. An AMD hardware report can run the two `wave64` tests in `emit::synthetic_tests` and include the reported lane range. This work builds on Xvania7’s data-flow changes. [Upstream proposal](https://github.com/Marvisak/VIctory/pull/2289) · [Translator and readback tests](../patches/0014-compute-mask-values.patch)
+
 ## Latest checks against Leonida and XCL
+
+Leonida also merged a draw test for dual-source blending. XCL added parallel compilation for pieces of large direct compute dispatches and identified active pipelines in its device-removal reports. The XCL dispatch change targets pipeline creation time. It has a separate fallback for indirect dispatches and large loops. [Leonida draw test](https://github.com/ubiquitarianism/leonida/pull/1703) · [XCL compute dispatches](https://github.com/xcl-dev/xcl/pull/2080) · [XCL device-removal reports](https://github.com/xcl-dev/xcl/pull/1592)
 
 | Project | Recent change and relevance to PortVI |
 | --- | --- |
+| Leonida | Its Vulkan translator now unpacks compressed FP16 mesh exports and exports layer and viewport indices per primitive. Its maintainers report reaching the world phase after story loading and are still working towards a first confirmed world frame. These are useful cases for testing per-primitive outputs on Direct3D 12. [Compressed exports](https://github.com/ubiquitarianism/leonida/commit/d6efad1bbcf44d12ae2946adeb5081e27753be6f) · [Layer and viewport](https://github.com/ubiquitarianism/leonida/commit/c48cc2353abddb82a81e5cbac342ca81bac6fadf) · [Maintainer status](https://github.com/ubiquitarianism/leonida/blob/384abe5b06d08e349f4b4e4394c68f036da47dc7/README.md) |
+| XCL | Its D3D12 backend corrected mesh triangle indices to nine bits and the index guard for a million-descriptor heap. Its NVIDIA integration branch reports about 5 FPS in a partially drawn world on an RTX 5090. The 14 FPS average also includes menus and loading. [Mesh index fix](https://github.com/xcl-dev/xcl/commit/3eab40a4bb48c15d4b79ed3f756deba52eb89bdb) · [Heap guard](https://github.com/xcl-dev/xcl/commit/19bef421e6f974fec2aa8289b228c78ab92f3013) · [Measurement and hardware](https://github.com/xcl-dev/xcl/blob/f0e1b2f149cc61231d04b838482f2fd5ec05b391/README.md) |
 | Leonida | Its Vulkan backend changed the order of mesh-shader interface declarations after one AMD Windows driver failed on the old order. PortVI emits DXIL for D3D12. The cross-project check worth repeating is creating a real mesh pipeline on each driver after bytecode validation. [Merged change and hardware scope](https://github.com/ubiquitarianism/leonida/pull/802) |
 | XCL | When a driver refuses a large compute pipeline, XCL now records the driver error, compile time, bytecode size and cache identity. These are useful fields when correlating PortVI’s pipeline failures with its offline shader results. Our driver checks here use small source-authored programs. [Merged D3D12 diagnostics](https://github.com/xcl-dev/xcl/pull/1918) |
 

@@ -13,6 +13,20 @@ verified = 13
 total = 13
 evidence = "docs/engineering-review.md#reproduced-on-this-revision"
 
+[fp64]
+title = "FP64 to FP32 · RTX 4060"
+unit = "register-pair conversions matched"
+verified = 14
+total = 14
+evidence = "docs/engineering-review.md#floating-point-conversion"
+
+[mesh]
+title = "Linked mesh draw · RTX 4060"
+unit = "pixels matched all four channels"
+verified = 256
+total = 256
+evidence = "docs/engineering-review.md#linked-mesh-and-pixel-shaders"
+
 [texture]
 title = "BC4 readback · RTX 4060"
 unit = "streamed texels matched"

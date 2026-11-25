@@ -22,12 +22,14 @@ PortVI runs x86-64 console code directly on the Windows host CPU. Its engine is 
 
 ## Development dashboard
 
-The shader cards track one instruction, `v_med3_f32`. The texture cards track one authored 8×4 BC4 image and its skipped-upload control.
+The cards show the results of individual tests. The mesh draw checks all four color channels of a 16×16 target. The texture tests use an 8×4 BC4 image.
 
 <!-- verification:start -->
 <p align="center">
   <a href="probes/runtime.rs"><img src="docs/assets/progress-loader.svg" width="366" alt="Native loader probe — 2 / 2 runtime imports bound (100%)"></a>
   <a href="docs/engineering-review.md#reproduced-on-this-revision"><img src="docs/assets/progress-shader.svg" width="366" alt="Median shader · RTX 4060 — 13 / 13 test vectors matched (100%)"></a>
+  <a href="docs/engineering-review.md#floating-point-conversion"><img src="docs/assets/progress-fp64.svg" width="366" alt="FP64 to FP32 · RTX 4060 — 14 / 14 register-pair conversions matched (100%)"></a>
+  <a href="docs/engineering-review.md#linked-mesh-and-pixel-shaders"><img src="docs/assets/progress-mesh.svg" width="366" alt="Linked mesh draw · RTX 4060 — 256 / 256 pixels matched all four channels (100%)"></a>
   <a href="docs/engineering-review.md#bc4-storage-and-gpu-readback"><img src="docs/assets/progress-texture.svg" width="366" alt="BC4 readback · RTX 4060 — 32 / 32 streamed texels matched (100%)"></a>
   <a href="docs/engineering-review.md#bc4-storage-and-gpu-readback"><img src="docs/assets/progress-stale.svg" width="366" alt="BC4 skipped upload — 32 / 32 stale texels detected (100%)"></a>
   <a href="https://github.com/tyr0nsur/PortVI/issues/1"><img src="docs/assets/progress-vendors.svg" width="366" alt="Median shader · vendors — 1 / 3 vendors with a passing hardware run (33%)"></a>
@@ -35,11 +37,13 @@ The shader cards track one instruction, `v_med3_f32`. The texture cards track on
 </p>
 <!-- verification:end -->
 
-**Windows regression run** · On Windows x64, 731 Rust workspace tests and two frame-time analyzer tests passed on this engine revision. A separate source-built x64 probe binds both imports and returns exit status 73. [Test breakdown](docs/engineering-review.md#reproduced-on-this-revision)
+**Windows regression run** · On Windows x64, 748 Rust workspace tests and two frame-time analyzer tests passed. A source-built x64 probe bound both imports and returned exit status 73. [Test breakdown](docs/engineering-review.md#reproduced-on-this-revision)
 
 **Texture streaming** · A DirectStorage request decoded two BC4 blocks directly into a console texture. The RTX 4060 matched all 32 texels after upload and detected all 32 stale texels when the upload was deliberately skipped. [Run the fixture](docs/engineering-review.md#bc4-storage-and-gpu-readback)
 
 **Texture sampling** · The translator now emits DXIL for two instructions with 16-bit texture gradients. The RTX 4060 and WARP selected the expected mip levels and texels with both 16-bit and 32-bit coordinates. [G16 tests and supported forms](docs/engineering-review.md#g16-texture-sampling)
+
+**Mesh rendering** · When a mesh shader exceeds the Direct3D 12 output limit, PortVI checks which channels its pixel shader reads. An authored draw went from 34,816 to 4,096 output bytes and reproduced the expected color in all 256 pixels. [Linked shader tests](docs/engineering-review.md#linked-mesh-and-pixel-shaders)
 
 **Frame pacing** · The first scene benchmark needs paired 120-second captures with cold and warm caches. Stable 30 FPS remains unmeasured. [Capture protocol](docs/engineering-review.md#measuring-a-30-fps-target)
 
@@ -85,7 +89,7 @@ The census counts runtime and Windows exports. For functions provided by a DLL a
 
 | Workstream | Next result we can verify | Join |
 | --- | --- | --- |
-| GPU validation | Repeat the 13 shader cases on AMD or Intel. Include the adapter, driver, commit and test output. | [Hardware reports](https://github.com/tyr0nsur/PortVI/issues/1) |
+| GPU validation | Repeat the median test on AMD or Intel, or run the two compute-mask tests on a device that supports 64-lane waves. Include the adapter, driver, commit and readback. | [Hardware reports](https://github.com/tyr0nsur/PortVI/issues/1) · [Wave64 cases](docs/engineering-review.md#compute-lane-masks) |
 | Texture uploads | Repeat the BC4 readback and skipped-upload control on AMD or Intel. Record the device, driver and both counts. | [Texture fixture](https://github.com/tyr0nsur/PortVI/issues/2) |
 | Frame pacing | Capture the same interactive scene twice and report displayed FPS and frame-time percentiles. | [Scene benchmark](https://github.com/tyr0nsur/PortVI/issues/3) |
 | Synchronization | Verify fence wakeups on the pinned engine for CPU signals, GPU writes and direct memory writes. | [Fence waits](https://github.com/tyr0nsur/PortVI/issues/4) |
@@ -99,7 +103,7 @@ The `engine` submodule pins the upstream revision. `prepare` prints the path of 
 
 ```powershell
 $source = python portvi.py prepare
-$patchPath = Join-Path $PWD 'patches/0012-description.patch'
+$patchPath = Join-Path $PWD 'patches/0015-description.patch'
 git -C $source diff --output=$patchPath
 python portvi.py test
 ```
