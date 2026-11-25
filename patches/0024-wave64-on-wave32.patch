@@ -1,0 +1,2470 @@
+diff --git a/apps/victory/src/main.rs b/apps/victory/src/main.rs
+index 5fae07f62c118aae8fd6ab819418afd83b6f02ff..a4d19930168a0bc5ec44ce37d6747f076fc28a64 100644
+--- a/apps/victory/src/main.rs
++++ b/apps/victory/src/main.rs
+@@ -91,6 +91,11 @@ enum Command {
+         /// Print one line per program and outcome.
+         #[arg(long)]
+         list: bool,
++        /// Translate for a host whose waves have at most 32 lanes (NVIDIA,
++        /// Intel), as `run` does there: wave64 compute programs in halves.
++        /// With `--pipelines`, set by the GPU that makes them.
++        #[arg(long, conflicts_with = "cache")]
++        wave32: bool,
+         /// Worker threads (default: every logical core).
+         #[arg(long)]
+         jobs: Option<usize>,
+@@ -181,7 +186,8 @@ fn main() -> Result<()> {
+             list,
+             jobs,
+             cache: false,
+-        } => translate::run(paths, validate, pipelines, list, jobs),
++            wave32,
++        } => translate::run(paths, validate, pipelines, list, jobs, wave32),
+         Command::Run {
+             exe,
+             unimplemented,
+diff --git a/apps/victory/src/translate.rs b/apps/victory/src/translate.rs
+index 242ea26261c71c513d2ee092ee1e97106c682445..36cf412d0f8362a556223bff367940eed5884ab2 100644
+--- a/apps/victory/src/translate.rs
++++ b/apps/victory/src/translate.rs
+@@ -150,6 +150,9 @@ struct Checks {
+     keep: Option<Kept>,
+     validator: Option<Validator>,
+     host: Option<(Host, emit::HostShader)>,
++    /// Translate for a host of 32-lane waves (`--wave32`, or the GPU
++    /// `--pipelines` makes them on).
++    wave32: bool,
+ }
+ 
+ pub fn run(
+@@ -158,6 +161,7 @@ pub fn run(
+     pipelines: bool,
+     list: bool,
+     jobs: Option<usize>,
++    wave32: bool,
+ ) -> Result<()> {
+     // Dumped shaders and validator reports are game-derived (rule #1).
+     if let Some(dir) = std::env::var_os("VICTORY_EMIT_DUMP") {
+@@ -173,8 +177,15 @@ pub fn run(
+                 .map_or("dxil.dll".into(), |p| p.display().to_string())
+         );
+     }
+-    if pipelines {
+-        Host::new(false).map_err(anyhow::Error::msg)?;
++    let wave32 = if pipelines {
++        let host = Host::new(false).map_err(anyhow::Error::msg)?;
++        // As `run` translates for this GPU.
++        wave32 || host.wave32().map_err(anyhow::Error::msg)?
++    } else {
++        wave32
++    };
++    if wave32 {
++        println!("waves        of 32 lanes at most (wave64 programs in halves)");
+     }
+     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
+         .unwrap_or_default()
+@@ -217,6 +228,7 @@ pub fn run(
+                                 host: pipelines
+                                     .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
+                                     .flatten(),
++                                wave32,
+                             };
+                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                                 translate(job, entry.path(), &seen, &mut t, &mut checks);
+@@ -568,7 +580,10 @@ fn translate(
+                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
+                     let label = || format!("{} {:?}", example(), p.stage);
+                     *counter(t, p.stage, 0) += 1;
+-                    let marks = emit::Options { view_marks: true };
++                    let marks = emit::Options {
++                        view_marks: true,
++                        host_wave32: checks.wave32,
++                    };
+                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
+                         Ok(shader) => {
+                             *counter(t, p.stage, 1) += 1;
+@@ -860,7 +875,7 @@ mod tests {
+         // SAFETY: no other test in this binary touches the environment.
+         unsafe { std::env::set_var("VICTORY_EMIT_DUMP", env!("CARGO_MANIFEST_DIR")) };
+         let missing = std::env::temp_dir().join("victory-translate-no-such-dir");
+-        let err = super::run(vec![missing], false, false, false, Some(1)).unwrap_err();
++        let err = super::run(vec![missing], false, false, false, Some(1), false).unwrap_err();
+         // SAFETY: as above; unset so a later test's `run` is not refused.
+         unsafe { std::env::remove_var("VICTORY_EMIT_DUMP") };
+         assert!(
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index d605bdb75356dc5a98add2af420b15b797cfe7a3..b972cd4b8404bc721427d71579d233bc9a369024 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -1052,6 +1052,29 @@ impl Host {
+         })
+     }
+ 
++    /// Whether the host's waves have at most 32 lanes, 32 among them
++    /// (NVIDIA, Intel): `WaveSize(64)` is refused there, so wave64 compute
++    /// programs are translated for waves of 32
++    /// (`victory_shader::emit::Options::host_wave32`); logged once.
++    pub(crate) fn wave32(&self) -> bool {
++        static WAVE32: OnceLock<bool> = OnceLock::new();
++        *WAVE32.get_or_init(|| {
++            let host = victory_shader::emit::host::Host {
++                device: self.device.clone(),
++            };
++            match host.wave32() {
++                Ok(wave32) => {
++                    tracing::info!(wave32, "host waves of 32 lanes at most");
++                    wave32
++                }
++                Err(e) => {
++                    tracing::warn!(error = %e, "host wave lanes not known");
++                    false
++                }
++            }
++        })
++    }
++
+     /// Whether the host runs 64-bit atomics on typed resources in the
+     /// descriptor heap (translated 64-bit image atomics); logged once.
+     pub(crate) fn heap_atomics64(&self) -> bool {
+diff --git a/crates/victory-gpu/src/shader_cache.rs b/crates/victory-gpu/src/shader_cache.rs
+index b3a9d1a13a10bf4e9f40c9ac37ca34fd63af113d..99bc6317791cc0e8d9a320c49b3c40ff588f4cc4 100644
+--- a/crates/victory-gpu/src/shader_cache.rs
++++ b/crates/victory-gpu/src/shader_cache.rs
+@@ -49,13 +49,28 @@ pub fn counts() -> (u64, u64) {
+     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
+ }
+ 
+-/// Writes through buffer views mark the pages for the renderer's copy-back.
+-const OPTIONS: Options = Options { view_marks: true };
++/// The translation options of this run: writes through buffer views mark
++/// the pages for the renderer's copy-back, and wave64 programs run in
++/// halves where the host's waves are 32 lanes at most ([`host_wave32`]).
++fn options() -> Options {
++    Options {
++        view_marks: true,
++        host_wave32: host_wave32(),
++    }
++}
++
++/// Whether translations are for a host of 32-lane waves: the host GPU's
++/// (made here if it is not yet: the cache belongs to the GPU it was filled
++/// on, as the pipeline library does); none without one.
++fn host_wave32() -> bool {
++    crate::host::host().is_some_and(crate::host::Host::wave32)
++}
+ 
+ /// What a translation depends on besides its container: the translator
+ /// (`victory_shader::SOURCE_HASH`: its sources, manifest, the lock file and
+ /// the compiler), the entry's encoding (this file's text) and the
+-/// loop limit and translation options passed to the emitter.
++/// loop limit and translation options passed to the emitter (among them
++/// whether the host's waves are 32 lanes at most, [`host_wave32`]).
+ fn build() -> &'static [u8; 32] {
+     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
+     BUILD.get_or_init(|| {
+@@ -66,7 +81,7 @@ fn build() -> &'static [u8; 32] {
+                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
+             );
+         }
+-        key(victory_shader::SOURCE_HASH, ENCODING, limit, OPTIONS)
++        key(victory_shader::SOURCE_HASH, ENCODING, limit, options())
+     })
+ }
+ 
+@@ -79,8 +94,12 @@ fn key(translator: &str, encoding: &[u8], limit: u32, options: Options) -> [u8;
+     h.update(blake3::hash(encoding).as_bytes());
+     h.update(&limit.to_le_bytes());
+     // Destructure all options so a new emitter flag requires a cache-key decision.
+-    let Options { view_marks } = options;
++    let Options {
++        view_marks,
++        host_wave32,
++    } = options;
+     h.update(&[u8::from(view_marks)]);
++    h.update(&[u8::from(host_wave32)]);
+     *h.finalize().as_bytes()
+ }
+ 
+@@ -106,8 +125,9 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
+     let profile = victory_shader::emit::view_heap();
+     // Writes through views mark their pages: copy-backs compare only those
+     // (`crate::shadow::copy_back_marks`).
++    let options = options();
+     let translate = |c: &[u8]| victory_shader::emit::with_view_heap(profile.0, profile.1, || {
+-        victory_shader::emit::translate_with(c, OPTIONS).map_err(|e| e.to_string())
++        victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string())
+     });
+     match CACHE.get() {
+         Some(cache) => cached(cache, &host_build(build(), profile), container, translate),
+@@ -138,7 +158,7 @@ pub(crate) fn translate_linked(
+     pixel: Option<&[u8]>,
+ ) -> Result<(HostShader, Option<HostShader>), String> {
+     victory_shader::emit::with_view_heap(profile.0, profile.1, || {
+-        victory_shader::emit::translate_linked(mesh, pixel, OPTIONS)
++        victory_shader::emit::translate_linked(mesh, pixel, options())
+     })
+     .map_err(|e| e.to_string())
+ }
+@@ -482,10 +502,15 @@ mod tests {
+     }
+ 
+     /// The key's parts: a change to any of them (the translator's sources,
+-    /// this file's encoding, the loop limit) makes another key, so no entry
+-    /// written before it is read.
++    /// this file's encoding, the loop limit, the options: view marks and
++    /// the host's wave width) makes another key, so no entry written before
++    /// it is read.
+     #[test]
+     fn the_key_covers_translator_encoding_and_settings() {
++        const OPTIONS: Options = Options {
++            view_marks: true,
++            host_wave32: false,
++        };
+         let k = key("0123456789abcdef", b"encoding", 1 << 20, OPTIONS);
+         assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, OPTIONS));
+         assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, OPTIONS));
+@@ -497,10 +522,35 @@ mod tests {
+                 victory_shader::SOURCE_HASH,
+                 ENCODING,
+                 victory_shader::emit::loop_limit(),
+-                OPTIONS,
++                options(),
+             )
+         );
+-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, Options { view_marks: false }));
++        assert_eq!(options().host_wave32, host_wave32());
++        assert!(options().view_marks);
++        assert_ne!(
++            k,
++            key(
++                "0123456789abcdef",
++                b"encoding",
++                1 << 20,
++                Options {
++                    view_marks: false,
++                    ..OPTIONS
++                }
++            )
++        );
++        let wave32 = key(
++            "0123456789abcdef",
++            b"encoding",
++            1 << 20,
++            Options {
++                host_wave32: true,
++                ..OPTIONS
++            },
++        );
++        assert_ne!(k, wave32);
++        // Heap caps and wave width key separately (below): neither stands
++        // in for the other.
+         // Each view heap size a device makes has entries of its own.
+         let (max, portable) = (
+             victory_shader::emit::HEAP_VIEWS_MAX,
+@@ -511,6 +561,8 @@ mod tests {
+         assert_ne!(host_build(&k, (portable, portable)), host_build(&k, (portable, 721_469)));
+         assert_ne!(host_build(&k, (max, max)), k);
+         assert_ne!(host_build(&k, (max, max)), host_build(&key("0123456789abcdee", b"encoding", 1 << 20, OPTIONS), (max, max)));
++        assert_ne!(host_build(&k, (max, max)), host_build(&wave32, (max, max)));
++        assert_ne!(host_build(&wave32, (max, max)), host_build(&wave32, (portable, portable)));
+         // The encoding part is this file as built.
+         assert!(
+             std::str::from_utf8(ENCODING)
+diff --git a/crates/victory-shader/src/emit/bvh_tests.rs b/crates/victory-shader/src/emit/bvh_tests.rs
+index c099af070b657083f0263df16a5ec69e4ca80290..1b32df7698dd2d5b2e38be22221a053937811afe 100644
+--- a/crates/victory-shader/src/emit/bvh_tests.rs
++++ b/crates/victory-shader/src/emit/bvh_tests.rs
+@@ -592,6 +592,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
+         outputs: Vec::new(),
+         prims: Vec::new(),
+         mesh_stride: 0,
++        host_wave32: false,
+         view_marks: false,
+     })
+     .expect("lower");
+diff --git a/crates/victory-shader/src/emit/g16_tests.rs b/crates/victory-shader/src/emit/g16_tests.rs
+index 568bda0112230edb9b6ad63128571b07a10ef77e..724e6ef47768cfa025d1620fcbebf5922bd237d5 100644
+--- a/crates/victory-shader/src/emit/g16_tests.rs
++++ b/crates/victory-shader/src/emit/g16_tests.rs
+@@ -202,6 +202,7 @@ fn build(words: &[u32]) -> Result<HostShader, ShaderError> {
+         prims: Vec::new(),
+         mesh_stride: 0,
+         view_marks: false,
++        host_wave32: false,
+     })?;
+     let shader = HostShader {
+         stage: HwStage::Cs,
+diff --git a/crates/victory-shader/src/emit/halves_tests.rs b/crates/victory-shader/src/emit/halves_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..24bb487d92cb213b230b88352f0bfaab5da33198
+--- /dev/null
++++ b/crates/victory-shader/src/emit/halves_tests.rs
+@@ -0,0 +1,568 @@
++//! Console wave64 compute programs translated for a host of 32-lane waves
++//! (`lower::halves`): what reads within a 32-lane half runs exactly in two
++//! host waves of 32, what reads across them is refused with its reason.
++//!
++//! The GPU test runs one program on every hardware adapter: in halves
++//! everywhere (`WaveSize(32)`), and also as one wave64 (`WaveSize(64)`)
++//! where the adapter has 64-lane waves (AMD), which is the console's own
++//! form; the results must be the console's, computed here, in both.
++
++use super::host::{Dispatch, Host, Root, Stride, View};
++use super::{lower, validator};
++use crate::native::{
++    ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
++};
++use crate::{gfx10, io, ir, resource, structure};
++
++const S_ENDPGM: u32 = 0xBF81_0000;
++const S_WAITCNT_LGKM: u32 = 0xBF8C_C07F; // s_waitcnt lgkmcnt(0)
++
++/// `s[40:43]`: the raw UAV at table dword 16 (s0 is the table's address).
++const PROLOGUE: [u32; 5] = [
++    0xBE84_0300, // s_mov_b32 s4, s0
++    0xBE85_0380, // s_mov_b32 s5, 0
++    0xF408_0A02,
++    0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
++    S_WAITCNT_LGKM,
++];
++
++/// `buffer_store_dword v<vdata>, v16, s[40:43], 0 offen offset:<offset>`.
++const fn store(vdata: u8, offset: u32) -> [u32; 2] {
++    [0xE070_1000 | offset, 0x800A_0010 | (vdata as u32) << 8]
++}
++
++/// Per thread `l` of a group of 64 (one console wave64), eight dwords at
++/// `l * 32`: its thread id, `v_mbcnt` of all lanes (its lane), `l ^ 5`
++/// through `ds_swizzle` (xor mode, within 32 lanes), `l ^ 9` through
++/// `ds_bpermute_b32` (within the half), `0x777` written by `v_writelane` to
++/// lane 40 only, whether the constant mask -4 (every lane but 0 and 1; lane
++/// 32 is bit 0 of its high dword) has its lane, and `l ^ 1` through DPP
++/// (`quad_perm:[1,0,3,2]`).
++fn in_halves() -> Vec<u32> {
++    let mut w = PROLOGUE.to_vec();
++    w.extend([
++        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
++        0xD765_0001,
++        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
++        0xD766_0001,
++        0x0002_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1
++        0xD8D4_141F,
++        0x0200_0000, // ds_swizzle_b32 v2, v0 offset:swizzle(BITMASK_PERM xor 5)
++        0x3A08_0089, // v_xor_b32 v4, 9, v0
++        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
++        0xDACC_0000,
++        0x0300_0004, // ds_bpermute_b32 v3, v4, v0
++        0xBE88_03FF,
++        0x0000_0777, // s_mov_b32 s8, 0x777
++        0x7E0A_0280, // v_mov_b32 v5, 0
++        0xD761_0005,
++        0x0001_5008, // v_writelane_b32 v5, s8, 40
++        0xBE94_04C4, // s_mov_b64 s[20:21], -4
++        0xD501_0006,
++        0x0051_0280, // v_cndmask_b32 v6, 0, 1, s[20:21]
++        0x7E0E_02FA,
++        0xFF00_B100, // v_mov_b32 v7, v0 quad_perm:[1,0,3,2] (DPP)
++        S_WAITCNT_LGKM,
++    ]);
++    for (vdata, slot) in [(0, 0), (1, 1), (2, 2), (3, 3), (5, 4), (6, 5), (7, 6)] {
++        w.extend(store(vdata, 4 * slot));
++    }
++    w.push(S_ENDPGM);
++    w
++}
++
++/// What the console gives [`in_halves`]'s lane `l`.
++fn console(l: u32) -> [u32; 8] {
++    [
++        l,
++        l,
++        l ^ 5,
++        l ^ 9,
++        if l == 40 { 0x777 } else { 0 },
++        u32::from(l >= 2),
++        l ^ 1,
++        0,
++    ]
++}
++
++fn native(words: &[u32], wave64: bool, threads: u32, lds_bytes: u32) -> NativeProgram {
++    let range = |kind, table_offset_dwords, dwords| UsedResource {
++        kind,
++        root: RootType::Table,
++        table_offset_dwords,
++        lower_bound: 0,
++        stride: 0,
++        dwords,
++        user_data: 0,
++        slot: 0,
++    };
++    NativeProgram {
++        stage: HwStage::Cs,
++        wave64,
++        vgprs: 32,
++        layout: vec![RootParam {
++            root: RootType::Table,
++            table_offset_dwords: 0,
++            sgprs: 1,
++            base_register: 0,
++            user_data: 0,
++            slot: 0,
++        }],
++        used: vec![
++            range(ResourceType::Srv, 0, 8),
++            range(ResourceType::Srv, 8, 4),
++            range(ResourceType::Uav, 16, 4),
++        ],
++        io: StageIo::Cs(ComputeIo {
++            // One user-data SGPR; LDS in blocks of 512 bytes (bits 15-23).
++            rsrc2: 1 << 1 | lds_bytes.div_ceil(512) << 15,
++            threads: [threads, 1, 1],
++        }),
++        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
++    }
++}
++
++fn lowered(
++    native: &NativeProgram,
++    host_wave32: bool,
++) -> Result<lower::Lowered, crate::ShaderError> {
++    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
++    let st = structure::structure(&p).expect("structure");
++    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
++    let io = io::raise(&p, native).expect("io::raise");
++    lower::lower(&lower::Parts {
++        native,
++        p: &p,
++        st: &st,
++        io: &io,
++        res: &res,
++        inputs: Vec::new(),
++        outputs: Vec::new(),
++        prims: Vec::new(),
++        mesh_stride: 0,
++        view_marks: false,
++        host_wave32,
++    })
++}
++
++fn shader(l: lower::Lowered) -> super::HostShader {
++    super::HostShader {
++        stage: HwStage::Cs,
++        dxil: l.dxil,
++        user_data: l.user_data,
++        static_samplers: Vec::new(),
++        samplers: l.samplers,
++        root_cbvs: l.root_cbvs,
++        root_srvs: l.root_srvs,
++        root_uavs: l.root_uavs,
++        memory: l.memory,
++        memory_writes: l.memory_writes,
++        view_addresses: l.view_addresses,
++        heap: l.heap,
++        heap_writes: l.heap_writes,
++        view_marks: l.view_marks,
++    }
++}
++
++fn refusal(words: &[u32], threads: u32, lds_bytes: u32) -> String {
++    match lowered(&native(words, true, threads, lds_bytes), true) {
++        Ok(_) => "translated".into(),
++        Err(e) => e.to_string(),
++    }
++}
++
++/// The hand-encoded words are the instructions their comments name.
++#[test]
++fn the_test_programs_are_what_their_comments_say() {
++    let programs: [(Vec<u32>, &[&str]); 5] = [
++        (
++            in_halves(),
++            &[
++                "v_mbcnt_lo_u32_b32 v1, -1, 0",
++                "v_mbcnt_hi_u32_b32 v1, -1, v1",
++                "ds_swizzle_b32 v2, v0",
++                "v_xor_b32 v4, 9, v0",
++                "ds_bpermute_b32 v3, v4, v0",
++                "v_writelane_b32 v5, s8, 40",
++                "v_cndmask_b32 v6, 0, 1, s[20:21]",
++                "v_mov_b32 v7, v0 quad_perm:[1,0,3,2]",
++                "buffer_store_dword v7, v16, s[40:43], 0 offen offset:24",
++            ],
++        ),
++        (
++            dpp_row_mask(),
++            &[
++                "v_mov_b32 v7, -1",
++                "v_mov_b32 v7, v0 quad_perm:[1,0,3,2] row_mask:0xc",
++                "buffer_store_dword v7, v16, s[40:43], 0 offen",
++            ],
++        ),
++        (
++            first_lane_of_the_thread_id(),
++            &[
++                "v_mbcnt_lo_u32_b32 v1, -1, 0",
++                "v_readfirstlane_b32 s12, v0",
++                "v_mov_b32 v2, s12",
++            ],
++        ),
++        (
++            first_lane_of_a_buffer_load(3),
++            &[
++                "s_load_dwordx4 s[44:47], s[4:5], 0x000020",
++                "v_mov_b32 v3, 4",
++                "buffer_load_dword v4, v3, s[44:47], 0 offen",
++                "s_waitcnt vmcnt(0)",
++                "v_readfirstlane_b32 s12, v4",
++                "v_mov_b32 v5, s12",
++            ],
++        ),
++        (
++            first_lane_alike(),
++            &[
++                "v_lshrrev_b32 v2, 6, v0",
++                "v_readfirstlane_b32 s12, v2",
++                "v_mov_b32 v3, s12",
++                "buffer_store_dword v1, v16, s[40:43], 0 offen offset:4",
++            ],
++        ),
++    ];
++    for (words, wants) in programs {
++        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
++        let all = gfx10::decode(&code)
++            .expect("decodes")
++            .iter()
++            .map(|i| i.text(true))
++            .collect::<Vec<_>>()
++            .join("\n");
++        for want in wants {
++            assert!(all.contains(want), "{want:?} not in:\n{all}");
++        }
++    }
++}
++
++/// In halves the program declares waves of 32; without, the console's 64.
++#[test]
++fn a_wave64_program_reading_lanes_declares_32_lane_waves_in_halves() {
++    let n = native(&in_halves(), true, 64, 0);
++    let halves = lowered(&n, true).expect("halves");
++    let whole = lowered(&n, false).expect("one wave64");
++    assert_eq!(halves.wave_size, Some(32));
++    assert_eq!(whole.wave_size, Some(64));
++    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
++        v.validate(&mut halves.dxil.clone())
++            .expect("DXIL validation failed");
++    }
++    // A wave32 program is the console's either way.
++    let n32 = native(&in_halves(), false, 32, 0);
++    assert_eq!(lowered(&n32, true).expect("wave32").wave_size, Some(32));
++}
++
++/// Reads across the halves are refused where they are made, with a reason
++/// naming the host's waves; the same programs translate for 64-lane hosts.
++#[test]
++fn reads_across_32_lane_halves_are_refused_with_their_reason() {
++    let readlane = [
++        PROLOGUE.as_slice(),
++        &[
++            0x3420_0085, // v_lshlrev_b32 v16, 5, v0
++            0xD760_000C,
++            0x0001_5100, // v_readlane_b32 s12, v0, 40
++            0x7E02_020C, // v_mov_b32 v1, s12
++        ],
++        &store(1, 0),
++        &[S_ENDPGM],
++    ]
++    .concat();
++    assert!(
++        refusal(&readlane, 64, 0).contains("a lane read that may cross 32-lane halves"),
++        "{}",
++        refusal(&readlane, 64, 0)
++    );
++    assert!(lowered(&native(&readlane, true, 64, 0), false).is_ok());
++
++    let first = standalone_first_lane();
++    let standalone = native(&first, true, 64, 0);
++    assert_eq!(
++        lowered(&standalone, false).expect("native waves").wave_size,
++        Some(64)
++    );
++    assert_eq!(refusal(&first, 64, 0), "translated");
++    assert_eq!(refusal(&first_lane_of_the_thread_id(), 32, 0), "translated");
++
++    // With only high EXEC enabled, its first active lane is 32. The
++    // 1D entry formula is invalid after even a straight-line EXEC write.
++    let mut masked = first;
++    masked.splice(PROLOGUE.len()..PROLOGUE.len(), [0xBEFE_0380]); // s_mov_b32 exec_lo, 0
++    assert_ne!(refusal(&masked, 64, 0), "translated");
++    let why = refusal(&standalone_first_lane(), 96, 0);
++    assert!(
++        why.contains("a first-lane read of a value that may differ between 32-lane halves"),
++        "{why}"
++    );
++    // A first-lane read nothing uses costs nothing.
++    let unused_first = [
++        PROLOGUE.as_slice(),
++        &[
++            0x3420_0085, // v_lshlrev_b32 v16, 5, v0
++            0xD765_0001,
++            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
++            0x7E18_0500, // v_readfirstlane_b32 s12, v0
++        ],
++        &store(1, 0),
++        &[S_ENDPGM],
++    ]
++    .concat();
++    assert_eq!(refusal(&unused_first, 64, 0), "translated");
++    // A buffer dword loaded at an offset the same in every lane, through a
++    // scalar descriptor, is one value: its first lane is the console's.
++    assert_eq!(
++        refusal(&first_lane_of_a_buffer_load(3), 64, 0),
++        "translated"
++    );
++    let why = refusal(&first_lane_of_a_buffer_load(0), 64, 0);
++    assert!(
++        why.contains("a first-lane read of a value that may differ between 32-lane halves"),
++        "{why}"
++    );
++
++    // A value read across halves that nothing uses costs nothing.
++    let unused = [
++        PROLOGUE.as_slice(),
++        &[
++            0x3420_0085, // v_lshlrev_b32 v16, 5, v0
++            0xD760_000C,
++            0x0001_5100, // v_readlane_b32 s12, v0, 40
++            0xD765_0001,
++            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
++        ],
++        &store(1, 0),
++        &[S_ENDPGM],
++    ]
++    .concat();
++    assert_eq!(refusal(&unused, 64, 0), "translated");
++}
++
++/// A second console wave does not supply a group barrier for the first.
++#[test]
++fn lds_spanning_host_waves_needs_proven_ordering() {
++    let lds = [
++        PROLOGUE.as_slice(),
++        &[
++            0x3420_0085, // v_lshlrev_b32 v16, 5, v0
++            0x3404_0082, // v_lshlrev_b32 v2, 2, v0
++            0xD765_0001,
++            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
++            0xD834_0000,
++            0x0000_0102, // ds_write_b32 v2, v1
++            S_WAITCNT_LGKM,
++            0xD8D8_0000,
++            0x0300_0002, // ds_read_b32 v3, v2
++            S_WAITCNT_LGKM,
++        ],
++        &store(3, 0),
++        &[S_ENDPGM],
++    ]
++    .concat();
++    assert_eq!(refusal(&lds, 32, 256), "translated");
++    for (threads, bytes) in [(33, 256), (64, 256), (128, 512)] {
++        assert!(refusal(&lds, threads, bytes).contains("LDS ordering across 32-lane halves"));
++        assert!(lowered(&native(&lds, true, threads, bytes), false).is_ok());
++    }
++}
++
++/// Runs `words`, one group of `threads` of a wave64 program whose lanes store
++/// `per_lane` dwords at `l * 32`, on every hardware adapter: in halves, and
++/// as one wave64 where the adapter runs 64-lane waves. A line per lane whose
++/// dwords differ from `want` (the console's, `per_lane` per lane).
++fn differences(words: &[u32], threads: u32, per_lane: usize, want: &[u32]) -> Vec<String> {
++    let n = native(words, true, threads, 0);
++    let forms = [
++        ("halves", shader(lowered(&n, true).expect("halves"))),
++        ("wave64", shader(lowered(&n, false).expect("one wave64"))),
++    ];
++    let views = [
++        View::Texture(1, 1, &[[0.0; 4]]),
++        View::Buffer {
++            data: &[0; 4],
++            stride: Stride::Structured(16),
++        },
++        View::RawUav(threads * 8),
++    ];
++    let _one = super::valu_tests::ONE_AT_A_TIME
++        .lock()
++        .unwrap_or_else(|e| e.into_inner());
++    let hosts = Host::each_hardware();
++    if hosts.is_empty() {
++        eprintln!("no SM 6.6 hardware device; skipped");
++    }
++    let mut failed = Vec::new();
++    for (adapter, host) in &hosts {
++        let wave32 = host.wave32().unwrap_or(false);
++        for (form, shader) in &forms {
++            let label = format!("{adapter} ({form})");
++            let Ok((root, pso)) = host.compute_pipeline(shader) else {
++                // Only the console's own form may be refused, and only
++                // where the host's waves are 32 lanes.
++                assert!(*form == "wave64" && wave32, "{label}: no pipeline");
++                eprintln!("{label}: no pipeline for 64-lane waves; skipped");
++                continue;
++            };
++            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
++            let out = host
++                .dispatch(
++                    &root,
++                    &pso,
++                    &Dispatch {
++                        roots: vec![(0, Root::Constants(ud))],
++                        views: &views,
++                        samplers: &[],
++                        groups: [1, 1, 1],
++                    },
++                )
++                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
++            let wrong: Vec<String> = out[0]
++                .chunks(8)
++                .zip(want.chunks(per_lane))
++                .enumerate()
++                .filter(|(_, (got, want))| got[..per_lane] != **want)
++                .map(|(l, (got, want))| {
++                    format!(
++                        "{label}: lane {l}: {:?}, the console {want:?}",
++                        &got[..per_lane]
++                    )
++                })
++                .collect();
++            eprintln!(
++                "{label}: {} lanes of {threads} differ from the console",
++                wrong.len()
++            );
++            failed.extend(wrong);
++        }
++    }
++    failed
++}
++
++/// A DPP row mask names the console's rows 0-3: with `row_mask:0xc` only
++/// rows 2 and 3 (lanes 32-63) take `l ^ 1`, rows 0 and 1 keep -1.
++fn dpp_row_mask() -> Vec<u32> {
++    let mut w = PROLOGUE.to_vec();
++    w.extend([
++        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
++        0x7E0E_02C1, // v_mov_b32 v7, -1
++        0x7E0E_02FA,
++        0xCF00_B100, // v_mov_b32 v7, v0 quad_perm:[1,0,3,2] row_mask:0xc (DPP)
++    ]);
++    w.extend(store(7, 0));
++    w.push(S_ENDPGM);
++    w
++}
++
++#[test]
++fn dpp_row_masks_name_the_console_rows_on_every_gpu() {
++    let want: Vec<u32> = (0..64)
++        .map(|l| if l >= 32 { l ^ 1 } else { u32::MAX })
++        .collect();
++    let failed = differences(&dpp_row_mask(), 64, 1, &want);
++    assert!(failed.is_empty(), "{}", failed.join("\n"));
++}
++
++/// `v_readfirstlane_b32` of the thread id, with console lanes (`v_mbcnt`):
++/// the console's first lane is lane 0 of the wave.
++fn first_lane_of_the_thread_id() -> Vec<u32> {
++    let mut w = PROLOGUE.to_vec();
++    w.extend([
++        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
++        0xD765_0001,
++        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
++        0x7E18_0500, // v_readfirstlane_b32 s12, v0
++        0x7E04_020C, // v_mov_b32 v2, s12
++    ]);
++    w.extend(store(2, 0));
++    w.push(S_ENDPGM);
++    w
++}
++
++/// `v_readfirstlane_b32` of a dword loaded from the buffer at table dword 8,
++/// at the byte offset in `v<offset>`: `v3` holds 4 in every lane, `v0` the
++/// thread id.
++fn first_lane_of_a_buffer_load(offset: u32) -> Vec<u32> {
++    let mut w = PROLOGUE.to_vec();
++    w.extend([
++        0xF408_0B02,
++        0xFA00_0020, // s_load_dwordx4 s[44:47], s[4:5], 0x20
++        S_WAITCNT_LGKM,
++        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
++        0xD765_0001,
++        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
++        0x7E06_0284, // v_mov_b32 v3, 4
++        0xE030_1000,
++        0x800B_0400 | offset, // buffer_load_dword v4, v<offset>, s[44:47], 0 offen
++        0xBF8C_3F70,          // s_waitcnt vmcnt(0)
++        0x7E18_0504,          // v_readfirstlane_b32 s12, v4
++        0x7E0A_020C,          // v_mov_b32 v5, s12
++    ]);
++    w.extend(store(5, 0));
++    w.push(S_ENDPGM);
++    w
++}
++
++/// Per thread `l` of a group of 128 (two console wave64s), two dwords at
++/// `l * 32`: the first lane of `l >> 6` (one value per console wave, the
++/// same in both its halves) and the lane `v_mbcnt` counts.
++fn first_lane_alike() -> Vec<u32> {
++    let mut w = PROLOGUE.to_vec();
++    w.extend([
++        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
++        0xD765_0001,
++        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
++        0xD766_0001,
++        0x0002_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1
++        0x2C04_0086, // v_lshrrev_b32 v2, 6, v0
++        0x7E18_0502, // v_readfirstlane_b32 s12, v2
++        0x7E06_020C, // v_mov_b32 v3, s12
++    ]);
++    w.extend(store(3, 0));
++    w.extend(store(1, 4));
++    w.push(S_ENDPGM);
++    w
++}
++
++/// A single first-lane read of the entry thread id, with no other wave opcode.
++fn standalone_first_lane() -> Vec<u32> {
++    [
++        PROLOGUE.as_slice(),
++        &[
++            0x3420_0085, // v_lshlrev_b32 v16, 5, v0
++            0x7E18_0500, // v_readfirstlane_b32 s12, v0
++            0x7E02_020C, // v_mov_b32 v1, s12
++        ],
++        &store(1, 0),
++        &[S_ENDPGM],
++    ]
++    .concat()
++}
++
++/// First-lane reads kept in halves give the console's value on every
++/// hardware adapter: the thread id's in a group of 32 (one host wave holds
++/// the whole console wave), and one value per console wave in a group of
++/// 128, where each half reads its console wave's.
++#[test]
++fn first_lanes_kept_in_halves_match_the_console_on_every_gpu() {
++    let mut failed = differences(&first_lane_of_the_thread_id(), 32, 1, &[0; 32]);
++    for threads in [64, 128] {
++        let want: Vec<u32> = (0..threads).map(|id| id & !63).collect();
++        failed.extend(differences(&standalone_first_lane(), threads, 1, &want));
++    }
++    let want: Vec<u32> = (0..128).flat_map(|l| [l >> 6, l & 63]).collect();
++    failed.extend(differences(&first_lane_alike(), 128, 2, &want));
++    assert!(failed.is_empty(), "{}", failed.join("\n"));
++}
++
++/// [`in_halves`] on every hardware adapter: in halves, and as one wave64
++/// where the adapter runs 64-lane waves; both give the console's results.
++#[test]
++fn wave64_programs_in_halves_match_the_console_on_every_gpu() {
++    let want: Vec<u32> = (0..64).flat_map(console).collect();
++    let failed = differences(&in_halves(), 64, 8, &want);
++    assert!(failed.is_empty(), "{}", failed.join("\n"));
++}
+diff --git a/crates/victory-shader/src/emit/host.rs b/crates/victory-shader/src/emit/host.rs
+index 05208c63517aaf739990059cfd7e96d0ea8c7e35..fe7f7b720ffc9a15bdc5556e20f6c1f30a5957ad 100644
+--- a/crates/victory-shader/src/emit/host.rs
++++ b/crates/victory-shader/src/emit/host.rs
+@@ -91,6 +91,28 @@ fn hardware_adapter(factory: &IDXGIFactory4) -> windows::core::Result<IDXGIAdapt
+     ))
+ }
+ 
++/// The adapter `device` was actually made on, by its LUID: never the
++/// software rasteriser (flagged, or the basic render driver), whatever was
++/// enumerated.
++fn physical_adapter(
++    factory: &IDXGIFactory4,
++    device: &ID3D12Device,
++) -> Result<DXGI_ADAPTER_DESC1, String> {
++    // SAFETY: plain DXGI/D3D12 queries with valid out pointers.
++    let desc = unsafe {
++        let made: IDXGIAdapter1 = factory
++            .EnumAdapterByLuid(device.GetAdapterLuid())
++            .map_err(err)?;
++        made.GetDesc1().map_err(err)?
++    };
++    if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
++        || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
++    {
++        return Err("the hardware device is the software adapter".to_owned());
++    }
++    Ok(desc)
++}
++
+ /// An adapter's model and PCI IDs, as the physical-adapter tests print them.
+ #[cfg(test)]
+ fn adapter_report(desc: &DXGI_ADAPTER_DESC1) -> String {
+@@ -130,38 +152,84 @@ impl Host {
+             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+             let device = device.ok_or("no device")?;
+             if !warp {
+-                // The adapter the device was actually made on, by its LUID:
+-                // never the software rasteriser, whatever was enumerated.
+-                let made: IDXGIAdapter1 = factory
+-                    .EnumAdapterByLuid(device.GetAdapterLuid())
+-                    .map_err(err)?;
+-                let desc = made.GetDesc1().map_err(err)?;
++                let _desc = physical_adapter(&factory, &device)?;
++                #[cfg(test)]
++                eprintln!("physical adapter: {}", adapter_report(&_desc));
++            }
++            Self::sm66(device)
++        }
++    }
++
++    /// Every hardware adapter (as [`hardware_adapter`] tells them, and whose
++    /// device [`physical_adapter`] confirms) whose device takes SM 6.6, by
++    /// name: tests that compare GPUs of different wave widths run on each.
++    pub fn each_hardware() -> Vec<(String, Self)> {
++        let mut hosts = Vec::new();
++        // SAFETY: plain D3D12/DXGI calls with valid out pointers.
++        unsafe {
++            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
++            else {
++                return hosts;
++            };
++            for index in 0.. {
++                let Ok(adapter) = factory.EnumAdapters1(index) else {
++                    break;
++                };
++                let Ok(desc) = adapter.GetDesc1() else {
++                    continue;
++                };
+                 if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
+-                    || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
++                    || desc.DedicatedVideoMemory == 0
+                 {
+-                    return Err("the hardware device is the software adapter".to_owned());
++                    continue;
+                 }
++                let mut device: Option<ID3D12Device> = None;
++                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
++                    continue;
++                }
++                let Some(device) = device else {
++                    continue;
++                };
++                let Ok(_made) = physical_adapter(&factory, &device) else {
++                    continue;
++                };
+                 #[cfg(test)]
+-                eprintln!("physical adapter: {}", adapter_report(&desc));
+-            }
+-            let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+-                HighestShaderModel: D3D_SHADER_MODEL_6_6,
+-            };
+-            device
+-                .CheckFeatureSupport(
+-                    D3D12_FEATURE_SHADER_MODEL,
+-                    (&raw mut sm).cast(),
+-                    size_of_val(&sm) as u32,
+-                )
+-                .map_err(err)?;
+-            if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+-                return Err(format!(
+-                    "the device supports SM {:#x} only",
+-                    sm.HighestShaderModel.0
+-                ));
++                eprintln!("physical adapter: {}", adapter_report(&_made));
++                let end = desc
++                    .Description
++                    .iter()
++                    .position(|&c| c == 0)
++                    .unwrap_or(desc.Description.len());
++                let name = String::from_utf16_lossy(&desc.Description[..end]);
++                if let Ok(host) = Self::sm66(device) {
++                    hosts.push((name, host));
++                }
+             }
+-            Ok(Host { device })
+         }
++        hosts
++    }
++
++    /// `device`, if it takes SM 6.6.
++    fn sm66(device: ID3D12Device) -> Result<Self, String> {
++        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
++            HighestShaderModel: D3D_SHADER_MODEL_6_6,
++        };
++        // SAFETY: the query writes its own structure of the given size.
++        unsafe {
++            device.CheckFeatureSupport(
++                D3D12_FEATURE_SHADER_MODEL,
++                (&raw mut sm).cast(),
++                size_of_val(&sm) as u32,
++            )
++        }
++        .map_err(err)?;
++        if sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
++            return Err(format!(
++                "the device supports SM {:#x} only",
++                sm.HighestShaderModel.0
++            ));
++        }
++        Ok(Host { device })
+     }
+ 
+     /// The root signature translated shaders expect: user data per stage
+@@ -611,6 +679,23 @@ impl Host {
+             .then_some((options.WaveLaneCountMin, options.WaveLaneCountMax))
+     }
+ 
++    /// Whether this device's waves have at most 32 lanes, 32 among them
++    /// (NVIDIA, Intel): it refuses `WaveSize(64)`, so translations for it
++    /// set [`super::Options::host_wave32`].
++    pub fn wave32(&self) -> Result<bool, String> {
++        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
++        // SAFETY: the query writes its own structure of the given size.
++        unsafe {
++            self.device.CheckFeatureSupport(
++                D3D12_FEATURE_D3D12_OPTIONS1,
++                (&raw mut o).cast(),
++                size_of_val(&o) as u32,
++            )
++        }
++        .map_err(err)?;
++        Ok((o.WaveLaneCountMin..=o.WaveLaneCountMax).contains(&32) && o.WaveLaneCountMax < 64)
++    }
++
+     /// Whether this device fuses DXIL `FMad`, which the lowering emits for
+     /// the console's fused `v_fma_f32`/`v_fmac_f32`/`v_fma_mix*`: where it
+     /// does not, their results can differ in kind (NaN where an overflowing
+@@ -811,6 +896,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
+         outputs: Vec::new(),
+         prims: Vec::new(),
+         mesh_stride: 0,
++        host_wave32: false,
+         view_marks: false,
+     })?;
+     Ok(HostShader {
+diff --git a/crates/victory-shader/src/emit/image_store_tests.rs b/crates/victory-shader/src/emit/image_store_tests.rs
+index 9d891ec847819d6b78daf09425872f915858c8cd..ec0d6f1b9bfdd50c98930478511e86ed66fd627d 100644
+--- a/crates/victory-shader/src/emit/image_store_tests.rs
++++ b/crates/victory-shader/src/emit/image_store_tests.rs
+@@ -127,6 +127,7 @@ fn lower(native: &NativeProgram) -> Result<HostShader, ShaderError> {
+         prims: Vec::new(),
+         mesh_stride: 0,
+         view_marks: false,
++        host_wave32: false,
+     })?;
+     Ok(HostShader {
+         stage: HwStage::Cs,
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 804aebc63bd3a6cf6958e0229fa8abcc796ebc2f..e25f36603098cc11128824acd6d742241e754952 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
+ use crate::structure::{Atom, Bool, LaneExit, Structured};
+ 
+ mod bvh;
++mod halves;
+ mod permlane;
+ 
+ type Why = &'static str;
+@@ -67,6 +68,9 @@ pub(crate) struct Lowered {
+     /// Whether it declares rasterizer-ordered views.
+     #[cfg(test)]
+     pub rovs: bool,
++    /// The wave size it declares (`WaveSize`).
++    #[cfg(test)]
++    pub wave_size: Option<u32>,
+ }
+ 
+ pub(crate) struct Parts<'a> {
+@@ -82,6 +86,8 @@ pub(crate) struct Parts<'a> {
+     pub mesh_stride: u32,
+     /// Writes through buffer views mark their pages (`emit`, "Write marks").
+     pub view_marks: bool,
++    /// The host's waves have at most 32 lanes (`emit::Options::host_wave32`).
++    pub host_wave32: bool,
+ }
+ 
+ enum Stop {
+@@ -135,8 +141,11 @@ pub(crate) fn lower_pruned(
+     keep: Option<&KeptOutputs>,
+ ) -> Result<Lowered, ShaderError> {
+     let mut bad = HashMap::new();
++    // Whether a source varies by lane is a property of the original SSA.
++    // Retries discard unused values but cannot change that proof.
++    let alike = std::cell::OnceCell::new();
+     loop {
+-        match Lower::new(parts, &bad, keep).run() {
++        match Lower::new(parts, &bad, keep, &alike).run() {
+             Ok(l) => return Ok(l),
+             Err(Stop::Retry(v, why)) => {
+                 if bad.insert(v, why).is_some() {
+@@ -276,8 +285,18 @@ struct Lower<'a> {
+     /// src0 of the current instruction as DPP fetched it.
+     src0: Option<V>,
+     /// Compute code that reads other lanes: thread ids follow the host
+-    /// lanes, so lane n is console lane n.
++    /// lanes, so lane n is console lane n (in [`Lower::halves`], console
++    /// lane n of the half the host wave holds).
+     console_lanes: bool,
++    /// A console wave64 program in host waves of 32 lanes (`halves`).
++    halves: bool,
++    /// Why such a program cannot run in halves.
++    halves_refused: Option<Why>,
++    /// [`Lower::relabelled_flat`], once made.
++    relabelled: Option<V>,
++    /// In halves: VGPR values the same in every lane of the console wave
++    /// ([`halves::lane_uniform`]), whose first lane either half reads.
++    alike: &'a std::cell::OnceCell<HashSet<Value>>,
+     /// Pixel: an ordered section (POPS), whose UAVs the host makes
+     /// rasterizer-ordered views.
+     pops: bool,
+@@ -608,6 +627,7 @@ impl<'a> Lower<'a> {
+         x: &'a Parts<'a>,
+         bad: &'a HashMap<Value, Why>,
+         keep: Option<&KeptOutputs>,
++        alike: &'a std::cell::OnceCell<HashSet<Value>>,
+     ) -> Self {
+         let p = x.p;
+         let mut phi_at = HashMap::new();
+@@ -634,6 +654,7 @@ impl<'a> Lower<'a> {
+         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
+             || insts().any(|i| i.name().starts_with("image_bvh"));
+         let mut console_lanes = false;
++        let (mut halves, mut halves_refused) = (false, None);
+         if let StageIo::Cs(cs) = x.native.io {
+             s.threads = Some(cs.threads);
+             s.lds_dwords = cs.lds_bytes() / 4;
+@@ -645,6 +666,10 @@ impl<'a> Lower<'a> {
+                 n.starts_with("ds_swizzle")
+                     || n.contains("permute")
+                     || n.starts_with("v_mbcnt")
++                    // A parsed descriptor waterfall uses the lane's own value.
++                    // It never performs a first-lane read on the host.
++                    || (x.native.wave64 && n == "v_readfirstlane_b32"
++                        && !i.writes.first().is_some_and(|w| x.res.waterfall.reads.contains(&w.1)))
+                     || matches!(n, "v_readlane_b32" | "v_writelane_b32" | "v_permlane16_b32" | "v_permlanex16_b32")
+                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+                     || reads_mask_as_data(x.st, i)
+@@ -714,9 +739,15 @@ impl<'a> Lower<'a> {
+                     needs_console
+                 };
+             let wave = if x.native.wave64 { 64 } else { 32 };
+-            let one_wave = cs.threads.iter().product::<u32>() <= wave;
+-            if console_lanes || one_wave && s.lds_dwords > 0 {
+-                s.wave_size = Some(wave);
++            let group = cs.threads.iter().product::<u32>();
++            let one_wave = group <= wave;
++            let needs_wave = console_lanes || one_wave && s.lds_dwords > 0;
++            halves = Self::halves_wanted(x, needs_wave);
++            if halves {
++                halves_refused = Self::halves_lds(group, s.lds_dwords);
++            }
++            if needs_wave {
++                s.wave_size = Some(if halves { 32 } else { wave });
+             }
+         }
+         let mut no_barrier = HashSet::new();
+@@ -816,6 +847,10 @@ impl<'a> Lower<'a> {
+             heap: [false; 2],
+             src0: None,
+             console_lanes,
++            halves,
++            halves_refused,
++            relabelled: None,
++            alike,
+             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
+                 if db_shader_control & 1 << 16 != 0),
+             root_memory,
+@@ -1263,6 +1298,7 @@ impl<'a> Lower<'a> {
+     /// expanded gives on that wave.
+     fn shape(&mut self, shape: super::wave::Shape) -> Result<V, Why> {
+         use super::wave::{Op, Shape};
++        const ACROSS: Why = "a wave reduction over both 32-lane halves (wave64 on a 32-lane host)";
+         let (op, src, mask, ident, prefix) = match shape {
+             Shape::K(k) => return Ok(self.s.m.i32(k)),
+             Shape::Value(v) => return self.i32_of(v),
+@@ -1283,6 +1319,7 @@ impl<'a> Lower<'a> {
+             Shape::Prefix(op, src, mask, ident, inclusive) => {
+                 (op, src, mask, ident, Some(inclusive))
+             }
++            Shape::Half(..) if self.halves => return Err(ACROSS),
+             Shape::Half(_, src, mask, ident, hi) => {
+                 // The high half is a console lane's: compute only.
+                 if self.mask_data != MaskData::Console {
+@@ -1352,6 +1389,7 @@ impl<'a> Lower<'a> {
+         {
+             return Err("a wave reduction in a mesh shader");
+         }
++        self.same_half(ACROSS)?;
+         let c = self.cur;
+         let &m = self
+             .x
+@@ -1445,6 +1483,9 @@ impl<'a> Lower<'a> {
+             }
+         }
+         self.cur = self.s.entry;
++        if let Some(why) = self.halves_refused {
++            return Err(unsupported(0, why));
++        }
+         self.find_sections();
+         self.inputs()?;
+         if let Some(mesh) = self.s.mesh {
+@@ -1535,6 +1576,8 @@ impl<'a> Lower<'a> {
+             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+             #[cfg(test)]
+             rovs: self.s.flags & flags::ROVS != 0,
++            #[cfg(test)]
++            wave_size: self.s.wave_size,
+             dxil: self.s.finish(),
+             user_data,
+             samplers: self.samplers,
+@@ -1955,6 +1998,7 @@ impl<'a> Lower<'a> {
+                     Some(&b) if b == self.cur_ir => self.cur,
+                     Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+                 };
++                self.same_half("a lane mask read as data (wave64 on a 32-lane host)")?;
+                 if !self.balloting.insert(lo) {
+                     return Err("a lane mask whose lanes depend on its own value");
+                 }
+@@ -2712,17 +2756,21 @@ impl<'a> Lower<'a> {
+         self.s.m.bin(c, Bin::Shl, byte, three)
+     }
+ 
+-    /// This lane's bit of the mask `lo`, `hi` (wave64).
++    /// This lane's bit of the mask `lo`, `hi` (wave64), by its console lane.
+     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
+         self.s.flags |= flags::WAVE_OPS;
+-        let lane = self.s.op(
+-            at,
+-            "waveGetLaneIndex",
+-            Attr::ReadOnly,
+-            self.s.t.i32,
+-            111,
+-            &[],
+-        );
++        let lane = if self.halves {
++            self.console_lane()
++        } else {
++            self.s.op(
++                at,
++                "waveGetLaneIndex",
++                Attr::ReadOnly,
++                self.s.t.i32,
++                111,
++                &[],
++            )
++        };
+         let (k31, k32, one, z) = (
+             self.s.m.i32(31),
+             self.s.m.i32(32),
+@@ -2949,36 +2997,16 @@ impl<'a> Lower<'a> {
+     /// thread is relabelled so that its host lane is its console lane: the
+     /// flat id is the wave's first lane's, rounded down to the wave size,
+     /// plus the lane index. (A bijection while each host wave holds a
+-    /// wave-aligned run of flat ids, as the console's waves do.)
++    /// wave-aligned run of flat ids, as the console's waves do.) In
++    /// [`Lower::halves`] the runs are 32 long: two host waves per console
++    /// wave, in order.
+     fn thread_id(&mut self, c: u8) -> Val {
+         if !self.console_lanes {
+             return self.compute_id("threadIdInGroup.i32", 95, c);
+         }
+         let [x, y, _] = self.s.threads.expect("compute");
+         let e = self.s.entry;
+-        let i32t = self.s.t.i32;
+-        let flat = self.s.op(
+-            e,
+-            "flattenedThreadIdInGroup.i32",
+-            Attr::ReadNone,
+-            i32t,
+-            96,
+-            &[],
+-        );
+-        let first = self.s.op(
+-            e,
+-            "waveReadLaneFirst.i32",
+-            Attr::NoUnwind,
+-            i32t,
+-            118,
+-            &[flat],
+-        );
+-        let wave = self.s.wave_size.expect("set with console lanes");
+-        let mask = self.s.m.i32(!(wave - 1));
+-        let base = self.s.m.bin(e, Bin::And, first, mask);
+-        let lane = self.lane_index();
+-        let f = self.s.m.bin(e, Bin::Add, base, lane);
+-        self.s.flags |= flags::WAVE_OPS;
++        let f = self.relabelled_flat();
+         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
+         Val::I32(match c {
+             0 => self.s.m.bin(e, Bin::URem, f, xk),
+@@ -3235,7 +3263,7 @@ impl<'a> Lower<'a> {
+             let a = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
+             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
+             let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+-            let (o, two, last) = (k(self, offset), k(self, 2), k(self, self.wave() - 1));
++            let (o, two, last) = (k(self, offset), k(self, 2), k(self, self.permute_lanes()));
+             let at = self.s.m.bin(c, Bin::Add, a, o);
+             let lane = self.s.m.bin(c, Bin::LShr, at, two);
+             let lane = self.s.m.bin(c, Bin::And, lane, last);
+@@ -5868,7 +5896,7 @@ impl<'a> Lower<'a> {
+             };
+             self.src0 = Some(x);
+         }
+-        let r = self.valu_op(inst, guard);
++        let r = self.valu_op(inst, guard, (b, i));
+         self.src0 = None;
+         r
+     }
+@@ -5979,9 +6007,15 @@ impl<'a> Lower<'a> {
+             }
+         }
+         if let Some((rows, banks)) = masks {
+-            // Row (16 lanes) and bank (4 lanes of a row) write masks.
++            // Row (16 lanes) and bank (4 lanes of a row) write masks. Rows are
++            // the console wave's: in halves the upper half holds rows 2 and 3.
+             let (four, two, three) = (k(self, 4), k(self, 2), k(self, 3));
+-            let ri = self.s.m.bin(c, Bin::LShr, lane, four);
++            let row_lane = if self.halves {
++                self.console_lane()
++            } else {
++                lane
++            };
++            let ri = self.s.m.bin(c, Bin::LShr, row_lane, four);
+             let ri = self.s.m.bin(c, Bin::And, ri, three);
+             let bi = self.s.m.bin(c, Bin::LShr, lane, two);
+             let bi = self.s.m.bin(c, Bin::And, bi, three);
+@@ -6000,7 +6034,7 @@ impl<'a> Lower<'a> {
+         Ok((r, enable))
+     }
+ 
+-    fn valu_op(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
++    fn valu_op(&mut self, inst: &Inst, guard: Option<V>, at: (usize, usize)) -> Result<(), Why> {
+         let Fields::Valu(v) = &inst.fields else {
+             unreachable!()
+         };
+@@ -6692,6 +6726,9 @@ impl<'a> Lower<'a> {
+                     self.s.flags |= flags::WAVE_OPS;
+                 } else {
+                     self.cross_lane(false)?;
++                    self.same_half(
++                        "a lane read that may cross 32-lane halves (wave64 on a 32-lane host)",
++                    )?;
+                 }
+                 let r = self.read_lane(a, lane);
+                 int(self, r)
+@@ -6707,96 +6744,12 @@ impl<'a> Lower<'a> {
+                     None => self.s.m.i32(0),
+                 };
+                 self.cross_lane(false)?;
+-                let me = self.lane_index();
++                let me = self.console_lane();
+                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
+                 let r = self.s.m.select(c, is, a, old);
+                 int(self, r)
+             }
+-            "v_permlane16_b32" | "v_permlanex16_b32" => {
+-                // RDNA2 ISA 12.12: each nibble of {src2, src1} selects a lane
+-                // in this row of 16, or the other row of the same 32-lane half.
+-                // OP_SEL[0:1] are fetch-inactive and bound-control, not half selects.
+-                if v.abs != 0 || v.neg != 0 || v.opsel & !3 != 0 {
+-                    return Err("permlane input modifiers");
+-                }
+-                self.cross_lane(false)?;
+-                let fetch_inactive = v.opsel & 1 != 0;
+-                let cross = name == "v_permlanex16_b32";
+-                // FI can read a lane outside EXEC, even when its VGPR contains
+-                // an earlier value. A partial last row has no such host invocation.
+-                let row_group = if cross { 32 } else { 16 };
+-                if fetch_inactive && self.s.threads.is_some_and(|group| {
+-                    !group.iter().map(|&n| u64::from(n)).product::<u64>().is_multiple_of(row_group)
+-                }) {
+-                    return Err("a permlane fetch from an incomplete thread-group row");
+-                }
+-                if fetch_inactive
+-                    && !self.full_wave_blocks.get_or_init(|| permlane::all_lane_blocks(self.x.p, self.x.st))
+-                        .as_ref().is_some_and(|all| all[self.cur_ir])
+-                {
+-                    // DXIL cannot read the last VGPR value of a host invocation
+-                    // that has left through a lane branch. A guard keeps it here.
+-                    return Err("a permlane fetch from lanes outside the host branch");
+-                }
+-                let (x, lo, hi) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+-                let lane = self.lane_index();
+-                let (k7, k8, k15, k16, k31, k32, k4, one, zero) = (
+-                    self.s.m.i32(7),
+-                    self.s.m.i32(8),
+-                    self.s.m.i32(15),
+-                    self.s.m.i32(16),
+-                    self.s.m.i32(31),
+-                    self.s.m.i32(32),
+-                    self.s.m.i32(4),
+-                    self.s.m.i32(1),
+-                    self.s.m.i32(0),
+-                );
+-                let pos = self.s.m.bin(c, Bin::And, lane, k15);
+-                let lower = self.s.m.cmp(c, pred::IULT, pos, k8);
+-                let packed = self.s.m.select(c, lower, lo, hi);
+-                let shift = self.s.m.bin(c, Bin::And, pos, k7);
+-                let shift = self.s.m.bin(c, Bin::Mul, shift, k4);
+-                let pick = self.s.m.bin(c, Bin::LShr, packed, shift);
+-                let pick = self.s.m.bin(c, Bin::And, pick, k15);
+-                let not15 = self.s.m.i32(!15);
+-                let mut row = self.s.m.bin(c, Bin::And, lane, not15);
+-                if cross {
+-                    row = self.s.m.bin(c, Bin::Xor, row, k16);
+-                }
+-                let src = self.s.m.bin(c, Bin::Or, row, pick);
+-                let r = if fetch_inactive {
+-                    self.read_lane(x, src)
+-                } else {
+-                    // Ballot the console EXEC guard as well as the host's active
+-                    // invocations. Never shuffle from an inactive host lane.
+-                    let enabled = guard.unwrap_or_else(|| self.s.m.bool(true));
+-                    let i32t = self.s.t.i32;
+-                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+-                    let mask =
+-                        self.s
+-                            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[enabled]);
+-                    let lo = self.s.m.extract(c, mask, 0);
+-                    let hi = self.s.m.extract(c, mask, 1);
+-                    let lower = self.s.m.cmp(c, pred::IULT, src, k32);
+-                    let word = self.s.m.select(c, lower, lo, hi);
+-                    let bit = self.s.m.bin(c, Bin::And, src, k31);
+-                    let bit = self.s.m.bin(c, Bin::LShr, word, bit);
+-                    let bit = self.s.m.bin(c, Bin::And, bit, one);
+-                    let active = self.s.m.cmp(c, pred::NE, bit, zero);
+-                    let safe = self.s.m.select(c, active, src, lane);
+-                    let read = self.read_lane(x, safe);
+-                    let fallback = if v.opsel & 2 != 0 {
+-                        zero
+-                    } else {
+-                        let Some(Operand::Vector { reg, .. }) = v.dst else {
+-                            return Err("a permlane result outside a VGPR");
+-                        };
+-                        self.i32_of(inst.read(Reg::V(reg)).ok_or("a permlane old value")?)?
+-                    };
+-                    self.s.m.select(c, active, read, fallback)
+-                };
+-                int(self, r)
+-            }
++            "v_permlane16_b32" | "v_permlanex16_b32" => self.permlane16(inst, guard),
+             "v_readfirstlane_b32"
+                 if inst
+                     .writes
+@@ -6808,7 +6761,25 @@ impl<'a> Lower<'a> {
+                 int(self, a)
+             }
+             "v_readfirstlane_b32" => {
++                if self.halves && !self.one_host_wave()
++                    && let Some(&Operand::Vector { reg, .. }) = v.src.first()
++                {
++                    if self.first_is_wave_base(at, v.src.first()) {
++                        let tid = s(self, 0)?;
++                        let mask = self.s.m.i32(!63);
++                        let base = self.s.m.bin(c, Bin::And, tid, mask);
++                        return int(self, base);
++                    }
++                    let alike = self.alike.get_or_init(|| halves::lane_uniform(self.x));
++                    if !inst.read(Reg::V(reg)).is_some_and(|x| alike.contains(&x)) {
++                        return Err(halves::FIRST_ACROSS);
++                    }
++                }
+                 let a = s(self, 0)?;
++                // shortcut: without console lanes, the first lane of the host
++                // wave (whose waves are the driver's choice): the console's
++                // where the value is the same in every lane, what the compiler
++                // reads first lanes for.
+                 self.s.flags |= flags::WAVE_OPS;
+                 let r = self.s.op(
+                     c,
+@@ -7902,7 +7873,7 @@ impl<'a> Lower<'a> {
+                 } else if self.s.mesh.is_none() {
+                     self.cross_lane(false)?;
+                 }
+-                let lane = self.lane_index();
++                let lane = self.console_lane();
+                 let below = if name == "v_mbcnt_lo_u32_b32" {
+                     lane
+                 } else {
+@@ -11115,6 +11086,7 @@ mod tests {
+             outputs: vec![],
+             prims: vec![],
+             mesh_stride: 0,
++            host_wave32: false,
+             view_marks: false,
+         })
+         .map(|_| ())
+@@ -11165,6 +11137,7 @@ mod tests {
+             outputs: vec![],
+             prims: vec![],
+             mesh_stride: 0,
++            host_wave32: false,
+             view_marks: false,
+         })
+     }
+@@ -11311,6 +11284,7 @@ mod tests {
+             prims: vec![],
+             mesh_stride: 0,
+             view_marks: false,
++            host_wave32: false,
+         })
+     }
+ 
+@@ -11500,6 +11474,7 @@ mod tests {
+             outputs: vec![],
+             prims: vec![],
+             mesh_stride: 0,
++            host_wave32: false,
+             view_marks: false,
+         })
+         .unwrap();
+diff --git a/crates/victory-shader/src/emit/lower/halves.rs b/crates/victory-shader/src/emit/lower/halves.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d9a463f0abd6def3448d3833ff22c86e196eb6d8
+--- /dev/null
++++ b/crates/victory-shader/src/emit/lower/halves.rs
+@@ -0,0 +1,452 @@
++//! Console wave64 compute programs on a host whose waves have at most 32
++//! lanes (NVIDIA, Intel: `WaveLaneCountMax` 32). Such a host refuses
++//! `WaveSize(64)`, which a wave64 program that needs the console's lanes
++//! ([`Lower::console_lanes`]) declares, so its pipeline was never made.
++//!
++//! Each console wave runs as two host waves of 32 lanes ("halves"): the
++//! thread relabelling ([`Lower::thread_id`]) gives each host wave a 32-aligned
++//! run of flat thread ids, so host wave `2w + h` holds console wave `w`'s
++//! lanes `32h..32h + 31`, host lane `n` being console lane `32h + n`. What
++//! a lane reads of its own half is exact; reads into the other half have no
++//! host form and are refused where they are made:
++//!
++//! * within a half, exact: DPP (rows of 16, DPP8 groups of 8), `ds_swizzle`
++//!   (groups of 32 or quads), `v_permlane16_b32` and `v_permlanex16_b32`
++//!   (a row of 16 or its partner row in the same half, by host lane;
++//!   fetch-inactive only in whole halves, see `permlane`), and
++//!   `ds_bpermute_b32`, which in wave64 permutes
++//!   each half on its own (RDNA2 ISA, "Data Share Operations"; measured on
++//!   RDNA2 in upstream PR #573, banbanzhige's). A lane's own bit of a mask
++//!   held as a number (a constant, data loaded or computed by scalar code),
++//!   `v_writelane_b32` (the lane named takes the scalar) and the row a DPP
++//!   row mask names (rows 2 and 3 are the upper half's) are decided by the
++//!   console lane ([`Lower::console_lane`]);
++//! * across halves, refused: ballots (a mask read as data holds the other
++//!   half's lanes), `v_readlane_b32` of a lane that may be in the other half
++//!   (SGPR spills read back are not lane reads), and whole-wave reductions
++//!   and prefix sums;
++//! * `v_readfirstlane_b32` reads the host wave's first lane, which in the
++//!   upper half is console lane 32 or later: kept for a value the same in
++//!   every lane of the console wave ([`lane_uniform`], what the compiler
++//!   reads first lanes for) and in a group of 32 threads or fewer (one host
++//!   wave holds the whole console wave), refused otherwise ([`FIRST_ACROSS`]).
++//!
++//! A refusal in a value no instruction ends up needing costs nothing (the
++//! lowering retries with that value missing), so a program is refused only
++//! when it really reads across halves.
++//!
++//! A group spanning more than one host wave can exchange LDS between the
++//! two halves of a console wave. Group size alone does not prove that a
++//! barrier separates the producer and consumer, even for groups of 128.
++//! Until this is established from the program, keep its native wave width.
++//!
++//! Approach after DexNom's fork (DexNom/Victory 5f4c3df, `set_host_max_wave`
++//! and the thread relabelling into halves) and upstream PR #2176
++//! (n-romanovich: the setting keyed in the shader cache); here the setting
++//! is a translation option ([`super::super::Options::host_wave32`]), and
++//! cross-half reads are refused where they are lowered instead of by
++//! instruction name. Which values are the same in every lane of the console
++//! wave ([`lane_uniform`]): justrealyme's analysis (chippy01/VIctory#1),
++//! ported from fxceless/victory-fork (#497 there).
++
++use super::*;
++
++/// Console lanes per host wave in halves.
++const HALF: u32 = 32;
++
++impl Lower<'_> {
++    /// Whether a wave64 program whose lanes follow the console's runs in
++    /// halves: the host's waves are 32 lanes at most.
++    pub(super) fn halves_wanted(x: &Parts, needs_wave: bool) -> bool {
++        needs_wave && x.native.wave64 && x.host_wave32
++    }
++
++    /// Splitting a console wave changes the ordering of its LDS accesses.
++    pub(super) fn halves_lds(group: u32, lds_dwords: u32) -> Option<Why> {
++        (lds_dwords > 0 && group > HALF)
++            .then_some("LDS ordering across 32-lane halves has not been proved")
++    }
++
++    /// An unmodified 1D thread id at program entry has a known first value
++    /// in each full console wave. Once EXEC changes, its first set bit can
++    /// be any lane, including one in the opposite half.
++    pub(super) fn first_is_wave_base(
++        &self,
++        (b, i): (usize, usize),
++        operand: Option<&Operand>,
++    ) -> bool {
++        let Some(Operand::Vector { reg, .. }) = operand else {
++            return false;
++        };
++        let StageIo::Cs(cs) = &self.x.native.io else {
++            return false;
++        };
++        let [width, y, z] = cs.threads;
++        let entry = &self.x.p.blocks[0];
++        b == 0
++            && entry.preds.is_empty()
++            && y == 1
++            && z == 1
++            && width.is_multiple_of(64)
++            && entry.insts[i]
++                .read(Reg::V(*reg))
++                .is_some_and(|v| Some(v) == wave_tid(self.x))
++            && !entry.insts[..i].iter().any(|op| {
++                op.writes.iter().any(|(r, _)|
++                matches!(*r, Reg::S(n) if n == crate::ir::EXEC || n == crate::ir::EXEC + 1))
++            })
++    }
++
++    /// The flat thread id, relabelled so that each host wave holds a run of
++    /// [`Shader::wave_size`]-aligned ids from its first lane (see
++    /// [`Lower::thread_id`]); made once, in the entry block.
++    pub(super) fn relabelled_flat(&mut self) -> V {
++        if let Some(f) = self.relabelled {
++            return f;
++        }
++        let e = self.s.entry;
++        let i32t = self.s.t.i32;
++        let flat = self.s.op(
++            e,
++            "flattenedThreadIdInGroup.i32",
++            Attr::ReadNone,
++            i32t,
++            96,
++            &[],
++        );
++        let first = self.s.op(
++            e,
++            "waveReadLaneFirst.i32",
++            Attr::NoUnwind,
++            i32t,
++            118,
++            &[flat],
++        );
++        let wave = self.s.wave_size.expect("set with console lanes");
++        let mask = self.s.m.i32(!(wave - 1));
++        let base = self.s.m.bin(e, Bin::And, first, mask);
++        let lane = self
++            .s
++            .op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
++        let f = self.s.m.bin(e, Bin::Add, base, lane);
++        self.s.flags |= flags::WAVE_OPS;
++        self.relabelled = Some(f);
++        f
++    }
++
++    /// This lane's index in its console wave: the host lane, or in halves
++    /// the host lane in the half the host wave holds.
++    pub(super) fn console_lane(&mut self) -> V {
++        if !self.halves {
++            return self.lane_index();
++        }
++        let f = self.relabelled_flat();
++        let m = self.s.m.i32(self.wave() - 1);
++        self.s.m.bin(self.s.entry, Bin::And, f, m)
++    }
++
++    /// Whether the group fits one host wave: a console wave64 of 32 threads
++    /// or fewer has no lane in the upper half.
++    pub(super) fn one_host_wave(&self) -> bool {
++        self.s
++            .threads
++            .is_some_and(|t| t.iter().product::<u32>() <= HALF)
++    }
++
++    /// Refuses a read into the other half of the console wave in halves.
++    pub(super) fn same_half(&self, what: Why) -> Result<(), Why> {
++        if self.halves { Err(what) } else { Ok(()) }
++    }
++
++    /// The lane mask `ds_bpermute_b32` takes its source lane modulo: in
++    /// halves the host wave, which is the half the console permutes within;
++    /// else the console wave, as before.
++    pub(super) fn permute_lanes(&self) -> u32 {
++        if self.halves {
++            HALF - 1
++        } else {
++            self.wave() - 1
++        }
++    }
++}
++
++/// Why a first-lane read stops in halves: the console's first lane may be
++/// in the other half, and the value is not known to be the same there.
++pub(super) const FIRST_ACROSS: Why = "a first-lane read of a value that may differ between 32-lane halves (wave64 on a 32-lane host)";
++
++/// Every per-lane branch (by its block) with its region: the blocks
++/// reachable from it that do not post-dominate it, which only some lanes
++/// run. Not branches on uniform conditions. None with an indirect exit.
++fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
++    let end = st.exits.len();
++    let n = end + 1;
++    let mut succ = vec![Vec::new(); n];
++    let mut pred = vec![Vec::new(); n];
++    for (b, exit) in st.exits.iter().enumerate() {
++        match *exit {
++            LaneExit::Jump(t) => succ[b].push(t),
++            LaneExit::Branch {
++                taken, not_taken, ..
++            } => succ[b].extend([taken, not_taken]),
++            LaneExit::End => succ[b].push(end),
++            LaneExit::Indirect => return None,
++        }
++        for &t in &succ[b] {
++            pred[t].push(b);
++        }
++    }
++    // Each divergent region ends at its immediate post-dominator. Computing
++    // dominators of the reversed CFG avoids a dense block-by-block bit matrix.
++    let order = crate::ir::graph_rpo(n, end, |b, i| pred[b].get(i).copied());
++    if order.len() != n {
++        return None;
++    }
++    let mut index = vec![usize::MAX; n];
++    for (i, &b) in order.iter().enumerate() {
++        index[b] = i;
++    }
++    let post = crate::ir::graph_idoms(&order, &index, |b| &succ[b]);
++    let mut regions = Vec::new();
++    for (d, e) in st.exits.iter().enumerate() {
++        let LaneExit::Branch { when, .. } = *e else {
++            continue;
++        };
++        if st
++            .bools
++            .support(when)
++            .iter()
++            .all(|a| matches!(a, Atom::Uniform(_)))
++        {
++            continue;
++        }
++        let mut seen = vec![false; end];
++        let mut stack: Vec<usize> = succ[d].clone();
++        while let Some(b) = stack.pop() {
++            if b == end || b == post[d] || seen[b] {
++                continue;
++            }
++            seen[b] = true;
++            stack.extend(succ[b].iter().copied());
++        }
++        regions.push((d, seen));
++    }
++    Some(regions)
++}
++
++/// The thread id's x (`v0` on entry) of a wave64 compute program whose
++/// console waves are runs of 64 ids along x (a group 64-aligned along x,
++/// or one row): `id >> 6` and up is one value per console wave.
++fn wave_tid(x: &Parts) -> Option<Value> {
++    let StageIo::Cs(cs) = &x.native.io else {
++        return None;
++    };
++    let [tx, ty, tz] = cs.threads;
++    if !x.native.wave64 || !(tx % 64 == 0 || ty * tz == 1) {
++        return None;
++    }
++    x.p.inputs
++        .iter()
++        .find(|(r, _)| *r == Reg::V(0))
++        .map(|(_, v)| *v)
++}
++
++/// VGPR values that are the same in every lane of a console wave holding
++/// them, so that a first-lane read in either half gives the console's
++/// value: written lane by lane from scalars, constants and such values, by
++/// an instruction every arriving lane runs or that runs under a condition
++/// itself the same in every lane (then only over an old value that is such
++/// a value too); loaded from LDS, or from a buffer through a scalar
++/// descriptor, at such an address; or the thread id's x shifted right past
++/// the console wave ([`wave_tid`]). The console compiler keeps wave-uniform
++/// data in VGPRs and fetches it with `v_readfirstlane` (a typed buffer's
++/// element, say, which only a vector load reads). A scalar is one value,
++/// except the dwords a waterfall loop reads, which are each lane's own.
++///
++/// A phi counts where every predecessor is a block every lane of the wave
++/// reaches together: no branch on a lane-dependent condition can have split
++/// them (a branch on alike values does not). The analysis runs to a fixed
++/// point from nothing, so a loop-carried value that needs itself to be
++/// alike never is.
++pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
++    let (p, st) = (x.p, x.st);
++    let wave_tid = wave_tid(x);
++    let regions = lane_regions(st);
++    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
++    let per_lane = |v: Value| x.res.waterfall.reads.contains(&v);
++    let mut same: HashSet<Value> = HashSet::new();
++    loop {
++        let alike_atom = |same: &HashSet<Value>, a: &Atom| match *a {
++            Atom::Uniform(_) => true,
++            Atom::Lane(v) => same.contains(&v),
++            _ => false,
++        };
++        let alike_bool = |same: &HashSet<Value>, b: Bool| {
++            st.bools.support(b).iter().all(|a| alike_atom(same, a))
++        };
++        // Blocks every lane of a console wave reaches together.
++        let wave_all: Vec<bool> = match &regions {
++            Some(regions) => {
++                let mut w = vec![true; st.exits.len()];
++                for (d, region) in regions {
++                    let LaneExit::Branch { when, .. } = st.exits[*d] else {
++                        continue;
++                    };
++                    if alike_bool(&same, when) {
++                        continue;
++                    }
++                    for (b, r) in region.iter().enumerate() {
++                        if *r {
++                            w[b] = false;
++                        }
++                    }
++                }
++                w
++            }
++            None => vec![false; st.exits.len()],
++        };
++        let mut next: HashSet<Value> = HashSet::new();
++        for b in crate::ir::reverse_postorder(&p.blocks) {
++            let block = &p.blocks[b];
++            let whole = block
++                .preds
++                .iter()
++                .all(|&q| wave_all.get(q).copied().unwrap_or(false));
++            for phi in &block.phis {
++                if matches!(phi.reg, Reg::V(_))
++                    && whole
++                    && phi
++                        .args
++                        .iter()
++                        .all(|a| next.contains(a) || same.contains(a))
++                {
++                    next.insert(phi.value);
++                }
++            }
++            let known = |next: &HashSet<Value>, v: &Value| next.contains(v) || same.contains(v);
++            for (i, inst) in block.insts.iter().enumerate() {
++                let name = inst.name();
++                // Under a condition: only one every lane holds alike, and
++                // over an old value that is alike too.
++                if let Some(g) = st.guards[b][i] {
++                    if !alike_bool(&same, g) {
++                        continue;
++                    }
++                    let old_alike = inst
++                        .writes
++                        .iter()
++                        .filter(|w| matches!(w.0, Reg::V(_)))
++                        .all(|w| inst.read(w.0).is_none_or(|old| known(&next, &old)));
++                    if !old_alike {
++                        continue;
++                    }
++                }
++                // A buffer load at an alike index and offset, through a scalar
++                // descriptor, reads one value in every lane.
++                if let Fields::Buffer {
++                    addr,
++                    rsrc,
++                    soffset,
++                    offen,
++                    idxen,
++                    ..
++                } = &inst.fields
++                    && (name.starts_with("buffer_load") || name.starts_with("tbuffer_load"))
++                {
++                    let vector = |op: &Operand| match *op {
++                        Operand::Vector { reg, dwords } => (0..dwords)
++                            .all(|k| inst.read(Reg::V(reg + k)).is_some_and(|v| known(&next, &v))),
++                        _ => true,
++                    };
++                    let scalar = |op: &Operand| match *op {
++                        Operand::Scalar { code, dwords } if code != NULL => (0..dwords)
++                            .all(|k| inst.read(Reg::S(code + k)).is_none_or(|v| !per_lane(v))),
++                        _ => true,
++                    };
++                    if (!(*offen || *idxen) || vector(addr)) && scalar(rsrc) && scalar(soffset) {
++                        next.extend(
++                            inst.writes
++                                .iter()
++                                .filter(|w| matches!(w.0, Reg::V(_)))
++                                .map(|w| w.1),
++                        );
++                    }
++                    continue;
++                }
++                // An LDS read at an alike address reads one value in every lane.
++                if let Fields::Ds {
++                    addr: Some(Operand::Vector { reg, .. }),
++                    dst: Some(_),
++                    data,
++                    ..
++                } = &inst.fields
++                    && name.starts_with("ds_read")
++                    && data.is_empty()
++                {
++                    if inst.read(Reg::V(*reg)).is_some_and(|a| known(&next, &a)) {
++                        next.extend(
++                            inst.writes
++                                .iter()
++                                .filter(|w| matches!(w.0, Reg::V(_)))
++                                .map(|w| w.1),
++                        );
++                    }
++                    continue;
++                }
++                let ops: Vec<Operand> = match &inst.fields {
++                    Fields::Valu(v)
++                        if v.dpp.is_none()
++                            && v.sdwa.is_none()
++                            && !name.starts_with("v_mbcnt")
++                            && !name.starts_with("v_cmpx")
++                            && !name.contains("lane") =>
++                    {
++                        v.src.clone()
++                    }
++                    _ => continue,
++                };
++                // The thread id's x shifted past the console wave: one value
++                // per console wave (the b32 shift uses five bits of its count).
++                if let (
++                    Some(tid),
++                    "v_lshrrev_b32",
++                    [
++                        Operand::Const(k @ 128..=192),
++                        Operand::Vector { reg, .. },
++                        ..,
++                    ],
++                ) = (wave_tid, name, ops.as_slice())
++                    && ((k - 128) & 31) >= 6
++                    && inst.read(Reg::V(*reg)) == Some(tid)
++                {
++                    next.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
++                    continue;
++                }
++                let alike = ops.iter().all(|op| match *op {
++                    Operand::Vector { reg, .. } => {
++                        // every dword the instruction reads from that register on
++                        let read: Vec<Value> = inst
++                            .reads
++                            .iter()
++                            .filter(|r| matches!(r.0, Reg::V(x) if x >= reg))
++                            .map(|r| r.1)
++                            .collect();
++                        !read.is_empty() && read.iter().all(|x| known(&next, x))
++                    }
++                    // A scalar is one value; a lane mask is not, unless a
++                    // compare of alike values made it.
++                    Operand::Scalar { code, .. } if code != NULL => inst
++                        .read(Reg::S(code))
++                        .is_none_or(|x| !is_mask(x) && !per_lane(x) || known(&next, &x)),
++                    _ => true,
++                });
++                if alike {
++                    next.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
++                }
++            }
++        }
++        if next.is_subset(&same) {
++            return same;
++        }
++        same.extend(next);
++    }
++}
+diff --git a/crates/victory-shader/src/emit/lower/permlane.rs b/crates/victory-shader/src/emit/lower/permlane.rs
+index ff662f45ef3a2410bcffa748b54c4146bb62ec34..980cd3939f4d646c63aace55f0309dcd40ec7195 100644
+--- a/crates/victory-shader/src/emit/lower/permlane.rs
++++ b/crates/victory-shader/src/emit/lower/permlane.rs
+@@ -1,4 +1,141 @@
+-use super::{Atom, LaneExit, Program, Structured};
++//! `v_permlane16_b32` and `v_permlanex16_b32`: lane shuffles within rows of
++//! 16, and the fetch-inactive (FI) flow check they need.
++//!
++//! Each nibble of {src2, src1} selects a lane in this row of 16
++//! (`v_permlane16`) or in the other row of the same 32-lane half
++//! (`v_permlanex16`); no form reads across 32-lane halves, so a console
++//! wave64 program in halves ([`Lower::halves`], host waves of 32) keeps
++//! them exact. Which lane each step uses:
++//!
++//! * the selected source position and the lane read: the host lane. In
++//!   halves host lane `n` of the host wave holding half `h` is console lane
++//!   `32h + n`; the row (`n & !15`), its partner row (`^ 16`) and the source
++//!   all lie in that half, so they are the console's positions less `32h`,
++//!   in the same host wave that `waveReadLaneAt` reads;
++//! * whether the source lane is active (without FI): the host ballot's bit
++//!   for that host lane, of the console EXEC guard, whose own bits are
++//!   decided by the console lane ([`Lower::console_lane`]);
++//! * the destination's EXEC: the guard, as every VALU result.
++//!
++//! FI reads lanes outside EXEC, which have no host form where their host
++//! invocation is absent: a partial last row, a block not every host lane
++//! reaches ([`all_lane_blocks`]), and in halves a host wave of fewer than
++//! 32 invocations ([`PARTIAL_HALF`]).
++
++use super::*;
++
++/// Why a fetch-inactive shuffle stops in halves: the group leaves a host
++/// wave of fewer than 32 invocations. Only full 32-lane halves have been
++/// measured with FI on 32-lane hosts (`permlane_tests`); in a partial one
++/// FI reads, without the ballot the other form checks, a host lane whose
++/// invocation exists only if the host packs it into the wave's low lanes.
++pub(super) const PARTIAL_HALF: Why =
++    "a permlane fetch from a partial 32-lane half (wave64 on a 32-lane host)";
++
++impl Lower<'_> {
++    /// `v_permlane16_b32` / `v_permlanex16_b32` (RDNA2 ISA 12.12) under
++    /// `guard`. OP_SEL[0:1] are fetch-inactive and bound-control, not half
++    /// selects.
++    pub(super) fn permlane16(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
++        let Fields::Valu(v) = &inst.fields else {
++            unreachable!()
++        };
++        let c = self.cur;
++        if v.abs != 0 || v.neg != 0 || v.opsel & !3 != 0 {
++            return Err("permlane input modifiers");
++        }
++        self.cross_lane(false)?;
++        // Console lanes made the program declare its wave: the console's, or
++        // 32 in halves, where every row and its partner are one host wave's.
++        debug_assert!(!self.halves || self.s.wave_size == Some(32));
++        let fetch_inactive = v.opsel & 1 != 0;
++        let cross = inst.name() == "v_permlanex16_b32";
++        // FI can read a lane outside EXEC, even when its VGPR contains
++        // an earlier value. A partial last row has no such host invocation.
++        let row_group = if cross { 32 } else { 16 };
++        let group = self
++            .s
++            .threads
++            .map(|group| group.iter().map(|&n| u64::from(n)).product::<u64>());
++        if fetch_inactive && group.is_some_and(|n| !n.is_multiple_of(row_group)) {
++            return Err("a permlane fetch from an incomplete thread-group row");
++        }
++        if fetch_inactive && self.halves && group.is_some_and(|n| !n.is_multiple_of(32)) {
++            return Err(PARTIAL_HALF);
++        }
++        if fetch_inactive
++            && !self
++                .full_wave_blocks
++                .get_or_init(|| all_lane_blocks(self.x.p, self.x.st))
++                .as_ref()
++                .is_some_and(|all| all[self.cur_ir])
++        {
++            // DXIL cannot read the last VGPR value of a host invocation
++            // that has left through a lane branch. A guard keeps it here.
++            return Err("a permlane fetch from lanes outside the host branch");
++        }
++        let (x, lo, hi) = (self.src(inst, 0)?, self.src(inst, 1)?, self.src(inst, 2)?);
++        // The host lane: in halves, the console lane within its half.
++        let lane = self.lane_index();
++        let (k7, k8, k15, k16, k31, k32, k4, one, zero) = (
++            self.s.m.i32(7),
++            self.s.m.i32(8),
++            self.s.m.i32(15),
++            self.s.m.i32(16),
++            self.s.m.i32(31),
++            self.s.m.i32(32),
++            self.s.m.i32(4),
++            self.s.m.i32(1),
++            self.s.m.i32(0),
++        );
++        let pos = self.s.m.bin(c, Bin::And, lane, k15);
++        let lower = self.s.m.cmp(c, pred::IULT, pos, k8);
++        let packed = self.s.m.select(c, lower, lo, hi);
++        let shift = self.s.m.bin(c, Bin::And, pos, k7);
++        let shift = self.s.m.bin(c, Bin::Mul, shift, k4);
++        let pick = self.s.m.bin(c, Bin::LShr, packed, shift);
++        let pick = self.s.m.bin(c, Bin::And, pick, k15);
++        let not15 = self.s.m.i32(!15);
++        let mut row = self.s.m.bin(c, Bin::And, lane, not15);
++        if cross {
++            row = self.s.m.bin(c, Bin::Xor, row, k16);
++        }
++        // A host lane of this host wave (below 32 in halves).
++        let src = self.s.m.bin(c, Bin::Or, row, pick);
++        let r = if fetch_inactive {
++            self.read_lane(x, src)
++        } else {
++            // Ballot the console EXEC guard as well as the host's active
++            // invocations. Never shuffle from an inactive host lane.
++            let enabled = guard.unwrap_or_else(|| self.s.m.bool(true));
++            let i32t = self.s.t.i32;
++            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
++            let mask = self
++                .s
++                .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[enabled]);
++            let lo = self.s.m.extract(c, mask, 0);
++            let hi = self.s.m.extract(c, mask, 1);
++            let lower = self.s.m.cmp(c, pred::IULT, src, k32);
++            let word = self.s.m.select(c, lower, lo, hi);
++            let bit = self.s.m.bin(c, Bin::And, src, k31);
++            let bit = self.s.m.bin(c, Bin::LShr, word, bit);
++            let bit = self.s.m.bin(c, Bin::And, bit, one);
++            let active = self.s.m.cmp(c, pred::NE, bit, zero);
++            let safe = self.s.m.select(c, active, src, lane);
++            let read = self.read_lane(x, safe);
++            let fallback = if v.opsel & 2 != 0 {
++                zero
++            } else {
++                let Some(Operand::Vector { reg, .. }) = v.dst else {
++                    return Err("a permlane result outside a VGPR");
++                };
++                self.i32_of(inst.read(Reg::V(reg)).ok_or("a permlane old value")?)?
++            };
++            self.s.m.select(c, active, read, fallback)
++        };
++        self.write_i(inst, r, guard)
++    }
++}
+ 
+ /// Blocks reached by every host lane: a fetch-inactive shuffle cannot
+ /// recover registers of invocations absent from a divergent host branch.
+diff --git a/crates/victory-shader/src/emit/memory_tests.rs b/crates/victory-shader/src/emit/memory_tests.rs
+index a1587cce0919f96b18fad41c990b745e29fa33c2..28e28f032f2ab2eddc9239a66d6e88748a90ab9c 100644
+--- a/crates/victory-shader/src/emit/memory_tests.rs
++++ b/crates/victory-shader/src/emit/memory_tests.rs
+@@ -194,6 +194,7 @@ fn program() -> HostShader {
+         outputs: Vec::new(),
+         prims: Vec::new(),
+         mesh_stride: 0,
++        host_wave32: false,
+         view_marks: false,
+     })
+     .expect("lower");
+@@ -427,6 +428,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
+         outputs: Vec::new(),
+         prims: Vec::new(),
+         mesh_stride: 0,
++        host_wave32: false,
+         view_marks: false,
+     })
+     .expect("lower");
+@@ -569,6 +571,7 @@ fn writes_through_views_mark_their_pages() {
+         outputs: Vec::new(),
+         prims: Vec::new(),
+         mesh_stride: 0,
++        host_wave32: false,
+         view_marks: true,
+     })
+     .expect("lower");
+@@ -685,6 +688,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
+             outputs: Vec::new(),
+             prims: Vec::new(),
+             mesh_stride: 0,
++            host_wave32: false,
+             view_marks: true,
+         })
+         .expect("lower")
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index c3ba944d14bdcc49494d1cff1dca3a0a1b3206ee..f2bcb9aa2e995c97f0d2ce125a5e7ad139105eb5 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -2,7 +2,9 @@
+ //! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
+ //! Compute shaders keep the console's thread-group size; one that depends
+ //! on the lane layout (cross-lane operations) declares the console's wave
+-//! size (`WaveSize`), so the host device must support it.
++//! size (`WaveSize`), so the host device must support it; a wave64 one on a
++//! host of 32-lane waves declares 32 and runs in halves
++//! ([`Options::host_wave32`]).
+ //!
+ //! What the host binds for a translated shader ([`HostShader`]):
+ //!
+@@ -224,6 +226,8 @@ mod diff_tests;
+ mod flow_tests;
+ #[cfg(all(test, windows))]
+ mod g16_tests;
++#[cfg(all(test, windows))]
++mod halves_tests;
+ #[cfg(all(windows, any(test, feature = "host")))]
+ pub mod host;
+ #[cfg(all(test, windows))]
+@@ -398,6 +402,12 @@ pub struct Options {
+     /// "Write marks"); the host must then bind the view-mark table and the
+     /// bitmap ([`HostShader::view_marks`]).
+     pub view_marks: bool,
++    /// The host's waves have at most 32 lanes (`WaveLaneCountMax` 32:
++    /// NVIDIA, Intel), so it refuses `WaveSize(64)`: a console wave64
++    /// compute program that needs the console's lanes runs as two waves of
++    /// 32, and is refused where it reads across them (`lower::halves`).
++    /// The translation differs, so the shader cache keys on it.
++    pub host_wave32: bool,
+ }
+ 
+ /// Combined vertex + primitive output byte size of an emitted mesh shader
+@@ -757,6 +767,7 @@ fn emit_pruned(
+         prims: prims.clone(),
+         mesh_stride,
+         view_marks: options.view_marks,
++        host_wave32: options.host_wave32,
+     };
+     let l = match lower::lower_pruned(&parts(st, res), keep) {
+         // Discarded lanes kept on as helpers can read what no surviving
+@@ -1454,7 +1465,10 @@ mod tests {
+             (out, features, flags)
+         };
+ 
+-        let marks = Options { view_marks: true };
++        let marks = Options {
++            view_marks: true,
++            host_wave32: false,
++        };
+         for stage in [HwStage::Vs, HwStage::Ms] {
+             let (out, sfi0, flags) = translate_stage(stage, marks);
+             assert!(
+@@ -2618,7 +2632,10 @@ mod tests {
+         use crate::native::fixture;
+         let ms = fixture::wide_mesh(128, 128, 128);
+         let ps = fixture::reading_pixel(16, &[(0, 0), (0, 1), (15, 2), (15, 3)], true);
+-        let options = Options { view_marks: true };
++        let options = Options {
++            view_marks: true,
++            host_wave32: false,
++        };
+         let alone_ms = translate_with(&ms, options).unwrap();
+         let alone_ps = translate_with(&ps, options).unwrap();
+         assert_eq!(mesh_output_bytes(&alone_ms.dxil), Some(34_816));
+@@ -2658,7 +2675,10 @@ mod tests {
+     fn translate_linked_refuses_over_budget_unwritten_and_misordered_pairs() {
+         use crate::native::fixture;
+         let ms = fixture::wide_mesh(128, 128, 128);
+-        let options = Options { view_marks: true };
++        let options = Options {
++            view_marks: true,
++            host_wave32: false,
++        };
+         let all: Vec<(u8, u8)> = (0..16u8).flat_map(|k| [(k, 0), (k, 3)]).collect();
+         let greedy = fixture::reading_pixel(16, &all, false);
+         let reads = pixel_input_reads(&translate_with(&greedy, options).unwrap().dxil).unwrap();
+diff --git a/crates/victory-shader/src/emit/permlane_tests.rs b/crates/victory-shader/src/emit/permlane_tests.rs
+index b387418df9399447026928712d1c43863c81f0f9..291d51b5d2c8d83fa79203d9c5353cd1337ef35b 100644
+--- a/crates/victory-shader/src/emit/permlane_tests.rs
++++ b/crates/victory-shader/src/emit/permlane_tests.rs
+@@ -78,11 +78,15 @@ fn native(cross: bool, fi: bool, bc: bool, alias: bool, wave64: bool) -> NativeP
+ }
+ 
+ fn lowered(native: &NativeProgram) -> Result<HostShader, ShaderError> {
++    lowered_for_host(native, false)
++}
++
++fn lower_rows(native: &NativeProgram, host_wave32: bool) -> Result<lower::Lowered, ShaderError> {
+     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir");
+     let st = structure::structure(&p).expect("structure");
+     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resources");
+     let io = io::raise(&p, native).expect("io");
+-    let result = lower::lower(&lower::Parts {
++    lower::lower(&lower::Parts {
+         native,
+         p: &p,
+         st: &st,
+@@ -93,8 +97,12 @@ fn lowered(native: &NativeProgram) -> Result<HostShader, ShaderError> {
+         prims: Vec::new(),
+         mesh_stride: 0,
+         view_marks: false,
+-    });
+-    let result = result?;
++        host_wave32,
++    })
++}
++
++fn lowered_for_host(native: &NativeProgram, host_wave32: bool) -> Result<HostShader, ShaderError> {
++    let result = lower_rows(native, host_wave32)?;
+     let shader = HostShader {
+         stage: HwStage::Cs,
+         dxil: result.dxil,
+@@ -150,6 +158,56 @@ fn fetch_inactive_needs_a_complete_source_row() {
+     }
+ }
+ 
++/// A wave64 program's shuffles on a 32-lane host run in halves: they
++/// declare waves of 32 (64 for a 64-lane host, 32 for a wave32 program
++/// either way), and fetch-inactive needs every host wave whole.
++#[test]
++fn permlanes_in_halves_declare_32_lane_waves_and_fetch_only_whole_halves() {
++    let wave_size =
++        |native: &NativeProgram, mode| lower_rows(native, mode).expect("lower permlane").wave_size;
++    for cross in [false, true] {
++        for fi in [false, true] {
++            let wave64 = native(cross, fi, false, false, true);
++            assert_eq!(wave_size(&wave64, true), Some(32));
++            assert_eq!(wave_size(&wave64, false), Some(64));
++            let wave32 = native(cross, fi, false, false, false);
++            assert_eq!(wave_size(&wave32, true), Some(32));
++        }
++    }
++    for (cross, fi, threads, host_wave32, valid) in [
++        // Complete rows of 16, but a host wave of 16 in halves.
++        (false, true, 48, true, false),
++        (false, true, 16, true, false),
++        (false, true, 48, false, true),
++        // Without FI the ballot leaves the absent lanes out.
++        (false, false, 48, true, true),
++        (false, true, 32, true, true),
++        (false, true, 64, true, true),
++        (true, true, 96, true, true),
++    ] {
++        let mut program = native(cross, fi, false, false, true);
++        let StageIo::Cs(ref mut cs) = program.io else {
++            unreachable!()
++        };
++        cs.threads = [threads, 1, 1];
++        let result = lowered_for_host(&program, host_wave32);
++        if valid {
++            result.expect("whole host waves");
++        } else {
++            assert!(
++                matches!(
++                    result,
++                    Err(ShaderError::Unsupported {
++                        what: "a permlane fetch from a partial 32-lane half (wave64 on a 32-lane host)",
++                        ..
++                    })
++                ),
++                "cross={cross} threads={threads}"
++            );
++        }
++    }
++}
++
+ #[test]
+ fn permlane_fetch_inactive_outside_the_host_branch_is_rejected() {
+     let mut native = native(true, true, false, false, false);
+@@ -270,18 +328,23 @@ fn permlane_rows_and_inactive_sources() {
+         ran += 1;
+         let mut dispatches = 0usize;
+         eprintln!("permlane: testing row and EXEC cases on {backend}");
+-        for wave64 in [false, true] {
+-            let wave = if wave64 { 64 } else { 32 };
+-            if wave < options.WaveLaneCountMin || wave > options.WaveLaneCountMax {
+-                eprintln!("{backend} does not support the requested console wave size; skipped");
++        for (wave64, host_wave32) in [(false, false), (true, false), (true, true)] {
++            let width = if wave64 && !host_wave32 { 64 } else { 32 };
++            if width < options.WaveLaneCountMin || width > options.WaveLaneCountMax {
++                eprintln!(
++                    "{backend} does not support the requested {width}-lane host wave; skipped"
++                );
+                 continue;
+             }
+             for cross in [false, true] {
+                 for fi in [false, true] {
+                     for bc in [false, true] {
+                         for alias in [false, true] {
+-                            let shader = lowered(&native(cross, fi, bc, alias, wave64))
+-                                .expect("lower permlane");
++                            let shader = lowered_for_host(
++                                &native(cross, fi, bc, alias, wave64),
++                                host_wave32,
++                            )
++                            .expect("lower permlane");
+                             let (root, pso) =
+                                 host.compute_pipeline(&shader).expect("permlane pipeline");
+                             for selectors in [
+@@ -300,7 +363,9 @@ fn permlane_rows_and_inactive_sources() {
+                                     1,
+                                     0,
+                                 ] {
+-                                    let constants = [selectors[0], selectors[1], mask, mask];
++                                    // Distinct EXEC halves expose wraparound at console lane 32.
++                                    let upper = !mask;
++                                    let constants = [selectors[0], selectors[1], mask, upper];
+                                     let mut ud = vec![0; shader.user_data_dwords() as usize];
+                                     for u in &shader.user_data {
+                                         ud[u.index as usize] = if u.root == RootType::Constants {
+@@ -329,9 +394,10 @@ fn permlane_rows_and_inactive_sources() {
+                                         let pick = (packed >> (4 * pos)) as u32 & 15;
+                                         let src = ((t & !15) ^ if cross { 16 } else { 0 }) | pick;
+                                         let old = if alias { BASE + t } else { OLD };
+-                                        let want = if mask >> (t % 32) & 1 == 0 {
++                                        let exec = if wave64 && t & 32 != 0 { upper } else { mask };
++                                        let want = if exec >> (t % 32) & 1 == 0 {
+                                             old
+-                                        } else if fi || mask >> (src % 32) & 1 != 0 {
++                                        } else if fi || exec >> (src % 32) & 1 != 0 {
+                                             BASE + src
+                                         } else if bc {
+                                             0
+@@ -341,7 +407,7 @@ fn permlane_rows_and_inactive_sources() {
+                                         let got = out[0][t as usize];
+                                         assert_eq!(
+                                             got, want,
+-                                            "{backend} wave64={wave64} cross={cross} fi={fi} bc={bc} alias={alias} selectors={selectors:x?} mask={mask:x} lane={t}"
++                                            "{backend} wave64={wave64} host_wave32={host_wave32} cross={cross} fi={fi} bc={bc} alias={alias} selectors={selectors:x?} mask={mask:x} lane={t}"
+                                         );
+                                     }
+                                 }
+diff --git a/crates/victory-shader/src/emit/semantics_tests.rs b/crates/victory-shader/src/emit/semantics_tests.rs
+index 3f98c23a8c41b08a350fa0aa37d34d310b5dc890..565cc3de5c2dcdd577409ddf27f0dfc47bfe59dd 100644
+--- a/crates/victory-shader/src/emit/semantics_tests.rs
++++ b/crates/victory-shader/src/emit/semantics_tests.rs
+@@ -292,6 +292,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
+         outputs: Vec::new(),
+         prims: Vec::new(),
+         mesh_stride: 0,
++        host_wave32: false,
+         view_marks: false,
+     })
+     .map_err(e)?;
+diff --git a/crates/victory-shader/src/emit/stride_tests.rs b/crates/victory-shader/src/emit/stride_tests.rs
+index 017b2f3398bb134666a07fc1827a3ddfe8982cdc..d2a2f0238d0dad2af4f38236f8c875da574cd911 100644
+--- a/crates/victory-shader/src/emit/stride_tests.rs
++++ b/crates/victory-shader/src/emit/stride_tests.rs
+@@ -198,6 +198,7 @@ fn build(
+         outputs: Vec::new(),
+         prims: Vec::new(),
+         mesh_stride: 0,
++        host_wave32: false,
+         view_marks: false,
+     })
+     .expect("lower");
+diff --git a/crates/victory-shader/src/emit/synthetic_tests.rs b/crates/victory-shader/src/emit/synthetic_tests.rs
+index 999c2f05a8ed57e03b7be5bed89f5fd59cecf5ae..f78efcbb49858ad9018f24d73170ebc72e23252b 100644
+--- a/crates/victory-shader/src/emit/synthetic_tests.rs
++++ b/crates/victory-shader/src/emit/synthetic_tests.rs
+@@ -141,6 +141,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
+         outputs: Vec::new(),
+         prims: Vec::new(),
+         mesh_stride: 0,
++        host_wave32: false,
+         view_marks: false,
+     })
+ }
+diff --git a/crates/victory-shader/src/emit/valu_tests.rs b/crates/victory-shader/src/emit/valu_tests.rs
+index 3323b044bd52e5f827872dfab502a8ccbf3dfd99..4e56c3f5eb644acbc2dd28fa8e03cf15e0d6d6d3 100644
+--- a/crates/victory-shader/src/emit/valu_tests.rs
++++ b/crates/victory-shader/src/emit/valu_tests.rs
+@@ -145,6 +145,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
+         outputs: Vec::new(),
+         prims: Vec::new(),
+         mesh_stride: 0,
++        host_wave32: false,
+         view_marks: false,
+     })?;
+ 
+@@ -1322,6 +1323,7 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
+         outputs: Vec::new(),
+         prims: Vec::new(),
+         mesh_stride: 0,
++        host_wave32: false,
+         view_marks: false,
+     })
+     .expect("lower");
+diff --git a/crates/victory-shader/src/emit/waterfall_tests.rs b/crates/victory-shader/src/emit/waterfall_tests.rs
+index f82234a99865bf3778f37a4c2384473ecab77fea..c2c5f68488da133b6b91e93fe69af50e04676465 100644
+--- a/crates/victory-shader/src/emit/waterfall_tests.rs
++++ b/crates/victory-shader/src/emit/waterfall_tests.rs
+@@ -69,6 +69,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
+         outputs: Vec::new(),
+         prims: Vec::new(),
+         mesh_stride: 0,
++        host_wave32: false,
+         view_marks: false,
+     })
+     .expect("lower");
