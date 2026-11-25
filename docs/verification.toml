@@ -13,6 +13,20 @@ verified = 13
 total = 13
 evidence = "docs/engineering-review.md#reproduced-on-this-revision"
 
+[texture]
+title = "BC4 readback · RTX 4060"
+unit = "streamed texels matched"
+verified = 32
+total = 32
+evidence = "docs/engineering-review.md#bc4-storage-and-gpu-readback"
+
+[stale]
+title = "BC4 skipped upload"
+unit = "stale texels detected"
+verified = 32
+total = 32
+evidence = "docs/engineering-review.md#bc4-storage-and-gpu-readback"
+
 [vendors]
 title = "Median shader · vendors"
 unit = "vendors with a passing hardware run"

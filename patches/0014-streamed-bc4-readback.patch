@@ -1,0 +1,367 @@
+diff --git a/crates/victory-gpu/Cargo.toml b/crates/victory-gpu/Cargo.toml
+index a24dd1a..eb6ea1d 100644
+--- a/crates/victory-gpu/Cargo.toml
++++ b/crates/victory-gpu/Cargo.toml
+@@ -20,6 +20,8 @@ victory-shader.workspace = true
+ tempfile.workspace = true
+ 
+ [features]
++# Expose the end-to-end texture fixture to the storage crate’s tests.
++texture-probe = []
+ # Debugging switches (frame capture, the host debug layer, per-draw data).
+ diagnostics = []
+ 
+diff --git a/crates/victory-gpu/src/resource.rs b/crates/victory-gpu/src/resource.rs
+index 3516a8f..bda712c 100644
+--- a/crates/victory-gpu/src/resource.rs
++++ b/crates/victory-gpu/src/resource.rs
+@@ -3414,3 +3414,7 @@ float4 lit() : SV_Target { return 1.0; }
+         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+     }
+ }
++
++#[cfg(all(windows, feature = "texture-probe"))]
++#[path = "resource_bc4_probe.rs"]
++pub mod bc4_probe;
+diff --git a/crates/victory-gpu/src/resource_bc4_probe.rs b/crates/victory-gpu/src/resource_bc4_probe.rs
+new file mode 100644
+index 0000000..70de288
+--- /dev/null
++++ b/crates/victory-gpu/src/resource_bc4_probe.rs
+@@ -0,0 +1,281 @@
++//! GPU half of the source-authored DirectStorage fixture, enabled only for tests.
++
++use super::{
++    HeapProperties, RESOURCE_IIDS, ResourceDesc, create_committed, host_resource, resource_release,
++    texture_layout, texture_memory,
++};
++use crate::host::{self, Host};
++use crate::object::{S_OK, This};
++use std::ptr::null;
++use windows::Win32::Graphics::Direct3D12::*;
++use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_BC4_UNORM;
++use windows::Win32::Graphics::Dxgi::*;
++use windows::core::s;
++
++const TEXELS: usize = 8 * 4;
++const OUTPUT_BYTES: u64 = (TEXELS * size_of::<f32>()) as u64;
++const PROBE_SHADER: &str = r#"
++Texture2D<float> image : register(t0);
++SamplerState pointSampler : register(s0);
++RWByteAddressBuffer outputTexels : register(u0);
++[RootSignature("DescriptorTable(SRV(t0)), UAV(u0), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_POINT, addressU=TEXTURE_ADDRESS_CLAMP, addressV=TEXTURE_ADDRESS_CLAMP, addressW=TEXTURE_ADDRESS_CLAMP)")]
++[numthreads(8, 4, 1)]
++void main(uint3 tid : SV_DispatchThreadID) {
++    float2 uv = (float2(tid.xy) + 0.5) / float2(8, 4);
++    outputTexels.Store(4 * (tid.x + 8 * tid.y), asuint(image.SampleLevel(pointSampler, uv, 0)));
++}
++"#;
++
++struct TitleTexture(This);
++
++impl Drop for TitleTexture {
++    fn drop(&mut self) {
++        resource_release(self.0);
++    }
++}
++
++struct Sampler {
++    root: ID3D12RootSignature,
++    pipeline: ID3D12PipelineState,
++    views: ID3D12DescriptorHeap,
++    output: ID3D12Resource,
++    readback: ID3D12Resource,
++}
++
++impl Sampler {
++    fn new(host: &Host, image: &ID3D12Resource) -> Self {
++        let code =
++            host::compile(PROBE_SHADER, s!("main"), s!("cs_5_1")).expect("compile BC4 sampler");
++        // SAFETY: the bytecode contains the root signature. All borrowed COM
++        // references and the shader bytes outlive pipeline and view creation.
++        let (root, pipeline, views) = unsafe {
++            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).unwrap();
++            let pipeline = host
++                .device
++                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
++                    pRootSignature: std::mem::transmute_copy(&root),
++                    CS: D3D12_SHADER_BYTECODE {
++                        pShaderBytecode: code.as_ptr().cast(),
++                        BytecodeLength: code.len(),
++                    },
++                    ..Default::default()
++                })
++                .unwrap();
++            let views: ID3D12DescriptorHeap = host
++                .device
++                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
++                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
++                    NumDescriptors: 1,
++                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
++                    NodeMask: 0,
++                })
++                .unwrap();
++            host.device.CreateShaderResourceView(
++                image,
++                None,
++                views.GetCPUDescriptorHandleForHeapStart(),
++            );
++            (root, pipeline, views)
++        };
++        Self {
++            root,
++            pipeline,
++            views,
++            output: host.uav_buffer(OUTPUT_BYTES).expect("BC4 sample buffer"),
++            readback: host
++                .read_back_buffer(OUTPUT_BYTES)
++                .expect("BC4 readback buffer"),
++        }
++    }
++
++    fn sample(&self, host: &Host, texture: &TitleTexture, upload: bool) -> [f32; TEXELS] {
++        let list = host.new_list().expect("BC4 command list");
++        let image = host_resource(texture.0).unwrap();
++        if upload {
++            crate::texture::upload(&list, texture.0, image);
++            // Indexed uploads retire their staging entry after recording. The
++            // list retains the allocation until its deferred refresh completes.
++            assert!(
++                crate::texture::is_staged(texture.0),
++                "runtime recorded the upload"
++            );
++            crate::texture::unstage(texture.0);
++        }
++        crate::list::ensure_state(
++            &list,
++            texture.0,
++            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 as u32,
++        );
++        // SAFETY: the live descriptor, pipeline and buffers match the shader.
++        // All 32 lanes write a distinct float before the readback copy.
++        unsafe {
++            let l = &list.list;
++            l.ResourceBarrier(&[host::transition(
++                &self.output,
++                D3D12_RESOURCE_STATE_COMMON,
++                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++            )]);
++            l.SetDescriptorHeaps(&[Some(self.views.clone())]);
++            l.SetComputeRootSignature(&self.root);
++            l.SetPipelineState(&self.pipeline);
++            l.SetComputeRootDescriptorTable(0, self.views.GetGPUDescriptorHandleForHeapStart());
++            l.SetComputeRootUnorderedAccessView(1, self.output.GetGPUVirtualAddress());
++            l.Dispatch(1, 1, 1);
++            l.ResourceBarrier(&[host::transition(
++                &self.output,
++                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++                D3D12_RESOURCE_STATE_COPY_SOURCE,
++            )]);
++            l.CopyBufferRegion(&self.readback, 0, &self.output, 0, OUTPUT_BYTES);
++            l.ResourceBarrier(&[host::transition(
++                &self.output,
++                D3D12_RESOURCE_STATE_COPY_SOURCE,
++                D3D12_RESOURCE_STATE_COMMON,
++            )]);
++        }
++        list.close();
++        host.execute(&[&list]);
++        // SAFETY: execute waits for this list. The readback buffer holds 32
++        // aligned floats, and the copy completes before its mapped span is read.
++        unsafe {
++            host.device
++                .GetDeviceRemovedReason()
++                .expect("device survived BC4 dispatch");
++            let mut ptr = std::ptr::null_mut();
++            self.readback
++                .Map(
++                    0,
++                    Some(&D3D12_RANGE {
++                        Begin: 0,
++                        End: OUTPUT_BYTES as usize,
++                    }),
++                    Some(&mut ptr),
++                )
++                .unwrap();
++            let texels = ptr.cast::<[f32; TEXELS]>().read();
++            self.readback
++                .Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
++            texels
++        }
++    }
++}
++
++/// Exercise the production texture upload on the host device. The storage
++/// callback receives the two adjacent blocks in the console texture itself.
++pub fn run(fill: impl FnOnce(&mut [u8; 16]), require_hardware: bool) {
++    let host = host::host().expect("the BC4 probe needs a D3D12 device");
++    // SAFETY: query the adapter belonging to the actual rendering device.
++    let info = unsafe {
++        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
++        let adapter: IDXGIAdapter1 = factory
++            .EnumAdapterByLuid(host.device.GetAdapterLuid())
++            .unwrap();
++        adapter.GetDesc1().unwrap()
++    };
++    let software = (info.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0
++        || (info.VendorId, info.DeviceId) == (0x1414, 0x8c);
++    assert!(
++        !require_hardware || !software,
++        "the physical BC4 probe selected a software adapter"
++    );
++    let end = info
++        .Description
++        .iter()
++        .position(|&v| v == 0)
++        .unwrap_or(info.Description.len());
++    eprintln!(
++        "BC4 adapter: {} (vendor {:#06x}, device {:#06x}, software={software})",
++        String::from_utf16_lossy(&info.Description[..end]),
++        info.VendorId,
++        info.DeviceId
++    );
++
++    let desc = ResourceDesc {
++        dimension: 3,
++        alignment: 0,
++        width: 8,
++        height: 4,
++        depth_or_array_size: 1,
++        mip_levels: 1,
++        format: DXGI_FORMAT_BC4_UNORM.0 as u32,
++        sample_count: 1,
++        sample_quality: 0,
++        layout: 0x105,
++        flags: 0,
++    };
++    let heap = HeapProperties {
++        kind: 1,
++        cpu_pages: 0,
++        pool: 0,
++        creation_nodes: 0,
++        visible_nodes: 0,
++    };
++    let mut raw = null();
++    assert_eq!(
++        create_committed(
++            null(),
++            &heap,
++            0,
++            &desc,
++            0,
++            null(),
++            &RESOURCE_IIDS[0],
++            &mut raw
++        ),
++        S_OK
++    );
++    let texture = TitleTexture(raw);
++    let (memory, _) = texture_memory(raw).unwrap();
++    let layout = &texture_layout(&desc).unwrap().planes[0].layout;
++    let first = layout.offset(0, 0, 0, 0).unwrap();
++    assert_eq!(layout.offset(0, 1, 0, 0).unwrap(), first + 8);
++    assert!(first + 16 <= layout.size);
++    // SAFETY: the layout places two consecutive BC4 blocks in this owned
++    // texture. A mutable borrow spans only the writes, never a GPU submission.
++    let address = unsafe { memory.cast_mut().add(first as usize).cast::<[u8; 16]>() };
++    let sampler = Sampler::new(host, host_resource(raw).expect("BC4 host texture"));
++    let sentinel = [51u8, 51, 0, 0, 0, 0, 0, 0];
++    {
++        // SAFETY: the two blocks lie in this texture and no work has been submitted.
++        let blocks = unsafe { &mut *address };
++        blocks[..8].copy_from_slice(&sentinel);
++        blocks[8..].copy_from_slice(&sentinel);
++    }
++    let original = sampler.sample(host, &texture, true);
++    assert!(
++        original.iter().all(|&v| (v * 255.0 - 51.0).abs() < 0.01),
++        "sentinel upload: {original:?}"
++    );
++    // SAFETY: the previous list has completed and the callback waits for its storage request.
++    fill(unsafe { &mut *address });
++    let stale = sampler.sample(host, &texture, false);
++    let updated = sampler.sample(host, &texture, true);
++    assert_eq!(
++        stale, original,
++        "the skipped upload must preserve the previous GPU contents"
++    );
++
++    // The source encoder selects successive sevenths between (138,125)
++    // and (139,126). This oracle reads neither the compressed bytes nor the GPU.
++    let matches = |samples: &[f32; TEXELS]| {
++        samples
++            .iter()
++            .enumerate()
++            .filter(|(i, v)| {
++                let (x, y) = (i % 8, i / 8);
++                let block = x / 4;
++                let step = (4 * y + x % 4 + block) % 8;
++                let expected = 138.0 + block as f32 - 13.0 * step as f32 / 7.0;
++                let tolerance = if step == 0 || step == 7 { 0.01 } else { 0.75 };
++                (**v * 255.0 - expected).abs() <= tolerance
++            })
++            .count()
++    };
++    assert_eq!(matches(&stale), 0, "the reference must reject stale texels");
++    assert_eq!(
++        matches(&updated),
++        TEXELS,
++        "unexpected GPU readback: {updated:?}"
++    );
++    eprintln!("BC4 readback: 32/32 expected texels; skipped upload: 32/32 stale texels detected");
++}
+diff --git a/crates/victory-hle/Cargo.toml b/crates/victory-hle/Cargo.toml
+index e8d6baf..2d8793c 100644
+--- a/crates/victory-hle/Cargo.toml
++++ b/crates/victory-hle/Cargo.toml
+@@ -45,6 +45,7 @@ windows = { workspace = true, optional = true, features = [
+ windows-core = { workspace = true, optional = true }
+ 
+ [dev-dependencies]
++victory-gpu = { workspace = true, features = ["texture-probe"] }
+ tempfile.workspace = true
+ 
+ [features]
+diff --git a/crates/victory-hle/src/modules/dstorage.rs b/crates/victory-hle/src/modules/dstorage.rs
+index bc77285..08862d4 100644
+--- a/crates/victory-hle/src/modules/dstorage.rs
++++ b/crates/victory-hle/src/modules/dstorage.rs
+@@ -343,7 +343,7 @@ struct Lanes {
+     staging: u64,
+     /// A start waited for staging space since the last finish.
+     starved: bool,
+-    /// Weighted round robin: each class's virtual time (bytes Ã— cost), and
++    /// Weighted round robin: each class's virtual time (bytes Ãƒâ€” cost), and
+     /// the time of the last start; within a class, the lane clock of the
+     /// last start.
+     clock: [u64; 3],
+@@ -1465,6 +1465,29 @@ mod tests {
+         out
+     }
+ 
++    #[test]
++    fn streamed_bc4_texels_survive_a_real_gpu_upload() {
++        with_test_tables();
++        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&BC4_STREAM, 6);
++        let (_dir, file) = file_with(&packed);
++        let (queue, array) = (new_queue(0), status_array(1));
++        let require_hardware = std::env::var_os("PORTVI_BC4_REQUIRE_HARDWARE").is_some();
++        victory_gpu::resource::bc4_probe::run(|blocks| {
++            let mut r = request(ZLIB | (4 << 1), blocks.as_mut_ptr().cast(), 16, file, 0, packed.len());
++            r.intermediate_size = BC4_STREAM.len() as u32;
++            enqueue(queue, &r);
++            enqueue_status(queue, array, 0);
++            void(queue, 0x30);
++            assert_eq!(wait(array, 0), S_OK);
++            assert_eq!(*blocks, bc4_blocks(), "BCPack output in the console texture");
++        }, require_hardware);
++        void(queue, 0x40);
++        for object in [queue, array, file] {
++            let release: extern "system" fn(*mut c_void) -> u32 = call(object, 0x10);
++            release(object);
++        }
++    }
++
+     #[test]
+     fn bcpack_requests_unpack_into_the_destination() {
+         with_test_tables();

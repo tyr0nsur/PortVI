@@ -1,0 +1,117 @@
+diff --git a/crates/victory-gpu/src/descriptor.rs b/crates/victory-gpu/src/descriptor.rs
+index ab2875a..171f92e 100644
+--- a/crates/victory-gpu/src/descriptor.rs
++++ b/crates/victory-gpu/src/descriptor.rs
+@@ -781,6 +781,24 @@ pub(crate) extern "system" fn create_uav(
+     record(handle, view);
+ }
+ 
++/// Read the fields of a console resource description, keeping its two
++/// four-byte ABI padding slots zero before descriptor interning and lookup.
++fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
++    if desc.is_null() {
++        return None;
++    }
++    let mut fields = [0u32; 14];
++    let from = desc.cast::<u8>();
++    let to = fields.as_mut_ptr().cast::<u8>();
++    // SAFETY: a 56-byte ResourceDesc; copying bytes also permits an unaligned
++    // source. Dimension occupies bytes 0..4, alignment through flags 8..52.
++    unsafe {
++        std::ptr::copy_nonoverlapping(from, to, 4);
++        std::ptr::copy_nonoverlapping(from.add(8), to.add(8), 44);
++    }
++    Some(fields)
++}
++
+ /// Device methods 0x230 and 0x238: shader resource and unordered access
+ /// views of memory the title placed itself, `(resource desc, view desc,
+ /// handle)`.
+@@ -790,7 +808,7 @@ pub(crate) extern "system" fn create_placed_srv(
+     desc: *const [u32; 16],
+     handle: u64,
+ ) {
+-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
++    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), words(desc)) {
+         record(handle, View::Placed(false, resource, desc));
+     }
+ }
+@@ -801,7 +819,7 @@ pub(crate) extern "system" fn create_placed_uav(
+     desc: *const [u32; 16],
+     handle: u64,
+ ) {
+-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
++    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), words(desc)) {
+         record(handle, View::Placed(true, resource, desc));
+     }
+ }
+@@ -1088,6 +1106,45 @@ mod tests {
+     /// The leak of run 65: a title that writes constant buffer views and
+     /// views of placed memory at ever new addresses adds nothing to the
+     /// table; one shape stands for all the placed views alike.
++    #[cfg(windows)]
++    #[test]
++    fn placed_texture_padding_reuses_the_resource_across_views() {
++        // The runtime caches the resource for this process. Keep its aligned
++        // backing allocation alive for the same lifetime.
++        static TITLE_ADDRESS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++        let addr = *TITLE_ADDRESS.get_or_init(|| {
++            Box::leak(Box::new(crate::resource::Memory::zeroed(65536, 65536).unwrap())).address()
++        });
++        let mut srv = [0u32; 16];
++        (srv[10], srv[11]) = (addr as u32, (addr >> 32) as u32);
++        let shape = [3, 0, 0, 0, 8, 0, 4, 0x1_0001, 80, 1, 0, 0x105, 0, 0];
++        let mut padded = shape;
++        padded[1] = 0x1234_5678;
++        padded[13] = 0x9abc_def0;
++        let record = |desc: &[u32; 14], unordered: bool| {
++            let mut record = [0u64; 4];
++            let slot = record.as_mut_ptr() as u64;
++            if unordered {
++                create_placed_uav(std::ptr::null(), desc, &srv, slot);
++            } else {
++                create_placed_srv(std::ptr::null(), desc, &srv, slot);
++            }
++            view(slot).unwrap()
++        };
++        let object = |view: &View| match host::placed_texture(view) {
++            Some(View::Shader(resource, _)) => resource,
++            _ => panic!("placed texture resource missing"),
++        };
++        let first = record(&shape, false);
++        let second = record(&padded, false);
++        assert_eq!(object(&first), object(&second), "padding allocated a second resource");
++        assert_eq!(first, second);
++        assert_eq!(record(&shape, true), record(&padded, true));
++        let mut wider = padded;
++        wider[4] = 16;
++        assert_ne!(object(&first), object(&record(&wider, false)));
++    }
++
+     #[test]
+     fn views_at_new_addresses_add_no_entries() {
+         if !inline() {
+@@ -1097,7 +1154,9 @@ mod tests {
+         let slots = [0u64; 4];
+         let at = slots.as_ptr() as u64;
+         // A resource description and a view no other test uses.
+-        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
++        let mut resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
++        resource[1] = 0;
++        resource[13] = 0;
+         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
+         let mine = |v: &View| match v {
+             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
+diff --git a/crates/victory-gpu/src/resource.rs b/crates/victory-gpu/src/resource.rs
+index bda712c..4e066d3 100644
+--- a/crates/victory-gpu/src/resource.rs
++++ b/crates/victory-gpu/src/resource.rs
+@@ -108,6 +108,8 @@ pub(crate) struct AllocationInfo {
+ const _: () = assert!(size_of::<HeapProperties>() == 20);
+ const _: () = assert!(size_of::<HeapDesc>() == 48);
+ const _: () = assert!(size_of::<ResourceDesc>() == 56);
++const _: () = assert!(std::mem::offset_of!(ResourceDesc, alignment) == 8);
++const _: () = assert!(std::mem::offset_of!(ResourceDesc, flags) == 48);
+ 
+ const BUFFER: u32 = 1;
+ const TEXTURE_3D: u32 = 4;

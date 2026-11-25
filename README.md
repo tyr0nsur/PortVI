@@ -22,20 +22,24 @@ PortVI runs x86-64 console code directly on the Windows host CPU. Built on VIcto
 
 ## Development dashboard
 
-The two shader cards track one instruction, `v_med3_f32`. Each card links to its evidence or open task.
+The shader cards track one instruction, `v_med3_f32`. The texture cards track one authored 8×4 BC4 image and its skipped-upload control.
 
 <!-- verification:start -->
 <p align="center">
   <a href="probes/runtime.rs"><img src="docs/assets/progress-loader.svg" width="366" alt="Native loader probe — 2 / 2 runtime imports bound (100%)"></a>
   <a href="docs/engineering-review.md#reproduced-on-this-revision"><img src="docs/assets/progress-shader.svg" width="366" alt="Median shader · RTX 4060 — 13 / 13 test vectors matched (100%)"></a>
+  <a href="docs/engineering-review.md#bc4-storage-and-gpu-readback"><img src="docs/assets/progress-texture.svg" width="366" alt="BC4 readback · RTX 4060 — 32 / 32 streamed texels matched (100%)"></a>
+  <a href="docs/engineering-review.md#bc4-storage-and-gpu-readback"><img src="docs/assets/progress-stale.svg" width="366" alt="BC4 skipped upload — 32 / 32 stale texels detected (100%)"></a>
   <a href="https://github.com/tyr0nsur/PortVI/issues/1"><img src="docs/assets/progress-vendors.svg" width="366" alt="Median shader · vendors — 1 / 3 vendors with a passing hardware run (33%)"></a>
   <a href="https://github.com/tyr0nsur/PortVI/issues/3"><img src="docs/assets/progress-timings.svg" width="366" alt="Scene frame times — 0 / 2 cold and warm captures recorded (0%)"></a>
 </p>
 <!-- verification:end -->
 
-**Windows regression run** · 142 passed and one upstream GPU-library benchmark was ignored. The native loader probe ran separately and returned its expected exit marker of `73`. The hardware run matched all 13 `v_med3_f32` cases on an NVIDIA GeForce RTX 4060 with driver `32.0.16.2114`. [Test breakdown](docs/engineering-review.md#reproduced-on-this-revision)
+**Windows regression run** · 153 passed and one upstream GPU-library benchmark was ignored. The native loader probe ran separately and returned its expected exit marker of `73`. The hardware run matched all 13 `v_med3_f32` cases on an NVIDIA GeForce RTX 4060 with driver `32.0.16.2114`. [Test breakdown](docs/engineering-review.md#reproduced-on-this-revision)
 
-**Texture streaming** · A completed DirectStorage write now requeues overlapping texture views. Index-selected textures also get five checks for late writes from other sources. A regression covers a write that finishes after the renderer has already consumed the first notification. [Streaming tests and limits](docs/engineering-review.md#upstream-integration-on-25-november)
+**Texture streaming** · A DirectStorage request decoded two BC4 blocks directly into a console texture. The RTX 4060 matched all 32 texels after upload and detected all 32 stale texels when the upload was deliberately skipped. [Run the fixture](docs/engineering-review.md#bc4-storage-and-gpu-readback)
+
+**Texture sampling** · The translator now emits DXIL for two instructions with 16-bit texture gradients. The RTX 4060 and WARP selected the expected mip levels and texels with both 16-bit and 32-bit coordinates. [G16 tests and supported forms](docs/engineering-review.md#g16-texture-sampling)
 
 **Frame pacing** · The first scene benchmark needs paired 120-second captures with cold and warm caches. Stable 30 FPS remains unmeasured. [Capture protocol](docs/engineering-review.md#measuring-a-30-fps-target)
 
@@ -57,6 +61,7 @@ This builds `target\release\portvi.exe`, compiles the [open x64 probe](probes/ru
 | --- | --- |
 | `python portvi.py test` | Loader, shader cache, GPU library, storage queue and frame-time analysis. |
 | `python portvi.py gpu` | Executes the median shader on the physical adapter and checks its outputs. |
+| `python portvi.py texture` | Streams and samples the BC4 fixture on the physical GPU, then verifies the stale-content control. |
 | `python portvi.py build` | Builds the release executable using the pinned engine and Cargo dependencies. |
 
 <details>
@@ -78,7 +83,7 @@ $program = 'D:\samples\sample.exe'
 | Workstream | Next result we can verify | Join |
 | --- | --- | --- |
 | GPU validation | Repeat the 13 shader cases on AMD or Intel. Include the adapter, driver, commit and test output. | [Hardware reports](https://github.com/tyr0nsur/PortVI/issues/1) |
-| Texture uploads | Compare sampled BC4 texels with known values and show that skipping an upload produces a mismatch. | [Texture fixture](https://github.com/tyr0nsur/PortVI/issues/2) |
+| Texture uploads | Repeat the BC4 readback and skipped-upload control on AMD or Intel. Record the device, driver and both counts. | [Texture fixture](https://github.com/tyr0nsur/PortVI/issues/2) |
 | Frame pacing | Capture the same interactive scene twice and report displayed FPS and frame-time percentiles. | [Scene benchmark](https://github.com/tyr0nsur/PortVI/issues/3) |
 | Synchronization | Reproduce the upstream fence wakeups with this integration’s deferred submission enabled. | [Fence waits](https://github.com/tyr0nsur/PortVI/issues/4) |
 
@@ -91,7 +96,7 @@ The `engine` submodule pins the upstream revision. `prepare` prints the path of 
 
 ```powershell
 $source = python portvi.py prepare
-$patchPath = Join-Path $PWD 'patches/0012-description.patch'
+$patchPath = Join-Path $PWD 'patches/0016-description.patch'
 git -C $source diff --output=$patchPath
 python portvi.py test
 ```

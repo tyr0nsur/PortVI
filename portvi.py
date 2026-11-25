@@ -111,33 +111,44 @@ def smoke(executable, rustc, version, env):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("prepare", "build", "test", "smoke", "gpu"))
+    parser.add_argument("action", choices=("prepare", "build", "test", "smoke", "gpu", "texture"))
     args = parser.parse_args()
     source = native_tree()
     if args.action == "prepare":
         print(source)
         return
     cargo, rustc, version, env = toolchain(source)
-    if args.action == "gpu":
-        case = "emit::valu_tests::v_med3_f32_on_physical_adapter"
+    if args.action in {"gpu", "texture"}:
         env.pop("VICTORY_WARP", None)
+        env.pop("VICTORY_D3D12_WARP", None)
+        if args.action == "gpu":
+            case = "emit::valu_tests::v_med3_f32_on_physical_adapter"
+            package = ["-p", "victory-shader", "--features", "host"]
+            options = ["--ignored"]
+            evidence = ["physical adapter: "]
+        else:
+            case = "modules::dstorage::tests::streamed_bc4_texels_survive_a_real_gpu_upload"
+            package = ["-p", "victory-hle"]
+            options = []
+            env["PORTVI_BC4_REQUIRE_HARDWARE"] = "1"
+            evidence = ["BC4 adapter: ", "software=false", "32/32 expected texels", "32/32 stale texels detected"]
         result = subprocess.run([
-            cargo, version, "test", "--locked", "-p", "victory-shader", "--features", "host",
-            "--lib", case, "--", "--exact", "--ignored", "--nocapture",
+            cargo, version, "test", "--locked", *package, "--lib", case,
+            "--", "--exact", *options, "--nocapture",
         ], cwd=source, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
            text=True, errors="replace")
         print(result.stdout, end="")
         result.check_returncode()
-        if f"test {case} ... ok" not in result.stdout:
-            raise RuntimeError("The physical adapter test did not run.")
-        if "physical adapter: " not in result.stdout:
-            raise RuntimeError("The physical adapter identity was missing from the GPU result.")
+        for marker in [f"test {case} ... ok", *evidence]:
+            if marker not in result.stdout:
+                raise RuntimeError(f"Missing hardware test evidence: {marker}")
         return
     if args.action == "test":
         subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tools"],
                        cwd=ROOT, check=True)
         for package_args in (
             ["-p", "victory-gpu", "--lib", "--", "--test-threads=1"],
+            ["-p", "victory-shader", "--features", "host", "--lib", "g16", "--", "--test-threads=1"],
             ["-p", "victory-loader", "--test", "load_probe"],
             ["-p", "victory-hle", "--lib", "modules::dstorage::tests"],
         ):
