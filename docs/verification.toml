@@ -1,0 +1,28 @@
+# Each counter has a fixed scope and links to a reproduction or a tracking issue.
+[loader]
+title = "Native loader probe"
+unit = "runtime imports bound"
+verified = 2
+total = 2
+evidence = "probes/runtime.rs"
+
+[shader]
+title = "Median shader · RTX 4060"
+unit = "test vectors matched"
+verified = 13
+total = 13
+evidence = "docs/engineering-review.md#reproduced-on-this-revision"
+
+[vendors]
+title = "Median shader · vendors"
+unit = "vendors with a passing hardware run"
+verified = 1
+total = 3
+evidence = "https://github.com/tyr0nsur/PortVI/issues/1"
+
+[timings]
+title = "Scene frame times"
+unit = "cold and warm captures recorded"
+verified = 0
+total = 2
+evidence = "https://github.com/tyr0nsur/PortVI/issues/3"

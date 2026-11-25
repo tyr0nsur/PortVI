@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 240" width="1040" height="240" role="img" aria-labelledby="title desc">
+  <title id="title">PortVI</title>
+  <desc id="desc">Native x86-64 runtime for Windows. Two cargo cranes and a container ship sit against a coral sunset over the port of Miami.</desc>
+  <defs>
+    <linearGradient id="sky" x1="0%" x2="100%" y1="65%" y2="35%">
+      <stop stop-color="#0b192a"/><stop offset=".52" stop-color="#102b3c"/><stop offset="1" stop-color="#22465a"/>
+    </linearGradient>
+    <linearGradient id="sun" x1="0%" x2="0%" y1="0%" y2="100%">
+      <stop stop-color="#ffcf91"/><stop offset="1" stop-color="#fc827e"/>
+    </linearGradient>
+    <linearGradient id="rail">
+      <stop stop-color="#4ad5cc"/><stop offset=".58" stop-color="#83dae1"/><stop offset="1" stop-color="#ffad91"/>
+    </linearGradient>
+    <clipPath id="bounds"><rect width="1040" height="240" rx="15"/></clipPath>
+    <clipPath id="disc"><circle cx="812" cy="118" r="69"/></clipPath>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0v32" fill="none" stroke="#84cbd2" stroke-opacity=".10"/></pattern>
+    <g id="crane" fill="none" stroke="currentColor" stroke-linecap="square" stroke-linejoin="round">
+      <path d="M0 140l14-67h36l18 67M14 73V23l7-10h7v60m-14-50h11m1 1 53 35H-14l28-31m14-4 2 35m-37 0 21-29" stroke-width="3.5"/>
+      <path d="M-17 62h99m-68 9 12-11 13 12 12-12m1 65H7m1 0 42-52m2 52L14 76m59-14v28m5-28v28m-10 1h15" stroke-width="1.8"/>
+      <rect x="61" y="92" width="28" height="12" rx="1.4" fill="currentColor" stroke="none"/>
+    </g>
+  </defs>
+  <g clip-path="url(#bounds)">
+    <rect width="1040" height="240" fill="url(#sky)"/>
+    <path d="M530 0h510v210H486z" fill="url(#grid)"/>
+    <g clip-path="url(#disc)" fill="url(#sun)">
+      <path d="M740 48h144v91H740z M740 144h144v7H740z M740 156h144v6H740z M740 168h144v5H740z M740 180h144v6H740z"/>
+    </g>
+    <g fill="#315569">
+      <path d="M495 180h54v-8h18v8h23v-16h13v-12h4v12h9v16h12v-37h15v37h9v-21h17v21h13v-29h19v29h22v-13h18v13h20v-20h27v20h48v20H495z"/>
+      <path d="M887 180h13v-15h10v15h12v-28h13v28h20v-38h19v38h10v-21h17v21h39v23H887z"/>
+    </g>
+    <use href="#crane" transform="translate(837 66) scale(.77)" color="#456c78"/>
+    <use href="#crane" transform="translate(658 44)" color="#9bc8cb"/>
+    <use href="#crane" transform="translate(738 66) scale(.82)" color="#60929b"/>
+    <path fill="#10293b" d="M529 181h259v11h-8v16h-5v-16H568v16h-6v-16h-33z"/>
+    <path fill="#172f41" stroke="#75afba" stroke-width="1.3" d="M783 176h23v-10h135v10h28l-15 18H802z"/>
+    <g fill="#d28e80"><path d="M819 163h25v9h-25z M858 151h24v10h-24z M884 163h24v9h-24z"/></g>
+    <g fill="#6397a3"><path d="M847 163h33v9h-33z M887 151h19v9h-19z M912 163h22v9h-22z"/></g>
+    <path fill="#b0cace" d="M806 156h10v16h-10z M803 153h15v4h-15z"/>
+    <path d="M505 195h535v45H481z" fill="#102b3d"/>
+    <g fill="none" stroke-linecap="round">
+      <path d="M510 196h530" stroke="#75bac1" stroke-opacity=".65"/>
+      <path d="M563 207h56m17 0h46m98 0h26m74 0h69m28 0h58M609 218h31m20 0h15m160 0h51m27 0h19" stroke="#65a4b0" stroke-opacity=".56"/>
+      <path d="M745 200h83m15 0h23m-98 8h67m-43 8h32" stroke="#dba293" stroke-opacity=".72"/>
+    </g>
+    <text x="53" y="132" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="98" font-weight="700" letter-spacing="-5" fill="#f3f7f6">Port<tspan fill="#78e4da">VI</tspan></text>
+    <text x="58" y="175" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="24" fill="#c9dce2">Native x86-64 runtime for Windows</text>
+    <path d="M58 196h75" stroke="url(#rail)" stroke-width="3"/>
+    <rect x="1" y="1" width="1038" height="238" rx="14" fill="none" stroke="#76a5b8" stroke-opacity=".32"/>
+  </g>
+</svg>

@@ -1,0 +1,32 @@
+diff --git a/apps/victory/Cargo.toml b/apps/victory/Cargo.toml
+index 5fddd5b..d59190a 100644
+--- a/apps/victory/Cargo.toml
++++ b/apps/victory/Cargo.toml
+@@ -6,6 +6,11 @@ edition.workspace = true
+ rust-version.workspace = true
+ license.workspace = true
+ publish.workspace = true
++autobins = false
++
++[[bin]]
++name = "portvi"
++path = "src/main.rs"
+ 
+ [dependencies]
+ victory-core.workspace = true
+diff --git a/apps/victory/src/main.rs b/apps/victory/src/main.rs
+index 842ce77..03cdf2d 100644
+--- a/apps/victory/src/main.rs
++++ b/apps/victory/src/main.rs
+@@ -16,9 +16,9 @@ use clap::{Parser, Subcommand, ValueEnum};
+ 
+ #[derive(Parser)]
+ #[command(
+-    name = "victory",
++    name = "portvi",
+     version,
+-    about = "Run an Xbox Series title natively on Windows"
++    about = "PortVI runs x86-64 console programs natively on Windows"
+ )]
+ struct Cli {
+     #[command(subcommand)]

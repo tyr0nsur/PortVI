@@ -1,0 +1,50 @@
+# Native runtime engineering review
+
+25 November 2026. The baseline is LooperSalty's VIctory integration at `fd021bf`. It has a native PE loader, console services, a shader translator and a D3D12 renderer. Its commit pin lets two people run the same experiment while the upstream forks continue to change. [Baseline commit](https://github.com/LooperSalty/victory/commit/fd021bf26a7003749d668e5d9bf6b234bfab2e47)
+
+## Reproduced on this revision
+
+| Finding | Evidence | Scope |
+| --- | --- | --- |
+| Shader translations crossed configuration boundaries on disk | The same input was translated in two processes sharing a cache. With the original key, the second process requested local waves off and retrieved the first process's default result. The regression failed there and passed with the PortVI fix. | The new key includes local-wave mode, strict mesh output and strict joins. Seven process launches exercise changes, empty values and warm hits. The regression uses a tagged converter to make stale hits observable. |
+| A cache entry was also reused across GPU capability profiles | A second regression requested a 64-lane translation and received the 32-lane marker. The fix keys each translation on the effective maximum wave width and descriptor clamp. It retries if device setup changes either value while the translation runs. | Controlled profiles exercise 32 and 64 lanes, different heap limits, warm hits and a change during a cache miss. An independent D3D12 query on our physical RTX 4060 returned a minimum and maximum of 32 lanes. Our 64-lane case is synthetic. [D3D12 wave capability fields](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_feature_data_d3d12_options1) |
+| A small console program runs natively on Windows | The release CLI mapped a source-built x64 image, bound both platform functions, called its entry point and observed its exit marker of 73. | This covers loader and runtime initialization. A scene benchmark requires a separate run. |
+| One translated shader produced all 13 expected values on hardware | `python portvi.py gpu` passed on a GeForce RTX 4060 with Windows driver 32.0.16.2114. Cases include ordinary medians, negative inputs, and one, two or three NaNs. | Upstream wrote the shader cases. PortVI adds a hardware-required entry point so a software-adapter pass cannot be reported as a hardware result. A run on AMD or Intel would give a second data point. |
+| A blocking fence wait can return early | The upstream regression ran successfully and explicitly expects `E_NOTIMPL` for a future value with a null handle. D3D12 specifies that the caller waits until the value is reached. | VIctory tracked the issue and has a proposed fix. Its effect on scene timing in this integration is unmeasured. [Pinned code and test](https://github.com/LooperSalty/victory/blob/fd021bf26a7003749d668e5d9bf6b234bfab2e47/crates/victory-gpu/src/fence.rs) · [D3D12 contract](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12fence-seteventoncompletion) · [Issue 759](https://github.com/Marvisak/VIctory/issues/759) |
+
+The Windows verification run passed 113 GPU-library tests, two loader tests, 13 storage tests and two frame-time analyzer tests. The GPU library marks its `host::batch::texture_checks_per_submission` benchmark as ignored. The physical shader check and the native executable probe ran separately.
+
+For hardware reports, the GPU command queries the adapter used for the dispatch by its D3D12 device LUID and prints the model and PCI vendor/device IDs. A failed identity query invalidates a hardware result. The Windows driver version comes from the host. Each engine and patch revision has its own Cargo build directory so reports can be traced to the code under test.
+
+## What the other projects contribute
+
+**Xenia and replayable frames.** Xenia can record and replay a GPU command stream. For a compact PortVI fixture, author a dispatch that writes an indirect argument, consume it on another queue and compare the readback to predetermined bytes. The same commands, waits and expected output can move between drivers. VIctory already persists driver pipeline objects, and the main project also has shader and pipeline prebuilding. The opportunity is reproducing one failing frame and checking its output across adapters. [Xenia GPU tracing](https://github.com/xenia-project/xenia/blob/master/docs/gpu.md) · [VIctory pipeline library](https://github.com/LooperSalty/victory/blob/fd021bf26a7003749d668e5d9bf6b234bfab2e47/crates/victory-gpu/src/pipeline/library.rs) · [Upstream prebuild](https://github.com/Marvisak/VIctory/commit/9c58a1c35a384552bde9b4c9b169731f282a15a1)
+
+**xemu and hardware reference results.** The original Xbox graphics tests publish outputs produced by real hardware. The method transfers across GPU generations. For PortVI, use small programs with known outputs, keep the input and expected value public, and record GPU and driver with every comparison. The median test above is the first physical-adapter check here. The AMD descriptor-heap fix already under discussion upstream is another reason to repeat checks across vendors. [xemu graphics debugging](https://github.com/xemu-project/xemu-website/blob/master/docs/docs/dev/debug/graphics.md) · [Hardware reference results](https://github.com/abaire/nxdk_pgraph_tests_golden_results) · [Upstream AMD investigation](https://github.com/fxceless/victory-fork/pull/134)
+
+**WinDurango and service behavior.** WinDurango implements Xbox One ERA and WinRT interfaces on Windows. Its D3D11.X backend targets an earlier graphics API. Resolving a function import leaves its timing contract to verify. A program can depend on when a callback fires, a fence signals or a queued read finishes. All 13 of the pinned VIctory storage tests passed here, including completion order, error propagation and staging limits. [WinDurango](https://github.com/WinDurango/WinDurango) · [Pinned storage tests](https://github.com/LooperSalty/victory/blob/fd021bf26a7003749d668e5d9bf6b234bfab2e47/crates/victory-hle/src/modules/dstorage.rs)
+
+**Integrating the existing fence fix.** AndyLatimer's upstream PR 32 registers fences by address and tests waits satisfied by CPU signals, command-list writes and direct memory writes. Other contributors have already exercised those cases. At head `9c5328d` a dry run of its nine-file diff against the PortVI engine failed to apply in `fence.rs`, `host.rs`, `list.rs` and `queue.rs`. An integration should preserve the fork's deferred submission handling and repeat the PR's wakeup tests with it enabled. One public RTX 4090 comparison reported a device reset during loading both with and without the PR. [PR and test reports](https://github.com/Marvisak/VIctory/pull/32) · [Fork's comparison with newer upstream work](https://github.com/fxceless/victory-fork/issues/126)
+
+**Xbox2Windows and XCL give us a texture test worth building.** Xbox2Windows compares all 16,384 RGBA bytes of a 64×64 frame across native, mapped and recompiled execution. It deliberately skips an update and checks that the comparison catches the first stale pixel. An XCL contributor on a 4060 Ti separately reported requests for about 189 MB of BCPack textures with zero bytes filled. The report leaves the cause of the eventual crash open. Our storage tests compare decoded BC4 blocks in CPU memory. A next experiment would pass those known blocks through a GPU upload, sample a nonuniform texture and compare the readback to an independently calculated image. Skipping the upload once provides a negative control. This would distinguish a storage failure from a lost upload or a bad texture view. [Xbox2Windows fixtures](https://github.com/R0Y00/Xbox2Windows) · [XCL texture measurements](https://github.com/xcl-dev/xcl/issues/878)
+
+To include the default physical adapter's reported wave range with a GPU result, run these commands in an x64 Visual Studio developer shell from the project root after the first build. The probe calls Windows directly.
+
+```powershell
+cl /nologo /EHsc probes\adapter.cpp /Fotarget\adapter.obj /Fetarget\adapter.exe /link d3d12.lib dxgi.lib
+.\target\adapter.exe
+```
+
+## Measuring a 30 FPS target
+
+Run the same interactive scene for 120 seconds with the same build, driver, settings and resolution. Capture it once with a new cache directory and repeat with that directory populated. Record scene, drawn and missing work, observed visual faults and any device reset alongside the timings. A faster pass that skips geometry changes what the benchmark measures.
+
+Start PresentMon while the scene is running. Keep frame generation disabled for a native-rendering benchmark. The summarizer reports all displayed intervals and includes the frame types when PresentMon provides them. [PresentMon console options and CSV fields](https://github.com/GameTechDev/PresentMon/blob/main/README-ConsoleApplication.md)
+
+```powershell
+New-Item -ItemType Directory -Force runs | Out-Null
+PresentMon.exe --process_name portvi.exe --timed 120 --terminate_after_timed --output_file runs\warm.csv
+python tools/frametimes.py runs\warm.csv
+```
+
+Read the game window's swap chain. The tool reports its displayed FPS, 95th and 99th percentile duration, worst duration and count of undisplayed rows. Each PID and swap chain has its own summary. At 30 FPS, one frame lasts about 33.33 ms. A 30 FPS average alongside a 90 ms 99th percentile means the slowest part of the run still contains visible stalls. The local tests above contain no scene-level performance measurement.

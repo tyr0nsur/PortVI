@@ -1,0 +1,15 @@
+/.work/
+/target/
+/runs/
+/local/
+/__pycache__/
+**/__pycache__/
+*.exe
+*.dll
+*.pdb
+*.etl
+*.xvc
+*.msixvc
+*.xvd
+*.rpf
+/victory.toml
