@@ -31,7 +31,7 @@ index e04a2d4a2072122d5d9c16594178d1885607b4c8..9c03c92517fc666c23e1f83bdf7a7f3a
      /// the console's fused `v_fma_f32`/`v_fmac_f32`/`v_fma_mix*`: where it
      /// does not, their results can differ in kind (NaN where an overflowing
 diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
-index 1d4c3f20b47f2671171f16ee8dbaaef9447d0d9a..99107d9361412d17671ffb36064d61cbc68ed677 100644
+index 6b787dbd97ae89d1f6c58e89a1a8b441b525b7f9..2b2c7fd566a423e2589b30c7e0030ed79ae1ec93 100644
 --- a/crates/victory-shader/src/emit/lower.rs
 +++ b/crates/victory-shader/src/emit/lower.rs
 @@ -303,6 +303,8 @@ struct Lower<'a> {
@@ -88,7 +88,7 @@ index 1d4c3f20b47f2671171f16ee8dbaaef9447d0d9a..99107d9361412d17671ffb36064d61cb
  /// Where half `h` (dword h / 2, the high half when odd) of the parameter
  /// whose first element is in row `a` comes from, when the console packs
  /// 16-bit values two per dword: a row and channel of `elements`, none for
-@@ -611,7 +651,8 @@ impl<'a> Lower<'a> {
+@@ -628,7 +668,8 @@ impl<'a> Lower<'a> {
                      || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                      || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                      || reads_mask_as_data(x.st, i)
@@ -98,7 +98,7 @@ index 1d4c3f20b47f2671171f16ee8dbaaef9447d0d9a..99107d9361412d17671ffb36064d61cb
                  // Masks held as numbers or constant lane sets: the lane
                  // tests its own bit by its console lane.
                  let whens = x.st.exits.iter().filter_map(|e| match *e {
-@@ -751,6 +792,7 @@ impl<'a> Lower<'a> {
+@@ -768,6 +809,7 @@ impl<'a> Lower<'a> {
              },
              mask_ok: false,
              ballots: HashMap::new(),
@@ -106,7 +106,7 @@ index 1d4c3f20b47f2671171f16ee8dbaaef9447d0d9a..99107d9361412d17671ffb36064d61cb
              balloting: HashSet::new(),
              def_block: p
                  .blocks
-@@ -1682,6 +1724,13 @@ impl<'a> Lower<'a> {
+@@ -1704,6 +1746,13 @@ impl<'a> Lower<'a> {
              Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                  return self.mask_dword(v).map(Val::I32);
              }
@@ -120,7 +120,7 @@ index 1d4c3f20b47f2671171f16ee8dbaaef9447d0d9a..99107d9361412d17671ffb36064d61cb
              Some(&Val::Missing(w)) => return Err(w),
              Some(&val) => return Ok(val),
              None => {}
-@@ -1892,6 +1941,38 @@ impl<'a> Lower<'a> {
+@@ -1914,6 +1963,38 @@ impl<'a> Lower<'a> {
          Ok(if high { y } else { x })
      }
  
@@ -159,7 +159,7 @@ index 1d4c3f20b47f2671171f16ee8dbaaef9447d0d9a..99107d9361412d17671ffb36064d61cb
      /// Both dwords of a mask holding lanes that do not reach the block
      /// writing it (a complement, a copy made where EXEC is not known), so
      /// no ballot there gives it: with console lanes, the scalar operation
-@@ -3456,6 +3537,21 @@ impl<'a> Lower<'a> {
+@@ -3643,6 +3724,21 @@ impl<'a> Lower<'a> {
          };
          let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
          if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
@@ -181,7 +181,7 @@ index 1d4c3f20b47f2671171f16ee8dbaaef9447d0d9a..99107d9361412d17671ffb36064d61cb
              return Err(LANE_MASK);
          }
          if matches!(
-@@ -10731,6 +10827,23 @@ impl<'a> Lower<'a> {
+@@ -11071,6 +11167,23 @@ impl<'a> Lower<'a> {
                  let read = live.contains(&(phi.value, n));
                  let x = match (self.vals.get(&arg).copied(), bit) {
                      (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
@@ -205,7 +205,7 @@ index 1d4c3f20b47f2671171f16ee8dbaaef9447d0d9a..99107d9361412d17671ffb36064d61cb
                      // No lane from this edge reads it, or no lane comes
                      // along it at all: any value will do.
                      _ if read
-@@ -11938,4 +12051,33 @@ mod tests {
+@@ -12438,4 +12551,33 @@ mod tests {
              Err(crate::ShaderError::Unsupported { what: "GDS", .. })
          ));
      }
@@ -240,7 +240,7 @@ index 1d4c3f20b47f2671171f16ee8dbaaef9447d0d9a..99107d9361412d17671ffb36064d61cb
 +    }
  }
 diff --git a/crates/victory-shader/src/emit/synthetic_tests.rs b/crates/victory-shader/src/emit/synthetic_tests.rs
-index 004097ff3afe4b2966d1092218718de3a7b7c479..0a947a5b16806b18decdd234367d7284eb1f6c1d 100644
+index c78a67ae4ac18767d72a99b9e7aa902ba1947ce5..1d2048e7048fd46959aaa9196e4174f0d4607e44 100644
 --- a/crates/victory-shader/src/emit/synthetic_tests.rs
 +++ b/crates/victory-shader/src/emit/synthetic_tests.rs
 @@ -68,6 +68,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
@@ -251,9 +251,9 @@ index 004097ff3afe4b2966d1092218718de3a7b7c479..0a947a5b16806b18decdd234367d7284
  fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderError> {
      let wave = if wave64 { 64 } else { 32 };
      let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
-@@ -856,3 +857,297 @@ fn ordered_pixel_sections_use_rasterizer_ordered_views() {
-     };
-     assert_eq!(what, "a hardware SGPR input");
+@@ -1028,3 +1029,297 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
+     // never spinning to LOOP_LIMIT (1 << 20).
+     assert_eq!(pixels, vec![[0.0; 4], [0.0; 4], [1.0; 4], [1.0; 4]]);
  }
 +
 +// ---- Lane-mask SCC and lane masks joined with data (PR 2289) ----

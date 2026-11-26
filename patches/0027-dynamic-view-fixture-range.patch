@@ -1,0 +1,29 @@
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index 3ac72e3f71d71fa5d1da5fba5339dc012d6ce3ad..d8ab0633eef60d11b613e8ee0a7183838f1d57ce 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -702,7 +702,8 @@ impl HostHeap {
+         }
+         // SAFETY: an entry of the mapped view addresses (checked).
+         let [lo, hi] = unsafe { ((data + 16 * index as usize) as *const [u32; 2]).read_unaligned() };
+-        Some(u64::from(hi) << 32 | u64::from(lo))
++        // Word 1 also carries stride in bits 16..29.
++        Some(u64::from(hi & 0xffff) << 32 | u64::from(lo))
+     }
+ 
+     /// Makes slots `index` and `index + 1` (dynamic ones) a raw shader
+@@ -2673,10 +2674,12 @@ mod tests {
+         let Some(heap) = HostHeap::new(false, 4) else {
+             return; // no host GPU
+         };
+-        let end = heap.count() + heap.dynamic;
++        // The fixed mirror can reserve slots between the title's last
++        // descriptor and the first dynamic descriptor on this host.
++        let end = heap.base + heap.dynamic;
+         assert!(heap.view_addresses().is_some());
+         let first = heap.dynamic(2).unwrap();
+-        assert!(first >= heap.count() && first + 1 < end);
++        assert!(first >= heap.base && first + 1 < end);
+         // A buffer the title placed at 0xd_6013_e000: 16 elements of 4 bytes.
+         let address = 0xd_6013_e000u64;
+         let mut resource = [0u32; 14];

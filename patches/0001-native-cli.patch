@@ -44,3 +44,29 @@ index 8a2bdae..5345c36 100644
 +    let output = Command::new(env!("CARGO_BIN_EXE_portvi"))
          .arg("census")
          .arg(valid)
+diff --git a/apps/victory/tests/census_unreadable.rs b/apps/victory/tests/census_unreadable.rs
+index 3153398987bf231ffa5cc862889b52f2dcbcf367..60d82a5d8eb033a9321c9c91bb637372742f6eb3 100644
+--- a/apps/victory/tests/census_unreadable.rs
++++ b/apps/victory/tests/census_unreadable.rs
+@@ -47,7 +47,7 @@ fn census_reports_unreadable_files_and_continues_scanning() {
+         Some(32), // ERROR_SHARING_VIOLATION
+     );
+ 
+-    let output = Command::new(env!("CARGO_BIN_EXE_victory"))
++    let output = Command::new(env!("CARGO_BIN_EXE_portvi"))
+         .args(["census", "--strict"])
+         .args([&locked, &empty, &short, &text, &readable])
+         .output()
+diff --git a/apps/victory/tests/translate.rs b/apps/victory/tests/translate.rs
+index 644bbdc099a4c0630e358f3054d80cff8fe8ae76..c9f0c5b587a20683a8686fa877525154ad9d1c67 100644
+--- a/apps/victory/tests/translate.rs
++++ b/apps/victory/tests/translate.rs
+@@ -5,7 +5,7 @@ use std::process::Command;
+ fn translate_rejects_zero_workers() {
+     let input = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+     for extra_args in [&[][..], &["--cache"][..]] {
+-        let output = Command::new(env!("CARGO_BIN_EXE_victory"))
++        let output = Command::new(env!("CARGO_BIN_EXE_portvi"))
+             .arg("translate")
+             .arg(&input)
+             .args(["--jobs", "0"])

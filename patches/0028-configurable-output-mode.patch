@@ -1,0 +1,143 @@
+diff --git a/crates/victory-gpu/src/dxgi.rs b/crates/victory-gpu/src/dxgi.rs
+index 5f359e7e58fe00972a8236aedcc224cf41589493..959aa75b4dae7cb7fd63a63f6b4f4eccea5998f6 100644
+--- a/crates/victory-gpu/src/dxgi.rs
++++ b/crates/victory-gpu/src/dxgi.rs
+@@ -227,9 +227,44 @@ struct Mode {
+ }
+ const _: () = assert!(size_of::<Mode>() == 32);
+
+-/// The console's mode list: one 4K mode at 60 Hz (Grand Theft Auto VI looks
+-/// for a 120 Hz one to allow 120 Hz frame intervals).
+-/// shortcut: fixed mode, not the host display's; report the host's rates if
++/// The mode size reported when `VICTORY_DISPLAY_MODE` is unset or invalid.
++const DEFAULT_DISPLAY: (u32, u32) = (3840, 2160);
++/// D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION: the largest swap-chain side.
++const MAX_DISPLAY_SIDE: u32 = 16384;
++
++/// `WIDTHxHEIGHT` with both sides in 1..=16384, or `None`. Negative or
++/// overflowing values fail the `u32` parse.
++fn parse_display_mode(value: &str) -> Option<(u32, u32)> {
++    let (w, h) = value.trim().split_once(['x', 'X'])?;
++    let (w, h) = (w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?);
++    let fits = |side: u32| (1..=MAX_DISPLAY_SIDE).contains(&side);
++    (fits(w) && fits(h)).then_some((w, h))
++}
++
++/// The size of the one listed mode: `VICTORY_DISPLAY_MODE=WIDTHxHEIGHT`
++/// (opt-in, read once per process) or 3840x2160. Unlike `VICTORY_WINDOW_MAX`
++/// this changes what the title is told the display is, so a title that sizes
++/// its back buffers from the mode renders and presents at that size.
++fn display_size() -> (u32, u32) {
++    static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
++    *SIZE.get_or_init(|| {
++        let Some(value) = std::env::var_os("VICTORY_DISPLAY_MODE") else {
++            return DEFAULT_DISPLAY;
++        };
++        let Some(size) = value.to_str().and_then(parse_display_mode) else {
++            tracing::warn!(
++                ?value,
++                "ignoring invalid VICTORY_DISPLAY_MODE; expected WIDTHxHEIGHT, each 1..=16384"
++            );
++            return DEFAULT_DISPLAY;
++        };
++        tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
++        size
++    })
++}
++
++/// Lists one 60 Hz mode. Applications may query this to size their back buffers.
++/// shortcut: fixed rate, not the host display's; report the host's rates if
+ /// a title paces by them.
+ extern "system" fn modes(
+     _: This,
+@@ -238,6 +273,11 @@ extern "system" fn modes(
+     count: *mut u32,
+     out: *mut Mode,
+ ) -> HRESULT {
++    list_modes(count, out, display_size())
++}
++
++/// `modes` for a given size, so tests need not touch the environment.
++fn list_modes(count: *mut u32, out: *mut Mode, (width, height): (u32, u32)) -> HRESULT {
+     // SAFETY: the title passes its count (null is tolerated).
+     let Some(count) = (unsafe { count.as_mut() }) else {
+         return E_INVALIDARG;
+@@ -251,8 +291,8 @@ extern "system" fn modes(
+     }
+     *count = 1;
+     let mode = Mode {
+-        width: 3840,
+-        height: 2160,
++        width,
++        height,
+         refresh: [60, 1],
+         format: 0,
+         scanlines: 1, // progressive
+@@ -338,4 +378,67 @@ mod tests {
+             assert!(out.is_null(), "{method} left a stale output pointer");
+         }
+     }
++
++    #[test]
++    fn display_mode_parses_valid_and_rejects_invalid_sizes() {
++        assert_eq!(parse_display_mode("1920x1080"), Some((1920, 1080)));
++        assert_eq!(parse_display_mode(" 2560 X 1440 "), Some((2560, 1440)));
++        assert_eq!(parse_display_mode("16384x1"), Some((16384, 1)));
++        for bad in [
++            "",
++            "1920",
++            "0x1080",
++            "1920x0",
++            "-1920x1080",
++            "1920x-1080",
++            "4294967296x1080",
++            "16385x1080",
++            "1920x16385",
++            "1920x1080x1",
++            "1920*1080",
++            "widexhigh",
++        ] {
++            assert_eq!(parse_display_mode(bad), None, "{bad:?}");
++        }
++    }
++
++    type Modes = extern "system" fn(This, u32, u32, *mut u32, *mut Mode) -> HRESULT;
++
++    /// The one listed mode, after checking the count/status protocol and the
++    /// fields that never change.
++    fn listed(modes: impl Fn(*mut u32, *mut Mode) -> HRESULT) -> Mode {
++        assert_eq!(modes(std::ptr::null_mut(), std::ptr::null_mut()), E_INVALIDARG);
++        let mut count = 0;
++        assert_eq!(modes(&mut count, std::ptr::null_mut()), S_OK);
++        assert_eq!(count, 1);
++        let mut mode = std::mem::MaybeUninit::<Mode>::uninit();
++        count = 0;
++        assert_eq!(modes(&mut count, mode.as_mut_ptr()), MORE_DATA);
++        count = 4;
++        assert_eq!(modes(&mut count, mode.as_mut_ptr()), S_OK);
++        assert_eq!(count, 1);
++        // SAFETY: written by the successful call above.
++        let mode = unsafe { mode.assume_init() };
++        assert_eq!(mode.refresh, [60, 1]);
++        assert_eq!((mode.format, mode.scanlines, mode.scaling, mode.flags), (0, 1, 0, 0));
++        mode
++    }
++
++    #[test]
++    fn modes_report_the_requested_size_and_keep_the_rest() {
++        for size in [DEFAULT_DISPLAY, (1920, 1080), (16384, 16384)] {
++            let mode = listed(|count, out| list_modes(count, out, size));
++            assert_eq!((mode.width, mode.height), size);
++        }
++        assert_eq!(DEFAULT_DISPLAY, (3840, 2160));
++    }
++
++    /// The vtable slot (0xa8) lists the process's display size.
++    #[test]
++    fn output_slot_lists_the_display_size() {
++        let output: This = &OUTPUT_OBJECT;
++        let modes = slot::<Modes>(output, 0xa8);
++        let mode = listed(|count, out| modes(output, 0, 0, count, out));
++        assert_eq!((mode.width, mode.height), display_size());
++    }
+ }

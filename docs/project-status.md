@@ -1,6 +1,6 @@
 # PortVI project status
 
-Evidence from 25 November 2026. [Component baseline at `134b1bf`](https://github.com/tyr0nsur/PortVI/tree/134b1bf9b324c19c43958b62a549cfffd1451cd6)
+Updated 26 November 2026. [Component baseline at `134b1bf`](https://github.com/tyr0nsur/PortVI/tree/134b1bf9b324c19c43958b62a549cfffd1451cd6)
 
 PortVI is an experimental Windows x64 compatibility runtime built on Marvisak’s VIctory. Its public work covers native platform bindings, translation to DXIL and repeatable Direct3D 12 hardware checks.
 
@@ -11,8 +11,10 @@ PortVI is an experimental Windows x64 compatibility runtime built on Marvisak’
 | D3D12 pipeline creation | The RTX 4060 created all 36 previously blocked descriptor-read pipelines. |
 | Buffer view readback | The RTX 4060 and WARP each matched the expected address, element count and format in all 24 rewritten buffer views. |
 | Placed texture writes | The RTX 4060 and WARP matched both texels after dispatching through a placed UAV. [Fixture and results](engineering-review.md#native-engine-refresh) |
+| Null texture reads | Both the RTX 4060 and WARP returned all 4,096 expected texels in a compute dispatch. [Fixture and device checks](engineering-review.md#native-graphics-refresh-of-26-november-2026) |
+| Command-list lifetime | Both adapters passed the pipeline and root-signature retention and release fixture. |
 | Wave64 on the RTX 4060 | The split-wave first-lane fixture returned the expected thread ID in groups of 64 and 128 threads. Native and split-wave row shuffles matched 143,360 lane results. [Device tests](engineering-review.md#wave64-on-a-32-lane-gpu) |
-| Scene capture | PortVI has yet to publish a measured scene capture. Scene FPS and stability are unmeasured. |
+| Introductory sequence | A preliminary RTX 4060 capture showed partial geometry. Two 120 s runs recorded 96 and 121 successful DXGI presents. [Revision, output modes and frame times](engineering-review.md#preliminary-startup-frame-timings) |
 
 [Engineering evidence and commands](engineering-review.md#component-tests) · [Windows CI](https://github.com/tyr0nsur/PortVI/actions/workflows/windows.yml?query=branch%3Amain) · [Contribute hardware results](../CONTRIBUTING.md)
 

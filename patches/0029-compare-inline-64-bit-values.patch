@@ -1,0 +1,51 @@
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index d7296636e0b946694e31d56adc5f7aea0eb9234d..b2c671c373d18c3ba84bdb453a20fe4dd3e2ed5c 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -7075,9 +7075,9 @@ impl<'a> Lower<'a> {
+     }
+
+     /// Operand `k` of a 64-bit instruction as its low and high dwords (i32),
+-    /// as [`Self::src64`] reads it: register pairs, inline constants and a
+-    /// signed instruction's literal sign-extended, other literals and the
+-    /// null register zero-extended.
++    /// as [`Self::src64`] reads it: register pairs, inline integers and a
++    /// signed instruction's literal sign-extended, inline floats as f64,
++    /// other literals and the null register zero-extended.
+     fn src64_dwords(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
+         let Fields::Valu(v) = &inst.fields else {
+             unreachable!()
+@@ -7096,10 +7096,9 @@ impl<'a> Lower<'a> {
+             Operand::Scalar { code, .. } if code != NULL => {
+                 pair(self, Reg::S(code), Reg::S(code + 1))
+             }
+-            Operand::Const(k @ 128..=208) => {
+-                let x = crate::resource::inline(k).ok_or("a special operand")?;
+-                let hi = if (x as i32) < 0 { u32::MAX } else { 0 };
+-                Ok((self.s.m.i32(x), self.s.m.i32(hi)))
++            Operand::Const(k @ (128..=208 | 240..=248)) => {
++                let bits = crate::resource::inline64(k).ok_or("an inline constant")?;
++                Ok((self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32)))
+             }
+             Operand::Literal(x) if inst.name().ends_with("_i64") => {
+                 let hi = if (x as i32) < 0 { u32::MAX } else { 0 };
+diff --git a/crates/victory-shader/src/emit/valu_tests.rs b/crates/victory-shader/src/emit/valu_tests.rs
+index a417f1bfdb32b3d7bd0e8b243ec5b5f261478584..cbd73a785bc30c1cb5b3a2e5209a1d316bdf5b03 100644
+--- a/crates/victory-shader/src/emit/valu_tests.rs
++++ b/crates/victory-shader/src/emit/valu_tests.rs
+@@ -2398,6 +2398,15 @@ fn inline_float_constant_in_a_64_bit_operand_is_the_f64_value() {
+         ));
+     }
+
++    // A special selector still reads its scalar register. Its value is
++    // zero-extended for the 64-bit comparison.
++    for (compare, bit) in [(0xBF06_8181u32, 1), (0xBF06_8281, 0)] {
++        let mut body = vec![compare]; // s_cmp_eq_u32 1, 1 (or 2)
++        body.extend(vop3(0x0E2, 106, 253, vgpr(1), 128));
++        body.extend(vop3(0x101, 0, 128, 129, 106));
++        cases.push((format!("v_cmp_eq_u64 src_scc ({bit})"), body, [bit, 0, 0, 0], 1));
++    }
++
+     let mut wrong = Vec::new();
+     for (what, body, inputs, want) in cases {
+         let shader = build_valu_cs(&body);

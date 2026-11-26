@@ -1,5 +1,30 @@
 # Native runtime engineering review
 
+## Native graphics refresh of 26 November 2026
+
+PortVI now pins VIctory at `63bcca4` and applies 30 patches. The 72 upstream commits since `61bfc77` include a null texture SRV correction and changes to dynamic descriptors on NVIDIA. A source-built compute dispatch read all 4,096 expected values through a null texture view on an RTX 4060 and on Microsoft WARP. The test checks the selected adapter. [Engine changes](https://github.com/Marvisak/VIctory/compare/61bfc773d3296252918572921237075d8a748649...63bcca43c6a00a758510398fa43096ce7e4f7df0) · [Null SRV correction](https://github.com/Marvisak/VIctory/commit/219878a0e7754511d89306331812971bb2153f5f) · [Readback fixture](../patches/0026-null-srv-readback.patch)
+
+PortVI retains each pipeline and root-signature pair once per command list. A fixture on both adapters covers repeated and alternating binds, distinct root signatures, diagnostics names, submission and reset. The design comes from the VIctory-7900XTX contributors. [Upstream change](https://github.com/avatarmanz/VIctory-7900XTX/commit/ab86ef7) · [PortVI fixture and implementation](../patches/0025-retain-pipeline-root-pairs.patch)
+
+`VICTORY_DISPLAY_MODE=1920x1080` makes the DXGI output report one 1920 × 1080 mode at 60 Hz. The default is 3840 × 2160. For a comparison, restart the process with the same settings and cache snapshot, then record the actual dimensions from the runtime's `presenting to a window` message. Applications choose the dimensions of their submitted surfaces. The experiment follows the display-mode work in scarlett-victory-bench. [Reference revision](https://github.com/Ryanabcraft/scarlett-victory-bench/tree/95e1884698473859f99b54678e163d2025691b4b) · [Output modes and tests](../patches/0028-configurable-output-mode.patch)
+
+PortVI also carries the two-dword comparison follow-up to the inline-constant change. The integer comparison now interprets inline floating-point selectors at binary64 width, with separate coverage for the scalar condition-code selector. [Upstream discussion](https://github.com/Marvisak/VIctory/pull/1577) · [Comparison fix and fixture](../patches/0029-compare-inline-64-bit-values.patch)
+
+## Preliminary startup frame timings
+
+A native introductory sequence rendered partial, severely overexposed geometry and subtitles on a GeForce RTX 4060 8 GB, driver 621.14, with a Ryzen 7 5800X and 32 GB of RAM. The menu ran at about 30 FPS. The table covers the heavier sequence after the first bind of the same mesh pipeline in each run. Each process started with its own copy of the same settings and populated cache. [Measured PortVI revision](https://github.com/tyr0nsur/PortVI/tree/7c5be216e42e0f5b44213af0e8ca27564ce99dc1)
+
+| Reported output mode | Successful DXGI presents in 120 s | Presents/s | Median interval | p95 | p99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 3840 × 2160 | 96 | 0.80 | 1,133 ms | 2,651 ms | 3,323 ms |
+| 1920 × 1080 | 121 | 1.01 | 908 ms | 1,653 ms | 2,417 ms |
+
+A local build timestamped each successful DXGI Present return with the process monotonic clock. Percentiles use the nearest rank of consecutive returns inside each capture. Both runs created a 3840 × 2160 swap chain. A separate size trace for each setting found a 3840 × 2160 primary plane and 3840 × 2160 output on the first 18 successful presents after the common marker. Internal draw-target resolution and physical display times were not measured. A single run per setting cannot isolate the cause of the difference.
+
+The runtime's sampled windows reported median submission-to-fence waits of 687 and 604 ms and median preparation times of 321 and 199 ms respectively. Both runs continued to drop draws for missing host pipelines. Controllable gameplay, cold-cache behavior and a stable 30 FPS remain unverified.
+
+## Native graphics refresh of 25 November 2026
+
 25 November 2026. PortVI pins Marvisak’s VIctory at `61bfc77` and applies 24 patches. Five new upstream commits cover placed texture writes, lane permutations, WARP concurrency, address tracking and async cleanup. The refresh retains the previously measured loader, buffer and texture fixes. [Pinned engine](https://github.com/Marvisak/VIctory/commit/61bfc773d3296252918572921237075d8a748649) · [Previous PortVI revision](https://github.com/tyr0nsur/PortVI/tree/ab0584d4eee9b4a4587018f3e742522ef6b4c6db)
 
 ## Reproduced on this revision

@@ -22,7 +22,7 @@
 
 PortVI is an experimental Windows x64 runtime for native console software compatibility. It runs x86-64 console code directly on the Windows host CPU. It builds on Marvisak’s VIctory, binds platform calls and translates console shaders to DXIL for Direct3D 12. We verify selected results on physical hardware. [Pinned engine](https://github.com/Marvisak/VIctory/commit/61bfc773d3296252918572921237075d8a748649)
 
-**Current status.** PortVI has verified native loader and Direct3D 12 test fixtures, including hardware results on the NVIDIA GeForce RTX 4060. Scene frame times remain unmeasured. [Project status and evidence](docs/project-status.md) · [Contribute hardware results](CONTRIBUTING.md)
+**Current status.** PortVI has verified native loader and Direct3D 12 test fixtures, including hardware results on the NVIDIA GeForce RTX 4060. Two preliminary 120-second runs of an introductory sequence reached partial geometry and averaged about one present per second. [Frame times](docs/engineering-review.md#preliminary-startup-frame-timings) · [Project status and evidence](docs/project-status.md) · [Contribute hardware results](CONTRIBUTING.md)
 
 ## Development dashboard
 

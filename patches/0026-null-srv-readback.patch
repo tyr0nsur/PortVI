@@ -1,0 +1,100 @@
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index fcc9c4554047d56742e43b7e09275ee5d60db7c3..1caaad5ad6f00ddae65d94dd1105e58b0f8bcbc3 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -2832,6 +2832,95 @@ void main(uint3 id : SV_DispatchThreadID) {
+ }
+ "#;
+ 
++    /// A title's null shader view (CreateShaderResourceView with no resource
++    /// and a 2D description, which D3D12 defines as reading zeros), made in a
++    /// shader-visible heap, mirrored for a draw and read through a table:
++    /// no alias source or host texture is looked up for it, the host slot is
++    /// a null view, and the shader reads zeros on the host device.
++    #[test]
++    fn a_null_shader_view_read_through_a_table_reads_zeros() {
++        let Some(host) = crate::host::host() else {
++            return; // no host GPU here
++        };
++        let null = std::ptr::null();
++        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
++        let mut heap = null;
++        let iid = crate::object::guid(
++            0x8efb471d,
++            0x616c,
++            0x4f49,
++            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
++        );
++        assert_eq!(
++            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
++            S_OK
++        );
++        let title_heap = crate::descriptor::heap(heap);
++        // RGBA8_UNORM, Texture2D, the default mapping, one mip.
++        let mut desc = [0u32; 10];
++        desc[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
++        crate::descriptor::create_srv(null, null, &desc, title_heap.start);
++        let heap_host = title_heap.host().expect("a host view heap");
++        let view = heap_host
++            .mirror(0, title_heap.start, true)
++            .expect("the null view is recorded");
++        assert_eq!(view, View::Shader(0, Some(desc)));
++        assert_eq!(crate::resource::alias_source(null), None);
++        assert!(crate::resource::host_resource(null).is_none());
++
++        let read = compile_cs(READ);
++        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
++        // SAFETY: the mapped output, 64x64 texels of 16 bytes.
++        unsafe { std::ptr::write_bytes(data, 0xA5, 64 * 64 * 16) };
++        let list = host.new_list().unwrap();
++        readable(&list, &used(ResourceType::Srv), &view, true);
++        // SAFETY: an open list, live objects of ours.
++        unsafe {
++            list.list
++                .SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
++            list.list.SetComputeRootSignature(&read.0);
++            list.list.SetPipelineState(&read.1);
++            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
++            list.list
++                .SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
++            list.list.Dispatch(8, 8, 1);
++        }
++        list.defer_heap(&heap_host.viewed);
++        list.close();
++        host.execute(&[&list]);
++        // SAFETY: a plain device query.
++        assert!(
++            unsafe { host.device.GetDeviceRemovedReason() }.is_ok(),
++            "the device survives"
++        );
++        // SAFETY: the mapped output, written by the finished dispatch.
++        let texels = unsafe { std::slice::from_raw_parts(data as *const u32, 64 * 64 * 4) };
++        assert!(texels.iter().all(|&t| t == 0), "a null view reads zeros");
++        crate::object::release(heap);
++
++        use windows::Win32::Graphics::Dxgi::{
++            CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS,
++            IDXGIAdapter1, IDXGIFactory4,
++        };
++        // SAFETY: these queries refer to the device that ran this dispatch.
++        let adapter = unsafe {
++            let factory =
++                CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
++            let adapter: IDXGIAdapter1 = factory
++                .EnumAdapterByLuid(host.device.GetAdapterLuid())
++                .unwrap();
++            adapter.GetDesc1().unwrap()
++        };
++        let end = adapter
++            .Description
++            .iter()
++            .position(|&c| c == 0)
++            .unwrap_or(adapter.Description.len());
++        let name = String::from_utf16_lossy(&adapter.Description[..end]);
++        let software = adapter.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
++        eprintln!("null SRV readback: {name}, software={software}, 4096/4096 RGBA texels matched");
++    }
++
+     /// One texture memory written through an unordered view of a resource
+     /// object in one format and read through a placed view in another: a
+     /// castable pair shares one host texture (no copy), a pair of other
