@@ -1,0 +1,268 @@
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 051872d3d8ee7a3fb2b56c7d3c7351d0e2b62734..fcc9c4554047d56742e43b7e09275ee5d60db7c3 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -630,7 +630,8 @@ impl State {
+             && p.stages.iter().any(|s| s.memory.is_some() || has_root_views(&s.translated().host));
+         self.bind_heaps(list, memory_heap);
+         let root = p.root.as_raw() as usize;
+-        if self.host_roots[usize::from(compute)] != root {
++        let root_changed = self.host_roots[usize::from(compute)] != root;
++        if root_changed {
+             // SAFETY: an open list and a live root signature.
+             unsafe {
+                 if compute {
+@@ -643,7 +644,8 @@ impl State {
+         }
+         // By host object: a title pipeline released and another made at its
+         // address is another host pipeline (the list keeps the old one).
+-        if self.host_pipeline != p.pso.as_raw() as usize {
++        let pipeline_changed = self.host_pipeline != p.pso.as_raw() as usize;
++        if pipeline_changed {
+             // SAFETY: an open list and a live pipeline.
+             unsafe { l.SetPipelineState(&p.pso) };
+             // Also reached after the indirect clamp invalidates the pipeline.
+@@ -651,10 +653,10 @@ impl State {
+                 self.apply_depth_bounds(list);
+             }
+             self.host_pipeline = p.pso.as_raw() as usize;
+-            list.used_pipeline(&p.name);
+-            // The title may release the pipeline before it submits the list.
+-            list.keep(&p.pso);
+-            list.keep(&p.root);
++        }
++        if pipeline_changed || root_changed {
++            // A title may release either object before it submits this list.
++            list.bind_pipeline(&p.name, &p.pso, &p.root);
+         }
+         #[cfg(feature = "diagnostics")]
+         crate::capture::binding(&p.name);
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index d302dcb055897f168a4f66a08344e91cce472811..54907a47e3cb930a03a2fc3ec5bbba4cf296a47c 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -1022,6 +1022,10 @@ struct Deferred {
+     /// descriptor heaps): the title may release its objects before it
+     /// submits the list.
+     kept: Vec<windows::core::IUnknown>,
++    /// The (pipeline, root signature) pairs [`HostList::bind_pipeline`]
++    /// kept, by address. Both are in `kept` until the reset that clears
++    /// this, so no other object can take either address meanwhile.
++    bound: std::collections::HashSet<(usize, usize)>,
+     /// Buffer ranges refreshed since the last title copy (host copy,
+     /// address, bytes): refreshing them again would find the same bytes.
+     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+@@ -2079,6 +2083,22 @@ impl HostList {
+         }
+     }
+ 
++    /// Retain each pipeline and root pair until reset. Two names may refer to
++    /// the same host objects, so record every bound name for submission reports.
++    pub(crate) fn bind_pipeline(
++        &self,
++        name: &str,
++        pso: &ID3D12PipelineState,
++        root: &ID3D12RootSignature,
++    ) {
++        self.used_pipeline(name);
++        let mut deferred = self.deferred();
++        if deferred.bound.insert((pso.as_raw() as usize, root.as_raw() as usize)) {
++            deferred.kept.push(pso.clone().into());
++            deferred.kept.push(root.clone().into());
++        }
++    }
++
+     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
+         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
+     }
+@@ -3998,6 +4018,190 @@ mod batch {   // `mod tests` is already taken at the top of this file
+     }
+ }
+ 
++#[cfg(test)]
++mod pipeline_retention {
++    use super::*;
++
++    /// An empty compute shader with root signature `rs` inside; `threads`
++    /// tells pipelines apart.
++    fn compute(rs: &str, threads: u32) -> ID3DBlob {
++        let source =
++            format!("[RootSignature(\"{rs}\")] [numthreads({threads}, 1, 1)] void main() {{}}");
++        let mut code: Option<ID3DBlob> = None;
++        // SAFETY: the source and names outlive the call.
++        unsafe {
++            D3DCompile(
++                source.as_ptr().cast(),
++                source.len(),
++                s!("retention"),
++                None,
++                None,
++                s!("main"),
++                s!("cs_5_1"),
++                0,
++                0,
++                &mut code,
++                None,
++            )
++        }
++        .unwrap();
++        code.unwrap()
++    }
++
++    fn root(host: &Host, blob: &ID3DBlob) -> ID3D12RootSignature {
++        // SAFETY: a compiled shader with its root signature inside.
++        unsafe {
++            host.device.CreateRootSignature(
++                0,
++                std::slice::from_raw_parts(
++                    blob.GetBufferPointer().cast::<u8>(),
++                    blob.GetBufferSize(),
++                ),
++            )
++        }
++        .unwrap()
++    }
++
++    fn pipeline(host: &Host, blob: &ID3DBlob, root: &ID3D12RootSignature) -> ID3D12PipelineState {
++        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
++            // SAFETY: borrowed for the call.
++            pRootSignature: unsafe { std::mem::transmute_copy(root) },
++            // SAFETY: the blob's own bytes, alive for the call.
++            CS: unsafe {
++                D3D12_SHADER_BYTECODE {
++                    pShaderBytecode: blob.GetBufferPointer(),
++                    BytecodeLength: blob.GetBufferSize(),
++                }
++            },
++            ..Default::default()
++        };
++        // SAFETY: a complete description.
++        unsafe { host.device.CreateComputePipelineState(&desc) }.unwrap()
++    }
++
++    /// Strong references to `object`, not counting the one asked with.
++    fn refs(object: &impl Interface) -> u32 {
++        let unknown: windows::core::IUnknown = object.cast().unwrap();
++        // SAFETY: a balanced AddRef and Release on a live object.
++        unsafe {
++            (unknown.vtable().AddRef)(unknown.as_raw());
++            (unknown.vtable().Release)(unknown.as_raw()) - 1
++        }
++    }
++
++    fn names(list: &HostList) -> Vec<String> {
++        list.pipelines.lock().unwrap().iter().cloned().collect()
++    }
++
++    /// A list binding pipelines A, B, A with root X keeps each pair once
++    /// (one strong reference per object per pair) and names A and B once;
++    /// A bound with another root Y keeps Y too. The references last through
++    /// submission; the reset releases them all and the next binds keep
++    /// again. A pipeline the test releases before the list is submitted runs.
++    #[test]
++    fn a_list_keeps_each_bound_pipeline_and_root_once_until_reset() {
++        let Some(host) = host() else {
++            eprintln!("skipped pipeline retention: no host D3D12 device");
++            return;
++        };
++        let x_blob = compute("RootFlags(0)", 1);
++        let (x, y) = (
++            root(host, &x_blob),
++            root(
++                host,
++                &compute("RootFlags(0), RootConstants(num32BitConstants=1, b0)", 1),
++            ),
++        );
++        let (a, b) = (
++            pipeline(host, &x_blob, &x),
++            pipeline(host, &compute("RootFlags(0)", 2), &x),
++        );
++        assert_ne!(a.as_raw(), b.as_raw(), "two pipelines");
++        assert_ne!(x.as_raw(), y.as_raw(), "two root signatures");
++        let fresh = [refs(&a), refs(&b), refs(&x), refs(&y)];
++        let count = |list: &HostList| {
++            let d = list.deferred();
++            (d.kept.len(), d.bound.len())
++        };
++
++        let list = host.new_list().unwrap();
++        // SAFETY: an open list, live root signature and pipelines.
++        unsafe {
++            list.list.SetComputeRootSignature(&x);
++            for p in [&a, &b, &a] {
++                list.list.SetPipelineState(p);
++                list.list.Dispatch(1, 1, 1);
++            }
++        }
++        // Whatever recording itself holds, the list's own references on top.
++        let base = [refs(&a), refs(&b), refs(&x), refs(&y)];
++        let held = |d: [u32; 4]| {
++            [refs(&a), refs(&b), refs(&x), refs(&y)] == std::array::from_fn(|i| base[i] + d[i])
++        };
++
++        list.bind_pipeline("a", &a, &x);
++        assert!(held([1, 0, 1, 0]), "A and X kept");
++        list.bind_pipeline("b", &b, &x);
++        assert!(held([1, 1, 2, 0]), "B and X kept for B");
++        list.bind_pipeline("a", &a, &x);
++        assert!(held([1, 1, 2, 0]), "A, B, A: A not kept again");
++        assert_eq!(count(&list), (4, 2));
++        assert_eq!(names(&list), ["a", "b"]);
++        list.bind_pipeline("a", &a, &y);
++        assert!(held([2, 1, 2, 1]), "A with another root: that root kept");
++        assert_eq!(count(&list), (6, 3));
++        list.bind_pipeline("alternate", &a, &y);
++        assert_eq!(count(&list), (6, 3));
++        assert_eq!(names(&list), ["a", "alternate", "b"]);
++
++        list.close();
++        host.execute(&[&list]);
++        assert!(held([2, 1, 2, 1]), "kept through submission");
++        list.reset();
++        assert_eq!(
++            [refs(&a), refs(&b), refs(&x), refs(&y)],
++            fresh,
++            "all released at the reset"
++        );
++        assert_eq!(count(&list), (0, 0));
++        assert!(names(&list).is_empty() && list.is_empty());
++
++        // After the reset the same pair is kept and named again, and keeps a
++        // pipeline alive that the test releases before submitting.
++        let b_raw = b.as_raw() as usize;
++        // SAFETY: an open list, live root signature and pipeline.
++        unsafe {
++            list.list.SetComputeRootSignature(&x);
++            list.list.SetPipelineState(&b);
++            list.list.Dispatch(1, 1, 1);
++        }
++        list.bind_pipeline("b", &b, &x);
++        assert_eq!(count(&list), (2, 1));
++        assert_eq!(names(&list), ["b"]);
++        let before = refs(&b);
++        drop(b);
++        {
++            let deferred = list.deferred();
++            let kept_b = deferred
++                .kept
++                .iter()
++                .find(|object| object.as_raw() as usize == b_raw)
++                .expect("the list retains B");
++            assert_eq!(
++                refs(kept_b),
++                before - 1,
++                "releasing the title's reference drops one"
++            );
++        }
++        list.close();
++        host.execute(&[&list]);
++        list.reset();
++        assert_eq!(
++            [refs(&a), refs(&x), refs(&y)],
++            [fresh[0], fresh[2], fresh[3]]
++        );
++    }
++}
+ 
+ #[cfg(test)]
+ mod withholding {

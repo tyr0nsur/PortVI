@@ -1,8 +1,8 @@
 diff --git a/crates/victory-gpu/src/descriptor.rs b/crates/victory-gpu/src/descriptor.rs
-index a48e52a..1d06d04 100644
+index 1057d56423887ae502dd7d203bd921ef26bceba1..a4c6909f728d65e54177d76b9fb3e72874af35d2 100644
 --- a/crates/victory-gpu/src/descriptor.rs
 +++ b/crates/victory-gpu/src/descriptor.rs
-@@ -564,6 +564,23 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
+@@ -572,6 +572,23 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
      (!desc.is_null()).then(|| unsafe { desc.read_unaligned() })
  }
  
@@ -24,9 +24,9 @@ index a48e52a..1d06d04 100644
 +}
 +
  /// Device method.
- pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-     if let Some([lo, hi, size, _]) = words(desc) {
-@@ -603,7 +620,7 @@ pub(crate) extern "system" fn create_placed_srv(
+ ///
+ /// A null `desc` writes a null CBV (`Constant(0, 0)`), matching D3D12's
+@@ -619,7 +636,7 @@ pub(crate) extern "system" fn create_placed_srv(
      desc: *const [u32; 16],
      handle: u64,
  ) {
@@ -35,7 +35,7 @@ index a48e52a..1d06d04 100644
          record(handle, View::Placed(false, resource, desc));
      }
  }
-@@ -614,7 +631,7 @@ pub(crate) extern "system" fn create_placed_uav(
+@@ -630,7 +647,7 @@ pub(crate) extern "system" fn create_placed_uav(
      desc: *const [u32; 16],
      handle: u64,
  ) {
@@ -44,9 +44,9 @@ index a48e52a..1d06d04 100644
          record(handle, View::Placed(true, resource, desc));
      }
  }
-@@ -986,4 +1003,43 @@ pub(crate) mod tests {
-         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
-         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+@@ -1055,4 +1072,43 @@ pub(crate) mod tests {
+             assert!(queued, "the descriptor write reached the heap at the reused address");
+         }
      }
 +
 +    #[cfg(windows)]
@@ -89,7 +89,7 @@ index a48e52a..1d06d04 100644
 +    }
  }
 diff --git a/crates/victory-gpu/src/texture.rs b/crates/victory-gpu/src/texture.rs
-index 4a502c1..0bad914 100644
+index 4a502c1abdf38af90d4c6238a94c3e04fa07a699..0bad9146e46238a85292b28412e73aa834418ddd 100644
 --- a/crates/victory-gpu/src/texture.rs
 +++ b/crates/victory-gpu/src/texture.rs
 @@ -439,7 +439,7 @@ fn copies(

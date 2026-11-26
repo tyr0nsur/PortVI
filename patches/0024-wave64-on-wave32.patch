@@ -1,8 +1,8 @@
 diff --git a/apps/victory/src/main.rs b/apps/victory/src/main.rs
-index 5fae07f62c118aae8fd6ab819418afd83b6f02ff..a4d19930168a0bc5ec44ce37d6747f076fc28a64 100644
+index 04ea439e786e9da16870faf1c1dac59348c05158..c28dc53f88b6a3f333d24728278a4bbedc7b2c09 100644
 --- a/apps/victory/src/main.rs
 +++ b/apps/victory/src/main.rs
-@@ -91,6 +91,11 @@ enum Command {
+@@ -92,6 +92,11 @@ enum Command {
          /// Print one line per program and outcome.
          #[arg(long)]
          list: bool,
@@ -11,19 +11,24 @@ index 5fae07f62c118aae8fd6ab819418afd83b6f02ff..a4d19930168a0bc5ec44ce37d6747f07
 +        /// With `--pipelines`, set by the GPU that makes them.
 +        #[arg(long, conflicts_with = "cache")]
 +        wave32: bool,
-         /// Worker threads (default: every logical core).
+         /// Positive worker thread count (default: every logical core).
          #[arg(long)]
-         jobs: Option<usize>,
-@@ -181,7 +186,8 @@ fn main() -> Result<()> {
+         jobs: Option<NonZeroUsize>,
+@@ -182,12 +187,14 @@ fn main() -> Result<()> {
              list,
              jobs,
              cache: false,
--        } => translate::run(paths, validate, pipelines, list, jobs),
 +            wave32,
-+        } => translate::run(paths, validate, pipelines, list, jobs, wave32),
+         } => translate::run(
+             paths,
+             validate,
+             pipelines,
+             list,
+             jobs.map(NonZeroUsize::get),
++            wave32,
+         ),
          Command::Run {
              exe,
-             unimplemented,
 diff --git a/apps/victory/src/translate.rs b/apps/victory/src/translate.rs
 index 242ea26261c71c513d2ee092ee1e97106c682445..36cf412d0f8362a556223bff367940eed5884ab2 100644
 --- a/apps/victory/src/translate.rs
@@ -94,10 +99,10 @@ index 242ea26261c71c513d2ee092ee1e97106c682445..36cf412d0f8362a556223bff367940ee
          unsafe { std::env::remove_var("VICTORY_EMIT_DUMP") };
          assert!(
 diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
-index bf63c60859f79b02e25f22e87e09f7ab10bee916..3ab1e6fa71d03e8f53444152b3c0165b875d3424 100644
+index a5c0e2a41d5c2e3c6fd9e7a8be8eeb7c9471622e..3ac72e3f71d71fa5d1da5fba5339dc012d6ce3ad 100644
 --- a/crates/victory-gpu/src/descriptor/host.rs
 +++ b/crates/victory-gpu/src/descriptor/host.rs
-@@ -2631,7 +2631,7 @@ mod tests {
+@@ -2784,7 +2784,7 @@ mod tests {
          // SAFETY: plain queries of live heaps.
          unsafe {
              let views = victory_shader::emit::heap_views();
@@ -130,11 +135,27 @@ index 4f26969bff904e52f37a05d8e096a1e7cb47d686..90b99160d9a008ef7eb3ac67711d17ee
      let (root, pso) = host.compute_pipeline(&shader).unwrap();
      let mirror = guest_heap.host().expect("host view heap");
      let addresses = mirror.view_addresses().expect("view-address table");
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index a714f643333e63a6a9d2ff02ec72de1e92bdc45d..051872d3d8ee7a3fb2b56c7d3c7351d0e2b62734 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -3419,7 +3419,10 @@ void main(uint3 id : SV_DispatchThreadID) {
+             &st,
+             &io,
+             &res,
+-            Options { view_marks: true },
++            Options {
++                view_marks: true,
++                host_wave32: false,
++            },
+         )
+         .unwrap();
+         assert!(host_shader.view_marks);
 diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
-index 0a9b8e544ff802d6c9b8836cd8ce669f0f05fc24..eb38a5f476c9dc6daaebb55e4edc1c7ccafe479f 100644
+index 014d4b9b7adc8e46cec62913bc7e3192b02bbe84..d302dcb055897f168a4f66a08344e91cce472811 100644
 --- a/crates/victory-gpu/src/host.rs
 +++ b/crates/victory-gpu/src/host.rs
-@@ -1050,6 +1050,27 @@ impl Host {
+@@ -1081,6 +1081,27 @@ impl Host {
          })
      }
  
@@ -163,7 +184,7 @@ index 0a9b8e544ff802d6c9b8836cd8ce669f0f05fc24..eb38a5f476c9dc6daaebb55e4edc1c7c
      /// descriptor heap (translated 64-bit image atomics); logged once.
      pub(crate) fn heap_atomics64(&self) -> bool {
 diff --git a/crates/victory-gpu/src/shader_cache.rs b/crates/victory-gpu/src/shader_cache.rs
-index b3a9d1a13a10bf4e9f40c9ac37ca34fd63af113d..99bc6317791cc0e8d9a320c49b3c40ff588f4cc4 100644
+index 9ca27c0b2a4246965610291263d44909da78ad6f..3608c2dc0d8398efb5b99b51c88fa69612ffdfe4 100644
 --- a/crates/victory-gpu/src/shader_cache.rs
 +++ b/crates/victory-gpu/src/shader_cache.rs
 @@ -49,13 +49,28 @@ pub fn counts() -> (u64, u64) {
@@ -241,7 +262,7 @@ index b3a9d1a13a10bf4e9f40c9ac37ca34fd63af113d..99bc6317791cc0e8d9a320c49b3c40ff
      })
      .map_err(|e| e.to_string())
  }
-@@ -482,10 +502,15 @@ mod tests {
+@@ -527,10 +547,15 @@ mod tests {
      }
  
      /// The key's parts: a change to any of them (the translator's sources,
@@ -259,7 +280,7 @@ index b3a9d1a13a10bf4e9f40c9ac37ca34fd63af113d..99bc6317791cc0e8d9a320c49b3c40ff
          let k = key("0123456789abcdef", b"encoding", 1 << 20, OPTIONS);
          assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, OPTIONS));
          assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, OPTIONS));
-@@ -497,10 +522,35 @@ mod tests {
+@@ -542,10 +567,35 @@ mod tests {
                  victory_shader::SOURCE_HASH,
                  ENCODING,
                  victory_shader::emit::loop_limit(),
@@ -297,7 +318,7 @@ index b3a9d1a13a10bf4e9f40c9ac37ca34fd63af113d..99bc6317791cc0e8d9a320c49b3c40ff
          // Each view heap size a device makes has entries of its own.
          let (max, portable) = (
              victory_shader::emit::HEAP_VIEWS_MAX,
-@@ -511,6 +561,8 @@ mod tests {
+@@ -556,6 +606,8 @@ mod tests {
          assert_ne!(host_build(&k, (portable, portable)), host_build(&k, (portable, 721_469)));
          assert_ne!(host_build(&k, (max, max)), k);
          assert_ne!(host_build(&k, (max, max)), host_build(&key("0123456789abcdee", b"encoding", 1 << 20, OPTIONS), (max, max)));
@@ -311,6 +332,18 @@ index c099af070b657083f0263df16a5ec69e4ca80290..1b32df7698dd2d5b2e38be22221a0539
 --- a/crates/victory-shader/src/emit/bvh_tests.rs
 +++ b/crates/victory-shader/src/emit/bvh_tests.rs
 @@ -592,6 +592,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
+         outputs: Vec::new(),
+         prims: Vec::new(),
+         mesh_stride: 0,
++        host_wave32: false,
+         view_marks: false,
+     })
+     .expect("lower");
+diff --git a/crates/victory-shader/src/emit/crosslane_tests.rs b/crates/victory-shader/src/emit/crosslane_tests.rs
+index 3b1a129fb777d23891ca5889deac3b8b5cbc1978..61a9f61895ba1852529de3a24be1e084e1b49381 100644
+--- a/crates/victory-shader/src/emit/crosslane_tests.rs
++++ b/crates/victory-shader/src/emit/crosslane_tests.rs
+@@ -410,6 +410,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
          outputs: Vec::new(),
          prims: Vec::new(),
          mesh_stride: 0,
@@ -1110,7 +1143,7 @@ index 9d891ec847819d6b78daf09425872f915858c8cd..ec0d6f1b9bfdd50c98930478511e86ed
      Ok(HostShader {
          stage: HwStage::Cs,
 diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
-index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d434924c4 100644
+index e02713c48f79724360a40358667f02dab3e14572..d7296636e0b946694e31d56adc5f7aea0eb9234d 100644
 --- a/crates/victory-shader/src/emit/lower.rs
 +++ b/crates/victory-shader/src/emit/lower.rs
 @@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
@@ -1173,7 +1206,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
      /// Pixel: an ordered section (POPS), whose UAVs the host makes
      /// rasterizer-ordered views.
      pops: bool,
-@@ -614,6 +633,7 @@ impl<'a> Lower<'a> {
+@@ -631,6 +650,7 @@ impl<'a> Lower<'a> {
          x: &'a Parts<'a>,
          bad: &'a HashMap<Value, Why>,
          keep: Option<&KeptOutputs>,
@@ -1181,7 +1214,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
      ) -> Self {
          let p = x.p;
          let mut phi_at = HashMap::new();
-@@ -640,6 +660,7 @@ impl<'a> Lower<'a> {
+@@ -657,6 +677,7 @@ impl<'a> Lower<'a> {
          let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
              || insts().any(|i| i.name().starts_with("image_bvh"));
          let mut console_lanes = false;
@@ -1189,7 +1222,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
          if let StageIo::Cs(cs) = x.native.io {
              s.threads = Some(cs.threads);
              s.lds_dwords = cs.lds_bytes() / 4;
-@@ -651,6 +672,10 @@ impl<'a> Lower<'a> {
+@@ -668,6 +689,10 @@ impl<'a> Lower<'a> {
                  n.starts_with("ds_swizzle")
                      || n.contains("permute")
                      || n.starts_with("v_mbcnt")
@@ -1200,7 +1233,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
                      || matches!(n, "v_readlane_b32" | "v_writelane_b32" | "v_permlane16_b32" | "v_permlanex16_b32")
                      || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                      || reads_mask_as_data(x.st, i)
-@@ -720,9 +745,15 @@ impl<'a> Lower<'a> {
+@@ -737,9 +762,15 @@ impl<'a> Lower<'a> {
                      needs_console
                  };
              let wave = if x.native.wave64 { 64 } else { 32 };
@@ -1219,7 +1252,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
              }
          }
          let mut no_barrier = HashSet::new();
-@@ -822,6 +853,10 @@ impl<'a> Lower<'a> {
+@@ -839,6 +870,10 @@ impl<'a> Lower<'a> {
              heap: [false; 2],
              src0: None,
              console_lanes,
@@ -1230,7 +1263,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
              pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                  if db_shader_control & 1 << 16 != 0),
              root_memory,
-@@ -1269,6 +1304,7 @@ impl<'a> Lower<'a> {
+@@ -1286,6 +1321,7 @@ impl<'a> Lower<'a> {
      /// expanded gives on that wave.
      fn shape(&mut self, shape: super::wave::Shape) -> Result<V, Why> {
          use super::wave::{Op, Shape};
@@ -1238,7 +1271,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
          let (op, src, mask, ident, prefix) = match shape {
              Shape::K(k) => return Ok(self.s.m.i32(k)),
              Shape::Value(v) => return self.i32_of(v),
-@@ -1289,6 +1325,7 @@ impl<'a> Lower<'a> {
+@@ -1306,6 +1342,7 @@ impl<'a> Lower<'a> {
              Shape::Prefix(op, src, mask, ident, inclusive) => {
                  (op, src, mask, ident, Some(inclusive))
              }
@@ -1246,7 +1279,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
              Shape::Half(_, src, mask, ident, hi) => {
                  // The high half is a console lane's: compute only.
                  if self.mask_data != MaskData::Console {
-@@ -1358,6 +1395,7 @@ impl<'a> Lower<'a> {
+@@ -1375,6 +1412,7 @@ impl<'a> Lower<'a> {
          {
              return Err("a wave reduction in a mesh shader");
          }
@@ -1254,7 +1287,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
          let c = self.cur;
          let &m = self
              .x
-@@ -1451,6 +1489,9 @@ impl<'a> Lower<'a> {
+@@ -1468,6 +1506,9 @@ impl<'a> Lower<'a> {
              }
          }
          self.cur = self.s.entry;
@@ -1264,7 +1297,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
          self.find_sections();
          self.inputs()?;
          if let Some(mesh) = self.s.mesh {
-@@ -1545,6 +1586,8 @@ impl<'a> Lower<'a> {
+@@ -1562,6 +1603,8 @@ impl<'a> Lower<'a> {
              uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
              #[cfg(test)]
              has_half_wave_mask: self.s.m.has_i32_const(!31),
@@ -1273,7 +1306,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
              dxil: self.s.finish(),
              user_data,
              samplers: self.samplers,
-@@ -1965,6 +2008,7 @@ impl<'a> Lower<'a> {
+@@ -1987,6 +2030,7 @@ impl<'a> Lower<'a> {
                      Some(&b) if b == self.cur_ir => self.cur,
                      Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
                  };
@@ -1281,7 +1314,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
                  if !self.balloting.insert(lo) {
                      return Err("a lane mask whose lanes depend on its own value");
                  }
-@@ -2722,17 +2766,21 @@ impl<'a> Lower<'a> {
+@@ -2832,17 +2876,21 @@ impl<'a> Lower<'a> {
          self.s.m.bin(c, Bin::Shl, byte, three)
      }
  
@@ -1312,7 +1345,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
          let (k31, k32, one, z) = (
              self.s.m.i32(31),
              self.s.m.i32(32),
-@@ -2959,36 +3007,16 @@ impl<'a> Lower<'a> {
+@@ -3069,36 +3117,16 @@ impl<'a> Lower<'a> {
      /// thread is relabelled so that its host lane is its console lane: the
      /// flat id is the wave's first lane's, rounded down to the wave size,
      /// plus the lane index. (A bijection while each host wave holds a
@@ -1353,7 +1386,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
          let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
          Val::I32(match c {
              0 => self.s.m.bin(e, Bin::URem, f, xk),
-@@ -3239,40 +3267,10 @@ impl<'a> Lower<'a> {
+@@ -3398,40 +3426,10 @@ impl<'a> Lower<'a> {
              return Ok(());
          }
          if name == "ds_bpermute_b32" {
@@ -1395,7 +1428,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
              let reg = dst_reg.ok_or("a permute result")?;
              self.write(inst, Reg::V(reg), r, guard);
              return Ok(());
-@@ -5888,7 +5886,7 @@ impl<'a> Lower<'a> {
+@@ -6107,7 +6105,7 @@ impl<'a> Lower<'a> {
              };
              self.src0 = Some(x);
          }
@@ -1404,7 +1437,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
          self.src0 = None;
          r
      }
-@@ -5999,9 +5997,15 @@ impl<'a> Lower<'a> {
+@@ -6233,9 +6231,15 @@ impl<'a> Lower<'a> {
              }
          }
          if let Some((rows, banks)) = masks {
@@ -1422,7 +1455,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
              let ri = self.s.m.bin(c, Bin::And, ri, three);
              let bi = self.s.m.bin(c, Bin::LShr, lane, two);
              let bi = self.s.m.bin(c, Bin::And, bi, three);
-@@ -6020,7 +6024,7 @@ impl<'a> Lower<'a> {
+@@ -6254,7 +6258,7 @@ impl<'a> Lower<'a> {
          Ok((r, enable))
      }
  
@@ -1431,7 +1464,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
          let Fields::Valu(v) = &inst.fields else {
              unreachable!()
          };
-@@ -6712,6 +6716,9 @@ impl<'a> Lower<'a> {
+@@ -6946,6 +6950,9 @@ impl<'a> Lower<'a> {
                      self.s.flags |= flags::WAVE_OPS;
                  } else {
                      self.cross_lane(false)?;
@@ -1441,7 +1474,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
                  }
                  let r = self.read_lane(a, lane);
                  int(self, r)
-@@ -6727,96 +6734,12 @@ impl<'a> Lower<'a> {
+@@ -6961,96 +6968,12 @@ impl<'a> Lower<'a> {
                      None => self.s.m.i32(0),
                  };
                  self.cross_lane(false)?;
@@ -1540,7 +1573,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
              "v_readfirstlane_b32"
                  if inst
                      .writes
-@@ -6828,7 +6751,25 @@ impl<'a> Lower<'a> {
+@@ -7062,7 +6985,25 @@ impl<'a> Lower<'a> {
                  int(self, a)
              }
              "v_readfirstlane_b32" => {
@@ -1566,7 +1599,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
                  self.s.flags |= flags::WAVE_OPS;
                  let r = self.s.op(
                      c,
-@@ -7922,7 +7863,7 @@ impl<'a> Lower<'a> {
+@@ -8201,7 +8142,7 @@ impl<'a> Lower<'a> {
                  } else if self.s.mesh.is_none() {
                      self.cross_lane(false)?;
                  }
@@ -1575,7 +1608,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
                  let below = if name == "v_mbcnt_lo_u32_b32" {
                      lane
                  } else {
-@@ -11135,6 +11076,7 @@ mod tests {
+@@ -11500,6 +11441,7 @@ mod tests {
              outputs: vec![],
              prims: vec![],
              mesh_stride: 0,
@@ -1583,7 +1616,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
              view_marks: false,
          })
          .map(|_| ())
-@@ -11185,6 +11127,7 @@ mod tests {
+@@ -11550,6 +11492,7 @@ mod tests {
              outputs: vec![],
              prims: vec![],
              mesh_stride: 0,
@@ -1591,7 +1624,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
              view_marks: false,
          })
      }
-@@ -11331,6 +11274,7 @@ mod tests {
+@@ -11696,6 +11639,7 @@ mod tests {
              prims: vec![],
              mesh_stride: 0,
              view_marks: false,
@@ -1599,7 +1632,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
          })
      }
  
-@@ -11520,6 +11464,7 @@ mod tests {
+@@ -11915,6 +11859,7 @@ mod tests {
              outputs: vec![],
              prims: vec![],
              mesh_stride: 0,
@@ -1607,7 +1640,7 @@ index c7edcbf7ea32634ecbd43d7d40c99d6561028dbf..b8be9b9fbf352a4c00d32651cb1a516d
              view_marks: false,
          })
          .unwrap();
-@@ -12338,6 +12283,7 @@ mod tests {
+@@ -12838,6 +12783,7 @@ mod tests {
                  prims: vec![],
                  mesh_stride: 0,
                  view_marks: false,
@@ -2248,7 +2281,7 @@ index ff662f45ef3a2410bcffa748b54c4146bb62ec34..980cd3939f4d646c63aace55f0309dcd
  /// Blocks reached by every host lane: a fetch-inactive shuffle cannot
  /// recover registers of invocations absent from a divergent host branch.
 diff --git a/crates/victory-shader/src/emit/memory_tests.rs b/crates/victory-shader/src/emit/memory_tests.rs
-index a1587cce0919f96b18fad41c990b745e29fa33c2..28e28f032f2ab2eddc9239a66d6e88748a90ab9c 100644
+index 02972fefbf6a71e5275e14a39275ca68f3b1efc4..64f78f2a25f0711b7ce1e74ad907b6563140e8f5 100644
 --- a/crates/victory-shader/src/emit/memory_tests.rs
 +++ b/crates/victory-shader/src/emit/memory_tests.rs
 @@ -194,6 +194,7 @@ fn program() -> HostShader {
@@ -2283,8 +2316,16 @@ index a1587cce0919f96b18fad41c990b745e29fa33c2..28e28f032f2ab2eddc9239a66d6e8874
              view_marks: true,
          })
          .expect("lower")
+@@ -809,6 +813,7 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
+         outputs: Vec::new(),
+         prims: Vec::new(),
+         mesh_stride: 0,
++        host_wave32: false,
+         view_marks: false,
+     })
+     .expect("lower");
 diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
-index c3ba944d14bdcc49494d1cff1dca3a0a1b3206ee..f2bcb9aa2e995c97f0d2ce125a5e7ad139105eb5 100644
+index 5682a294c851a005f061b0636e6c77b12008f77f..4079886e1ca97e486857122cda4b435eb909dc19 100644
 --- a/crates/victory-shader/src/emit/mod.rs
 +++ b/crates/victory-shader/src/emit/mod.rs
 @@ -2,7 +2,9 @@
@@ -2298,7 +2339,7 @@ index c3ba944d14bdcc49494d1cff1dca3a0a1b3206ee..f2bcb9aa2e995c97f0d2ce125a5e7ad1
  //!
  //! What the host binds for a translated shader ([`HostShader`]):
  //!
-@@ -224,6 +226,8 @@ mod diff_tests;
+@@ -228,6 +230,8 @@ mod diff_tests;
  mod flow_tests;
  #[cfg(all(test, windows))]
  mod g16_tests;
@@ -2307,7 +2348,7 @@ index c3ba944d14bdcc49494d1cff1dca3a0a1b3206ee..f2bcb9aa2e995c97f0d2ce125a5e7ad1
  #[cfg(all(windows, any(test, feature = "host")))]
  pub mod host;
  #[cfg(all(test, windows))]
-@@ -398,6 +402,12 @@ pub struct Options {
+@@ -402,6 +406,12 @@ pub struct Options {
      /// "Write marks"); the host must then bind the view-mark table and the
      /// bitmap ([`HostShader::view_marks`]).
      pub view_marks: bool,
@@ -2320,7 +2361,7 @@ index c3ba944d14bdcc49494d1cff1dca3a0a1b3206ee..f2bcb9aa2e995c97f0d2ce125a5e7ad1
  }
  
  /// Combined vertex + primitive output byte size of an emitted mesh shader
-@@ -757,6 +767,7 @@ fn emit_pruned(
+@@ -761,6 +771,7 @@ fn emit_pruned(
          prims: prims.clone(),
          mesh_stride,
          view_marks: options.view_marks,
@@ -2328,7 +2369,7 @@ index c3ba944d14bdcc49494d1cff1dca3a0a1b3206ee..f2bcb9aa2e995c97f0d2ce125a5e7ad1
      };
      let l = match lower::lower_pruned(&parts(st, res), keep) {
          // Discarded lanes kept on as helpers can read what no surviving
-@@ -1454,7 +1465,10 @@ mod tests {
+@@ -1458,7 +1469,10 @@ mod tests {
              (out, features, flags)
          };
  
@@ -2340,7 +2381,7 @@ index c3ba944d14bdcc49494d1cff1dca3a0a1b3206ee..f2bcb9aa2e995c97f0d2ce125a5e7ad1
          for stage in [HwStage::Vs, HwStage::Ms] {
              let (out, sfi0, flags) = translate_stage(stage, marks);
              assert!(
-@@ -2618,7 +2632,10 @@ mod tests {
+@@ -2622,7 +2636,10 @@ mod tests {
          use crate::native::fixture;
          let ms = fixture::wide_mesh(128, 128, 128);
          let ps = fixture::reading_pixel(16, &[(0, 0), (0, 1), (15, 2), (15, 3)], true);
@@ -2352,7 +2393,7 @@ index c3ba944d14bdcc49494d1cff1dca3a0a1b3206ee..f2bcb9aa2e995c97f0d2ce125a5e7ad1
          let alone_ms = translate_with(&ms, options).unwrap();
          let alone_ps = translate_with(&ps, options).unwrap();
          assert_eq!(mesh_output_bytes(&alone_ms.dxil), Some(34_816));
-@@ -2658,7 +2675,10 @@ mod tests {
+@@ -2662,7 +2679,10 @@ mod tests {
      fn translate_linked_refuses_over_budget_unwritten_and_misordered_pairs() {
          use crate::native::fixture;
          let ms = fixture::wide_mesh(128, 128, 128);
@@ -2521,7 +2562,7 @@ index b387418df9399447026928712d1c43863c81f0f9..291d51b5d2c8d83fa79203d9c5353cd1
                                      }
                                  }
 diff --git a/crates/victory-shader/src/emit/semantics_tests.rs b/crates/victory-shader/src/emit/semantics_tests.rs
-index 3f98c23a8c41b08a350fa0aa37d34d310b5dc890..565cc3de5c2dcdd577409ddf27f0dfc47bfe59dd 100644
+index c347a6297c12ab19f4a5c10e026dc30abd142ee9..6c7ef90a2f403e9eb24359d50db5066071691a09 100644
 --- a/crates/victory-shader/src/emit/semantics_tests.rs
 +++ b/crates/victory-shader/src/emit/semantics_tests.rs
 @@ -292,6 +292,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
@@ -2545,7 +2586,7 @@ index 017b2f3398bb134666a07fc1827a3ddfe8982cdc..d2a2f0238d0dad2af4f38236f8c875da
      })
      .expect("lower");
 diff --git a/crates/victory-shader/src/emit/synthetic_tests.rs b/crates/victory-shader/src/emit/synthetic_tests.rs
-index 3d00d0d35259bc18496cf23372ded9a5f142f488..b73e179ee09fd336ea560d04f84368c4ace96da4 100644
+index 83cc07b6b352b47143ab0450241ab564c26cda4f..5873185463ebb4ab41c5bec959de15715de04475 100644
 --- a/crates/victory-shader/src/emit/synthetic_tests.rs
 +++ b/crates/victory-shader/src/emit/synthetic_tests.rs
 @@ -142,6 +142,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
@@ -2556,11 +2597,19 @@ index 3d00d0d35259bc18496cf23372ded9a5f142f488..b73e179ee09fd336ea560d04f84368c4
          view_marks: false,
      })
  }
+@@ -891,6 +892,7 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
+             outputs,
+             prims: Vec::new(),
+             mesh_stride: 0,
++            host_wave32: false,
+             view_marks: false,
+         })
+         .expect("lower");
 diff --git a/crates/victory-shader/src/emit/valu_tests.rs b/crates/victory-shader/src/emit/valu_tests.rs
-index 3323b044bd52e5f827872dfab502a8ccbf3dfd99..4e56c3f5eb644acbc2dd28fa8e03cf15e0d6d6d3 100644
+index d52712ef965f2c585e7fb8665eb31ebcf419fb44..a417f1bfdb32b3d7bd0e8b243ec5b5f261478584 100644
 --- a/crates/victory-shader/src/emit/valu_tests.rs
 +++ b/crates/victory-shader/src/emit/valu_tests.rs
-@@ -145,6 +145,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, crate::ShaderError> {
+@@ -155,6 +155,7 @@ fn lower_valu_cs(native: &NativeProgram) -> Result<HostShader, crate::ShaderErro
          outputs: Vec::new(),
          prims: Vec::new(),
          mesh_stride: 0,
@@ -2568,7 +2617,7 @@ index 3323b044bd52e5f827872dfab502a8ccbf3dfd99..4e56c3f5eb644acbc2dd28fa8e03cf15
          view_marks: false,
      })?;
  
-@@ -1322,6 +1323,7 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
+@@ -1758,6 +1759,7 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
          outputs: Vec::new(),
          prims: Vec::new(),
          mesh_stride: 0,

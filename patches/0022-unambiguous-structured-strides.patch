@@ -1,8 +1,8 @@
 diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
-index d76ebfbfd59703d10857cb3e71ba75d31322485c..804aebc63bd3a6cf6958e0229fa8abcc796ebc2f 100644
+index 1658ef51c1393f7a772601187751c4fac6fa7b85..e02713c48f79724360a40358667f02dab3e14572 100644
 --- a/crates/victory-shader/src/emit/lower.rs
 +++ b/crates/victory-shader/src/emit/lower.rs
-@@ -4316,10 +4316,15 @@ impl<'a> Lower<'a> {
+@@ -4523,10 +4523,15 @@ impl<'a> Lower<'a> {
                  ((kind | u, 0x409), Some(kind))
              }
              Fields::Buffer { idxen, format, .. } => {
@@ -22,7 +22,7 @@ index d76ebfbfd59703d10857cb3e71ba75d31322485c..804aebc63bd3a6cf6958e0229fa8abcc
                      (10 | u, 0x409)
                  } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
                      if uav {
-@@ -4344,7 +4349,7 @@ impl<'a> Lower<'a> {
+@@ -4551,7 +4556,7 @@ impl<'a> Lower<'a> {
                  if used.kind == ResourceType::Cbv {
                      return Err("a constant buffer's descriptor read as data");
                  }
@@ -31,7 +31,7 @@ index d76ebfbfd59703d10857cb3e71ba75d31322485c..804aebc63bd3a6cf6958e0229fa8abcc
                      0 | 1 => (11 | u, 0),
                      s if s.is_multiple_of(4) && uav => (12 | u, s),
                      s if s.is_multiple_of(4) => {
-@@ -5305,6 +5310,26 @@ impl<'a> Lower<'a> {
+@@ -5544,6 +5549,26 @@ impl<'a> Lower<'a> {
              .max_by_key(|u| u.table_offset_dwords)
      }
  
@@ -58,7 +58,7 @@ index d76ebfbfd59703d10857cb3e71ba75d31322485c..804aebc63bd3a6cf6958e0229fa8abcc
      /// A handle for the descriptor `src` read at `site`; the heap index of
      /// a texture shader view the program takes from the heap itself is noted
      /// for the instruction's read mark (handles are made once per block,
-@@ -9662,7 +9687,7 @@ impl<'a> Lower<'a> {
+@@ -9971,7 +9996,7 @@ impl<'a> Lower<'a> {
              let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
              let (h, coords, byte) = match index {
                  Some(index) => {
@@ -67,7 +67,7 @@ index d76ebfbfd59703d10857cb3e71ba75d31322485c..804aebc63bd3a6cf6958e0229fa8abcc
                      if stride < 4 || !stride.is_multiple_of(4) {
                          return Err("a structured buffer of unknown stride");
                      }
-@@ -9815,7 +9840,7 @@ impl<'a> Lower<'a> {
+@@ -10124,7 +10149,7 @@ impl<'a> Lower<'a> {
              } else {
                  match index {
                      Some(index) => {
@@ -76,7 +76,7 @@ index d76ebfbfd59703d10857cb3e71ba75d31322485c..804aebc63bd3a6cf6958e0229fa8abcc
                          if stride < 4 || !stride.is_multiple_of(4) {
                              return Err("a structured buffer of unknown stride");
                          }
-@@ -9928,7 +9953,7 @@ impl<'a> Lower<'a> {
+@@ -10237,7 +10262,7 @@ impl<'a> Lower<'a> {
                      // A structured shader view is raw on the host (module
                      // notes, "Buffer views in the heap"): the element's bytes,
                      // as the hardware addresses them.
@@ -85,7 +85,7 @@ index d76ebfbfd59703d10857cb3e71ba75d31322485c..804aebc63bd3a6cf6958e0229fa8abcc
                      if stride < 4 || !stride.is_multiple_of(4) {
                          return Err("a structured buffer of unknown stride");
                      }
-@@ -9948,7 +9973,7 @@ impl<'a> Lower<'a> {
+@@ -10257,7 +10282,7 @@ impl<'a> Lower<'a> {
                      )
                  }
                  Some(index) => {
@@ -94,13 +94,13 @@ index d76ebfbfd59703d10857cb3e71ba75d31322485c..804aebc63bd3a6cf6958e0229fa8abcc
                      if stride < 4 || !stride.is_multiple_of(4) {
                          return Err("a structured buffer of unknown stride");
                      }
-@@ -11051,6 +11076,8 @@ impl<'a> Lower<'a> {
+@@ -11411,6 +11436,8 @@ impl<'a> Lower<'a> {
  
  #[cfg(test)]
  mod tests {
 +    mod structured_strides;
 +
-     use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower, packed_half};
+     use super::{Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower, packed_half};
      use crate::native::{
          ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 diff --git a/crates/victory-shader/src/emit/lower/tests/structured_strides.rs b/crates/victory-shader/src/emit/lower/tests/structured_strides.rs

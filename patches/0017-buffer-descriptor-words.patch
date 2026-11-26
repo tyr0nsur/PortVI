@@ -1,8 +1,8 @@
 diff --git a/crates/victory-gpu/src/descriptor.rs b/crates/victory-gpu/src/descriptor.rs
-index 1d06d04..b919668 100644
+index a4c6909f728d65e54177d76b9fb3e72874af35d2..bbf37c290636ee4af55296768d53675bd42b30b1 100644
 --- a/crates/victory-gpu/src/descriptor.rs
 +++ b/crates/victory-gpu/src/descriptor.rs
-@@ -829,6 +829,9 @@ static FUNCTIONS: Table<24> = {
+@@ -845,6 +845,9 @@ static FUNCTIONS: Table<24> = {
  
  #[cfg(test)]
  pub(crate) mod tests {
@@ -13,43 +13,25 @@ index 1d06d04..b919668 100644
      /// slot), outside the heaps' lock.
      pub(crate) static WHILE_MAKING: std::sync::Mutex<Option<(u32, Work)>> = std::sync::Mutex::new(None);
 diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
-index cb39ad9..79a295f 100644
+index 7ed3969f8d7cccd1a7aad0376b657c169707f4d9..57d2b48397c9f3500ea8015ef9982e3bf6969c5d 100644
 --- a/crates/victory-gpu/src/descriptor/host.rs
 +++ b/crates/victory-gpu/src/descriptor/host.rs
-@@ -60,7 +60,7 @@ pub(crate) struct HostHeap {
+@@ -60,10 +60,10 @@ pub(crate) struct HostHeap {
      /// view there, `VIEW_MARK_NONE` for none. Mapped at the address kept
      /// beside it.
      marks: Option<(ID3D12Resource, usize)>,
--    /// Per title slot, the console descriptor's dwords 0-3 as far as the
-+    /// Per shader-visible slot, the console descriptor's dwords 0-3 as far as the
-     /// host knows them (shaders reading a descriptor as data, `crate::memory`;
+-    /// Per title slot and per dynamic slot (tables made afresh lie there,
+-    /// and shaders index the view addresses at the slots their tables are
+-    /// in), the console descriptor's dwords 0-3 as far as the host knows
+-    /// them (shaders reading a descriptor as data, `crate::memory`;
++    /// Per shader-visible slot, title and dynamic ones alike (tables made
++    /// afresh lie in dynamic slots, and shaders index the view addresses at
++    /// the slots their tables are in), the console descriptor's dwords 0-3
++    /// as far as the host knows them (shaders reading a descriptor as data, `crate::memory`;
      /// [`write_address`]): the buffer, its mapping and host address, made on
      /// first use.
-@@ -470,6 +470,7 @@ impl HostHeap {
-         }
-         self.keep(index, kept.flatten());
-         self.set_stride(index, Some(view));
-+        self.note_address(index, Some(view));
-         self.set_mark(index, mark);
-     }
- 
-@@ -527,6 +528,7 @@ impl HostHeap {
-         }
-         self.keep(index, buffer.map(|b| (b.clone(), None)));
-         self.write_stride(index, 4);
-+        self.note_address(index, None);
-         self.set_mark(index, None);
-     }
- 
-@@ -539,6 +541,7 @@ impl HostHeap {
-         }
-         self.keep(index, None);
-         self.set_stride(index, None);
-+        self.note_address(index, None);
-         self.set_mark(index, None);
-         if index < self.count {
-             self.viewed.set(index, None, false);
-@@ -619,13 +622,23 @@ impl HostHeap {
+     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
+@@ -643,25 +643,31 @@ impl HostHeap {
      /// The host address of the slots' view addresses (see the field), made
      /// on first use from the slots made so far.
      pub(crate) fn view_addresses(&self) -> Option<u64> {
@@ -60,9 +42,13 @@ index cb39ad9..79a295f 100644
 +        // replacement either enters this snapshot or updates the mapped table.
 +        let slots = self.made.lock().unwrap_or_else(|e| e.into_inner());
          let made = self.addresses.get_or_init(|| {
--            let (buffer, data) = host()?.upload_buffer(u64::from(self.count) * 16)?;
-+            let entries = self.views.max(self.base + self.dynamic);
-+            let bytes = u64::from(entries) * 16;
+             // The view is a root view, which has no bounds: an entry for
+             // every slot a table can lie in, the dynamic ones too (a table
+             // made afresh on a host whose heap is smaller than the title's
+             // read past the title slots' entries: whatever followed the
+             // buffer, or a GPU fault).
+-            let (buffer, data) = host()?.upload_buffer(u64::from(self.address_slots()) * 16)?;
++            let bytes = u64::from(self.address_slots()) * 16;
 +            let (buffer, data) = host()?.upload_buffer(bytes)?;
              crate::host::name(&buffer, || "view addresses".into());
 +            // SAFETY: this is the entire fresh mapping. Unused and reserved
@@ -76,17 +62,31 @@ index cb39ad9..79a295f 100644
 +                let view = view_at(key as u32, (key >> 32) as u32);
                  write_address(data, i, view.as_ref());
              }
+             // Dynamic slots are entered as they are made ([`Self::make_at`],
+-            // [`Self::make_null`], raw views).
+-            for i in self.count..self.address_slots() {
+-                write_address(data, i as usize, None);
+-            }
++            // [`Self::make_null`], raw views); until then they read zero.
              // SAFETY: a live buffer.
-@@ -686,6 +699,8 @@ impl HostHeap {
-         self.keep(index + 1, buffer.map(|b| (b.clone(), None)));
-         self.write_stride(index, 4);
-         self.write_stride(index + 1, 4);
-+        self.note_address(index, None);
-+        self.note_address(index + 1, None);
-         // Writes through these are title memory's, marked in its page table.
-         self.set_mark(index, None);
-         self.set_mark(index + 1, None);
-@@ -776,7 +791,6 @@ impl HostHeap {
+             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+             Some((buffer, data, gpu))
+@@ -669,10 +675,11 @@ impl HostHeap {
+         made.as_ref().map(|m| m.2)
+     }
+ 
+-    /// The slots the view addresses have an entry for: the title's and the
+-    /// dynamic ones.
++    /// The slots the view addresses have an entry for: every slot a shader
++    /// can index (indices clamped below `views`, as the stride and mark
++    /// tables cover them) and the dynamic ones, which start at `base`.
+     fn address_slots(&self) -> u32 {
+-        self.count + self.dynamic
++        self.views.max(self.base + self.dynamic)
+     }
+ 
+     /// Slot `index` now holds `view` (or no view): its view address.
+@@ -835,7 +842,6 @@ impl HostHeap {
              if made[index as usize] != 0 {
                  made[index as usize] = 0;
                  self.make_null(index);
@@ -94,29 +94,33 @@ index cb39ad9..79a295f 100644
              }
              return None;
          };
-@@ -1092,15 +1106,13 @@ fn srv_alignment(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC, element: u64) -> u64 {
- }
+@@ -1173,17 +1179,15 @@ fn srv_alignment(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC, element: u64) -> u64 {
  
- /// Writes slot `index`'s words into the view addresses at `data`, 16 bytes
--/// a slot: a buffer view's title address (dword 0 low, dword 1 bits 0-15
+ /// Writes slot `index`'s words into the view addresses at `data` (the
+ /// caller keeps `index` below [`HostHeap::address_slots`]), 16 bytes a
+-/// slot: a buffer view's title address (dword 0 low, dword 1 bits 0-15
 -/// high), a texture view's size fields ([`texture_words`]), zeros for
 -/// anything else.
-+/// a slot: a texture view's size fields ([`texture_words`]), a buffer
-+/// view's buffer descriptor fields ([`BufferView::words`]), zeros for
-+/// anything else (and for a buffer view whose range the host cannot tell).
++/// slot: a texture view's size fields ([`texture_words`]), a buffer view's
++/// buffer descriptor fields ([`BufferView::words`]), zeros for anything
++/// else (and for a buffer view whose range the host cannot tell).
  fn write_address(data: usize, index: usize, view: Option<&View>) {
 -    let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
 -    let words = match view.and_then(texture_words) {
 -        Some(words) => words,
 -        None => [address as u32, (address >> 32) as u32 & 0xFFFF, 0, 0],
 -    };
+-    // SAFETY: the mapped view addresses hold 16 bytes per title and dynamic
+-    // slot (below `address_slots`).
 +    let words = view
 +        .and_then(|v| texture_words(v).or_else(|| buffer_view(v).map(|b| b.words())))
 +        .unwrap_or([0; 4]);
-     // SAFETY: the mapped view addresses hold 16 bytes per title slot.
++    // SAFETY: the mapped view addresses hold 16 bytes per shader-visible
++    // and dynamic slot (below `address_slots`).
      unsafe { ((data + 16 * index) as *mut [u32; 4]).write_unaligned(words) };
  }
-@@ -1170,36 +1182,168 @@ fn image_words(resource: &[u32; 14], desc: Option<&[u32; 10]>, unordered: bool)
+ 
+@@ -1252,36 +1256,168 @@ fn image_words(resource: &[u32; 14], desc: Option<&[u32; 10]>, unordered: bool)
      ]
  }
  
@@ -310,7 +314,7 @@ index cb39ad9..79a295f 100644
  }
  
  /// The host copy a buffer view's bytes are in (the one its host view
-@@ -1216,24 +1360,6 @@ pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Sh
+@@ -1298,24 +1434,6 @@ pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Sh
      Some((shadow, address, len))
  }
  
@@ -335,7 +339,7 @@ index cb39ad9..79a295f 100644
  /// The host resource a slot made by [`make`] views, if any, and the view's
  /// own copy of title memory ([`crate::shadow::for_view`]): the slot holds
  /// it, so that draws reading the view find and refresh that copy.
-@@ -2131,6 +2257,179 @@ mod tests {
+@@ -2246,6 +2364,179 @@ mod tests {
          assert!(raw_structured(&mut view(u64::MAX, 1, 12)).is_none());
      }
  
@@ -515,9 +519,54 @@ index cb39ad9..79a295f 100644
      /// The world's 16-byte view of 0 elements removed the device.
      #[test]
      fn empty_and_overlong_buffer_views_are_refused() {
+@@ -2347,9 +2638,12 @@ mod tests {
+         heap.raw_pair_at(first, None, 0);
+         assert_eq!(heap.address_at(first), Some(0), "a view pair");
+         assert_eq!(heap.address_at(first + 1), Some(0), "a view pair");
+-        // Slots past the dynamic ones (host copies' view pairs) have no
+-        // entry, and nothing is written past the last: a mark there (the
+-        // buffer's allocation reaches past it) stays.
++        // Every slot a shader can index has an entry (host copies' view
++        // pairs and the null slots too, below `views`); nothing is written
++        // past the last: a mark there (the buffer's allocation reaches past
++        // it) stays.
++        assert!(heap.address_slots() >= end);
++        let end = heap.address_slots();
+         assert_eq!(heap.address_at(end), None);
+         let host = host().unwrap();
+         let (buffer, data, _) = heap.addresses.get().unwrap().as_ref().unwrap();
+@@ -2360,14 +2654,20 @@ mod tests {
+             (desc, info.SizeInBytes)
+         };
+         assert_eq!(desc.Width, 16 * u64::from(end));
+-        assert!(size >= desc.Width + 8, "room for the mark");
+-        let past = (data + 16 * end as usize) as *mut u64;
+-        let mark = 0x5a5a_5a5a_5a5a_5a5a;
+-        // SAFETY: mapped memory of the buffer's allocation (checked).
+-        unsafe { past.write_unaligned(mark) };
+-        heap.note_address(end, Some(&view));
+-        // SAFETY: as above.
+-        assert_eq!(unsafe { past.read_unaligned() }, mark);
++        // A table of every shader-visible slot may end on an allocation
++        // boundary: the mark needs room past it.
++        if size >= desc.Width + 8 {
++            let past = (data + 16 * end as usize) as *mut u64;
++            let mark = 0x5a5a_5a5a_5a5a_5a5a;
++            // SAFETY: mapped memory of the buffer's allocation (checked).
++            unsafe { past.write_unaligned(mark) };
++            heap.note_address(end, Some(&view));
++            // SAFETY: as above.
++            assert_eq!(unsafe { past.read_unaligned() }, mark);
++        } else {
++            // Nothing to observe; it must still not write (or fault).
++            heap.note_address(end, Some(&view));
++        }
+         // SAFETY: a plain device query.
+         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+     }
 diff --git a/crates/victory-gpu/src/descriptor/tests/buffer_data.rs b/crates/victory-gpu/src/descriptor/tests/buffer_data.rs
 new file mode 100644
-index 0000000..c1d38cf
+index 0000000000000000000000000000000000000000..c1d38cfa1b32fc1a195267d45294ca99f1f784cc
 --- /dev/null
 +++ b/crates/victory-gpu/src/descriptor/tests/buffer_data.rs
 @@ -0,0 +1,283 @@
@@ -805,19 +854,19 @@ index 0000000..c1d38cf
 +    victory_shader::emit::emit(&signatures, &native, &ir, &st, &io, &res).unwrap()
 +}
 diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
-index 3e8e0ef..5270ae1 100644
+index b13c77d4088ea1d25621482fa23a72db83318806..a714f643333e63a6a9d2ff02ec72de1e92bdc45d 100644
 --- a/crates/victory-gpu/src/draw.rs
 +++ b/crates/victory-gpu/src/draw.rs
-@@ -693,7 +693,7 @@ impl State {
-         for stage in &p.stages {
-             let t = stage.translated();
-             self.table_failed = false;
+@@ -713,7 +713,7 @@ impl State {
+                     .host()
+                     .and_then(|h| h.view_addresses());
+             }
 -            let made = self.tables(list, &t.used, compute);
 +            let made = self.tables(list, &t.used, compute, t.host.view_addresses);
              // A depth copy of ours made readable a texture the tables hold
              // (`crate::twin`), with a compute pipeline: this one's again
              // (root arguments are set below).
-@@ -1199,7 +1199,7 @@ impl State {
+@@ -1253,7 +1253,7 @@ impl State {
      ///
      /// Within a list, the same table holding the same descriptors is made
      /// once.
@@ -826,7 +875,7 @@ index 3e8e0ef..5270ae1 100644
          let tables = |u: &&UsedResource| u.root == RootType::Table;
          let mut fresh: Vec<u8> = Vec::new();
          // Tables reaching past a host heap smaller than the title's (the
-@@ -1248,11 +1248,18 @@ impl State {
+@@ -1302,11 +1302,18 @@ impl State {
              };
              let (start, end) = fresh_range(entries.iter().map(|u| u.table_offset_dwords / 8), host.count());
              let n = end - start;
@@ -846,18 +895,18 @@ index 3e8e0ef..5270ae1 100644
                  for k in start..end {
                      let at = table + u64::from(k) * 32;
                      // SAFETY: a descriptor slot in title memory.
-@@ -1980,6 +1987,8 @@ fn fresh_range(entries: impl Iterator<Item = u32> + Clone, mirrored: u32) -> (u3
+@@ -2038,6 +2045,8 @@ fn fresh_range(entries: impl Iterator<Item = u32> + Clone, mirrored: u32) -> (u3
  
  #[cfg(test)]
  mod tests {
 +    mod descriptor_counts;
 +
      use super::*;
-     use crate::object::{HRESULT, S_OK};
-     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+ 
+     /// A root signature that indexes the heaps directly needs one of each
 diff --git a/crates/victory-gpu/src/draw/tests/descriptor_counts.rs b/crates/victory-gpu/src/draw/tests/descriptor_counts.rs
 new file mode 100644
-index 0000000..db50bc8
+index 0000000000000000000000000000000000000000..db50bc8a44688bfa3b13f727690d16d1f7316b8c
 --- /dev/null
 +++ b/crates/victory-gpu/src/draw/tests/descriptor_counts.rs
 @@ -0,0 +1,128 @@
@@ -990,10 +1039,10 @@ index 0000000..db50bc8
 +    assert_eq!([initial, rewritten], [[37, 37, 19, 11], [13, 37, 20, 28]]);
 +}
 diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
-index 1022cb7..2c824ee 100644
+index 7fde94a650a03671be4986a614aa42f11844c9ce..4675513f48f6b1b01b69691a3a622a215e302bc0 100644
 --- a/crates/victory-shader/src/emit/lower.rs
 +++ b/crates/victory-shader/src/emit/lower.rs
-@@ -4757,43 +4757,62 @@ impl<'a> Lower<'a> {
+@@ -4996,43 +4996,62 @@ impl<'a> Lower<'a> {
  
      /// A descriptor load from a table or heap whose dwords the program only
      /// reads as numbers: the base address of a buffer view (dwords 0 and 1,
@@ -1080,7 +1129,7 @@ index 1022cb7..2c824ee 100644
              if let Some(v) = inst.write(Reg::S(code + k as u8)) {
                  self.vals.insert(v, val);
 diff --git a/crates/victory-shader/src/emit/memory_tests.rs b/crates/victory-shader/src/emit/memory_tests.rs
-index c228e98..2942b94 100644
+index 9224518fe161aff2015f828f4b51eab47ce63e01..2a1e92429ae5847a80937d4684e85fb50469a6c6 100644
 --- a/crates/victory-shader/src/emit/memory_tests.rs
 +++ b/crates/victory-shader/src/emit/memory_tests.rs
 @@ -81,6 +81,8 @@ fn program() -> HostShader {

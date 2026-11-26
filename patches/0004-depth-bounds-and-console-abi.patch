@@ -1,5 +1,5 @@
 diff --git a/crates/victory-gpu/src/device.rs b/crates/victory-gpu/src/device.rs
-index ce1cad1..27cdbaf 100644
+index ce1cad194a42f41421bc25ba3100c34607bfd853..27cdbafd6b5b1bdff7690efb1f834badbf9f9228 100644
 --- a/crates/victory-gpu/src/device.rs
 +++ b/crates/victory-gpu/src/device.rs
 @@ -600,4 +600,23 @@ mod tests {
@@ -26,93 +26,8 @@ index ce1cad1..27cdbaf 100644
 +        assert_eq!(reason(device), expected);
 +    }
  }
-diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
-index c5e5840..a2bfb39 100644
---- a/crates/victory-gpu/src/draw.rs
-+++ b/crates/victory-gpu/src/draw.rs
-@@ -101,6 +101,7 @@ struct Fixed {
-     scissors: Option<Vec<RECT>>,
-     blend_factor: Option<Option<[f32; 4]>>,
-     stencil_ref: Option<u32>,
-+    depth_bounds: Option<(f32, f32)>,
-     /// Render target and depth view handles.
-     targets: Option<(Vec<u64>, u64)>,
-     topology: bool,
-@@ -291,17 +292,28 @@ impl State {
-         unsafe { list.list.OMSetStencilRef(reference) };
-     }
- 
-+    /// Set depth bounds and keep them for the next command-list segment.
-+    pub(crate) fn depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
-+        if crate::host::host().is_some_and(|host| host.depth_bounds())
-+            && let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>()
-+        {
-+            self.fixed.depth_bounds = Some((min, max));
-+            // SAFETY: an open list on a device supporting depth bounds.
-+            unsafe { list1.OMSetDepthBounds(min, max) };
-+        }
-+    }
-+
-     /// The title list goes on in a fresh host list (a segment after a wait,
-     /// `crate::list`): the state it set is given to `list` again.
-     ///
-     /// Replayed: topology, viewports, scissors, blend factor, stencil
--    /// reference, render targets and depth (set at once); heaps, root
-+    /// reference, depth bounds, render targets and depth (set at once); heaps, root
-     /// signatures, pipelines, root arguments, vertex and index buffers are
-     /// set by the next draw or dispatch from what this state holds (the
-     /// host caches are cleared). Made again in the new segment, so their
-     /// submission-time work (refreshes, uploads) runs with it: fresh tables,
-     /// root views and the title-memory page table. Not replayed, as nothing
--    /// of it is on the host list: depth bounds and shading rate (ignored),
-+    /// of it is on the host list: shading rate (ignored),
-     /// queries (resolved with plain values), the 0x4a0 upload memory (the
-     /// title list's own), texture states and twins (each segment has its
-     /// own, made from the real states at its submission). Clears and copies
-@@ -327,6 +339,9 @@ impl State {
-         if let Some(s) = fixed.stencil_ref {
-             self.stencil_ref(list, s);
-         }
-+        if let Some((min, max)) = fixed.depth_bounds {
-+            self.depth_bounds(list, min, max);
-+        }
-         if let Some((targets, depth)) = &fixed.targets {
-             self.set_targets(list, targets, *depth);
-         }
-diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
-index 17852d8..f6f2dac 100644
---- a/crates/victory-gpu/src/host.rs
-+++ b/crates/victory-gpu/src/host.rs
-@@ -1073,6 +1073,27 @@ impl Host {
-         })
-     }
- 
-+    /// Whether the host GPU supports the depth bounds test; logged once.
-+    pub(crate) fn depth_bounds(&self) -> bool {
-+        static BOUNDS: OnceLock<bool> = OnceLock::new();
-+        *BOUNDS.get_or_init(|| {
-+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
-+            // SAFETY: the query writes the structure of the given size.
-+            let ok = unsafe {
-+                self.device
-+                    .CheckFeatureSupport(
-+                        D3D12_FEATURE_D3D12_OPTIONS2,
-+                        (&raw mut options).cast(),
-+                        size_of_val(&options) as u32,
-+                    )
-+                    .is_ok()
-+            };
-+            let supported = ok && options.DepthBoundsTestSupported.as_bool();
-+            tracing::info!(supported, "host depth bounds support");
-+            supported
-+        })
-+    }
-+
-     /// A new list, open for recording.
-     pub(crate) fn new_list(&self) -> windows::core::Result<HostList> {
-         // SAFETY: plain object creation.
 diff --git a/crates/victory-gpu/src/list.rs b/crates/victory-gpu/src/list.rs
-index a16d61c..24793dc 100644
+index 1a8f93df0d6af25b39b901d829d56b050342770c..d88094cd535ce86e721f28576075807ac01787a8 100644
 --- a/crates/victory-gpu/src/list.rs
 +++ b/crates/victory-gpu/src/list.rs
 @@ -1319,7 +1319,7 @@ pub(crate) static UPLOADS: [std::sync::atomic::AtomicU64; 2] =
@@ -124,35 +39,15 @@ index a16d61c..24793dc 100644
  /// arguments, nothing returned.
  extern "system" fn ignored_state(_: This) {}
  
-@@ -1361,6 +1361,10 @@ mod state {
+@@ -1368,6 +1368,7 @@ mod state {
      pub(super) extern "system" fn stencil_ref(this: This, reference: u32) {
          with_state(this, |list, s| s.stencil_ref(list, reference));
      }
 +    /// `OMSetDepthBounds(min, max)`.
-+    pub(super) extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
-+        with_state(this, |list, s| s.depth_bounds(list, min, max));
-+    }
      pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
          with_state(this, |_, s| s.set_heaps(items(heaps, count)));
      }
-@@ -1556,6 +1560,7 @@ mod state {
-     pub(super) use super::ignored_state as compute_constants;
-     pub(super) use super::ignored_state as compute_table;
-     pub(super) use super::ignored_state as compute_view;
-+    pub(super) use super::ignored_state as depth_bounds;
-     pub(super) use super::ignored_state as graphics_constant;
-     pub(super) use super::ignored_state as graphics_constants;
-     pub(super) use super::ignored_state as graphics_table;
-@@ -1772,7 +1777,7 @@ const METHODS: [(usize, *const ()); 52] = [
-     (52, clear_rtv as *const ()),                 // 0x1a0
-     (59, execute_indirect as *const ()),          // 0x1d8 indirect
-     (60, copy_memory as *const ()),               // 0x1e0
--    (68, ignored_state as *const ()),             // 0x220 depth bounds
-+    (68, state::depth_bounds as *const ()),       // 0x220 depth bounds (newer: 0x230)
-     (69, write32 as *const ()),                   // 0x228
-     (70, write64 as *const ()),                   // 0x230
-     (71, wait32 as *const ()),                    // 0x238 (newer 0x248)
-@@ -1963,6 +1968,17 @@ mod tests {
+@@ -1978,6 +1979,17 @@ mod tests {
          }
      }
  
@@ -160,7 +55,7 @@ index a16d61c..24793dc 100644
 +    /// (where older lists have the 64-bit write); both reach the host list.
 +    #[test]
 +    fn depth_bounds_have_their_slot_in_both_layouts() {
-+        let bounds = state::depth_bounds as *const ();
++        let bounds = super::depth_bounds as *const ();
 +        assert_eq!(LIST_FUNCTIONS.0[0x220 / 8], bounds);
 +        assert_eq!(NEWER_LIST_FUNCTIONS.0[0x230 / 8], bounds);
 +        assert_eq!(LIST_FUNCTIONS.0[0x230 / 8], write64 as *const ());
@@ -170,7 +65,7 @@ index a16d61c..24793dc 100644
      #[test]
      fn every_inline_command_falls_back_to_the_table() {
          let null = std::ptr::null();
-@@ -2031,4 +2047,46 @@ mod tests {
+@@ -2046,4 +2058,46 @@ mod tests {
              assert_eq!(release(object), 0);
          }
      }
@@ -218,357 +113,14 @@ index a16d61c..24793dc 100644
 +    }
  }
 diff --git a/crates/victory-gpu/src/pipeline/host.rs b/crates/victory-gpu/src/pipeline/host.rs
-index f6c566a..478d3b4 100644
+index 354fc721aedf0339953005bc9ca0527e64ff2c4c..a259379237a7822c164b8d63ae0729b8f28c4b4e 100644
 --- a/crates/victory-gpu/src/pipeline/host.rs
 +++ b/crates/victory-gpu/src/pipeline/host.rs
-@@ -24,6 +24,8 @@ pub(crate) struct GraphicsState {
-     sample_mask: u32,
-     rasterizer: D3D12_RASTERIZER_DESC,
-     depth: D3D12_DEPTH_STENCIL_DESC,
-+    /// `DepthBoundsTestEnable` of a `DEPTH_STENCIL1` subobject.
-+    depth_bounds: bool,
-     /// Input elements, their names pointing into `names`.
-     inputs: Vec<D3D12_INPUT_ELEMENT_DESC>,
-     names: Vec<CString>,
-@@ -75,6 +77,7 @@ impl Default for GraphicsState {
-                 BackFace: keep,
-                 ..Default::default()
-             },
-+            depth_bounds: false,
-             inputs: Vec::new(),
-             names: Vec::new(),
-             strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
-@@ -103,12 +106,13 @@ impl GraphicsState {
-                 8 => self.blend = data.cast::<D3D12_BLEND_DESC>().read_unaligned(),
-                 9 => self.sample_mask = data.cast::<u32>().read_unaligned(),
-                 10 => self.rasterizer = data.cast::<D3D12_RASTERIZER_DESC>().read_unaligned(),
--                11 => self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned(),
-+                11 => {
-+                    self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned();
-+                    self.depth_bounds = false;
-+                }
-                 21 => {
--                    // shortcut: the depth bounds test is dropped (the host
--                    // pipeline uses the plain description); bring it back
--                    // with a stream if a title enables it.
-                     let d = data.cast::<D3D12_DEPTH_STENCIL_DESC1>().read_unaligned();
-+                    self.depth_bounds = d.DepthBoundsTestEnable.as_bool();
-                     self.depth = D3D12_DEPTH_STENCIL_DESC {
-                         DepthEnable: d.DepthEnable,
-                         DepthWriteMask: d.DepthWriteMask,
-@@ -183,8 +187,15 @@ impl GraphicsState {
-                 )
-             })
-             .collect();
-+        // Only pipelines with the test get a new name: the others keep
-+        // theirs in the library and in early-start keys.
-+        let bounds = if self.depth_bounds {
-+            " depth-bounds-v2"
-+        } else {
-+            ""
-+        };
-         format!(
--            "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}",
-+            "{:?} {} {:?} {:?}{bounds} {inputs:?} {} {} {:?} {} {:?}",
-             self.blend,
-             self.sample_mask,
-             self.rasterizer,
-@@ -197,6 +208,30 @@ impl GraphicsState {
-         )
-     }
- 
-+    /// The host's `DEPTH_STENCIL1` for a pipeline with the depth bounds test.
-+    fn depth1(&self) -> D3D12_DEPTH_STENCIL_DESC1 {
-+        let d = &self.depth;
-+        let mut host = D3D12_DEPTH_STENCIL_DESC1 {
-+            DepthEnable: d.DepthEnable,
-+            DepthWriteMask: d.DepthWriteMask,
-+            DepthFunc: d.DepthFunc,
-+            StencilEnable: d.StencilEnable,
-+            StencilReadMask: d.StencilReadMask,
-+            StencilWriteMask: d.StencilWriteMask,
-+            FrontFace: d.FrontFace,
-+            BackFace: d.BackFace,
-+            DepthBoundsTestEnable: self.depth_bounds.into(),
-+        };
-+        // WARP bypasses the bounds check when its depth unit is disabled.
-+        // Keep the depth read active without adding a rejection or writing depth.
-+        if self.depth_bounds && !d.DepthEnable.as_bool() && self.depth_format != DXGI_FORMAT_UNKNOWN {
-+            host.DepthEnable = true.into();
-+            host.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-+            host.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-+        }
-+        host
-+    }
-+
-     /// The vertex buffer slots the input layout reads.
-     fn slots(&self) -> u32 {
-         self.inputs
-@@ -567,6 +602,21 @@ impl HostPipeline {
-         let Some(g) = g else {
-             return refuse("graphics state not kept (plain description)", shaders);
-         };
-+        // A host without the test gets the plain description: the
-+        // pipeline's draws then pass at every depth.
-+        let depth_bounds = g.depth_bounds && {
-+            let supported = host.depth_bounds();
-+            if !supported {
-+                static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-+                if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
-+                    tracing::warn!(
-+                        ?shaders,
-+                        "a pipeline enables the depth bounds test, which the host GPU does not support: its draws pass at every depth"
-+                    );
-+                }
-+            }
-+            supported
-+        };
-         let state = g.describe();
-         if mesh.is_some() {
-             let name = super::library::name(
-@@ -575,7 +625,7 @@ impl HostPipeline {
-                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
-                 &state,
-             );
--            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
-+            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, depth_bounds, &name) {
-                 Ok(pso) => pso,
-                 Err(e) => {
-                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
-@@ -644,13 +694,17 @@ impl HostPipeline {
-             &state,
-         );
-         let started = std::time::Instant::now();
--        let made = super::library::pipeline(
--            &name,
--            // SAFETY: the description points at live data.
--            |library, name| unsafe { library.LoadGraphicsPipeline(name, &desc) },
--            // SAFETY: as above.
--            || unsafe { host.device.CreateGraphicsPipelineState(&desc) },
--        );
-+        let made = if depth_bounds {
-+            graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
-+        } else {
-+            super::library::pipeline(
-+                &name,
-+                // SAFETY: the description points at live data.
-+                |library, name| unsafe { library.LoadGraphicsPipeline(name, &desc) },
-+                // SAFETY: as above.
-+                || unsafe { host.device.CreateGraphicsPipelineState(&desc) },
-+            )
-+        };
-         let pso = match made {
-             Ok(pso) => pso,
-             Err(e) => {
-@@ -664,6 +718,7 @@ impl HostPipeline {
-         tracing::debug!(
-             ?shaders,
-             depth = ?g.depth,
-+            depth_bounds,
-             dsv = g.depth_format.0,
-             targets = ?&g.targets.RTFormats[..g.targets.NumRenderTargets.min(8) as usize],
-             blend = ?g.blend.RenderTarget[0],
-@@ -694,62 +749,158 @@ fn host_topology(g: &GraphicsState) -> D3D12_PRIMITIVE_TOPOLOGY_TYPE {
-     }
- }
- 
-+/// A stream subobject: its type, then its description, pointer-aligned.
-+#[repr(C, align(8))]
-+struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
-+
-+/// A pipeline from a stream of whole subobjects, loaded from the library
-+/// by `name` or made and stored.
-+fn stream_pipeline<S>(
-+    device: &ID3D12Device,
-+    stream: &mut S,
-+    name: &str,
-+) -> windows::core::Result<ID3D12PipelineState> {
-+    use windows::core::Interface;
-+    let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
-+        SizeInBytes: size_of::<S>(),
-+        pPipelineStateSubobjectStream: std::ptr::from_mut(stream).cast(),
-+    };
-+    let device = device.cast::<ID3D12Device2>()?;
-+    super::library::pipeline(
-+        name,
-+        // SAFETY: the stream holds whole subobjects pointing at live data.
-+        |library, name| unsafe { library.LoadPipeline(name, &desc) },
-+        // SAFETY: as above.
-+        || unsafe { device.CreatePipelineState(&desc) },
-+    )
-+}
-+
-+/// A graphics pipeline enabling the depth bounds test:
-+/// `D3D12_GRAPHICS_PIPELINE_STATE_DESC` has no field for
-+/// `DepthBoundsTestEnable`, so it is made and loaded as a pipeline-state
-+/// stream with `DEPTH_STENCIL1`, the rest taken from `d`.
-+fn graphics_depth_bounds_pipeline(
-+    device: &ID3D12Device,
-+    root: &ID3D12RootSignature,
-+    d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC,
-+    depth: D3D12_DEPTH_STENCIL_DESC1,
-+    name: &str,
-+) -> windows::core::Result<ID3D12PipelineState> {
-+    use windows::core::Interface;
-+    #[repr(C)]
-+    struct Stream {
-+        root: Sub<*mut std::ffi::c_void>,
-+        vs: Sub<D3D12_SHADER_BYTECODE>,
-+        ps: Sub<D3D12_SHADER_BYTECODE>,
-+        blend: Sub<D3D12_BLEND_DESC>,
-+        mask: Sub<u32>,
-+        raster: Sub<D3D12_RASTERIZER_DESC>,
-+        depth: Sub<D3D12_DEPTH_STENCIL_DESC1>,
-+        input: Sub<D3D12_INPUT_LAYOUT_DESC>,
-+        strip_cut: Sub<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>,
-+        topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
-+        targets: Sub<D3D12_RT_FORMAT_ARRAY>,
-+        dsv: Sub<DXGI_FORMAT>,
-+        samples: Sub<DXGI_SAMPLE_DESC>,
-+    }
-+    /// With the rectangle geometry shader.
-+    #[repr(C)]
-+    struct StreamGs {
-+        base: Stream,
-+        gs: Sub<D3D12_SHADER_BYTECODE>,
-+    }
-+    let base = Stream {
-+        root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
-+        vs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, d.VS),
-+        ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, d.PS),
-+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, d.BlendState),
-+        mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, d.SampleMask),
-+        raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, d.RasterizerState),
-+        depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
-+        input: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, d.InputLayout),
-+        strip_cut: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE, d.IBStripCutValue),
-+        topology: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, d.PrimitiveTopologyType),
-+        targets: Sub(
-+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
-+            D3D12_RT_FORMAT_ARRAY {
-+                RTFormats: d.RTVFormats,
-+                NumRenderTargets: d.NumRenderTargets,
-+            },
-+        ),
-+        dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, d.DSVFormat),
-+        samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, d.SampleDesc),
-+    };
-+    if d.GS.pShaderBytecode.is_null() {
-+        let mut stream = base;
-+        stream_pipeline(device, &mut stream, name)
-+    } else {
-+        let mut stream = StreamGs {
-+            base,
-+            gs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, d.GS),
-+        };
-+        stream_pipeline(device, &mut stream, name)
-+    }
-+}
-+
- /// A mesh pipeline from the title's graphics state: the pipeline-state
--/// stream form (no input layout).
-+/// stream form (no input layout), with `DEPTH_STENCIL1` if `depth_bounds`.
- fn mesh_pipeline(
-     device: &ID3D12Device,
-     root: &ID3D12RootSignature,
-     ms: D3D12_SHADER_BYTECODE,
-     ps: D3D12_SHADER_BYTECODE,
-     g: &GraphicsState,
-+    depth_bounds: bool,
-     name: &str,
- ) -> windows::core::Result<ID3D12PipelineState> {
--    use windows::core::Interface;
--    /// A stream subobject: its type, then its description, pointer-aligned.
--    #[repr(C, align(8))]
--    struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
-     #[repr(C)]
--    struct Stream {
-+    struct Stream<D> {
-         root: Sub<*mut std::ffi::c_void>,
-         ms: Sub<D3D12_SHADER_BYTECODE>,
-         ps: Sub<D3D12_SHADER_BYTECODE>,
-         blend: Sub<D3D12_BLEND_DESC>,
-         mask: Sub<u32>,
-         raster: Sub<D3D12_RASTERIZER_DESC>,
--        depth: Sub<D3D12_DEPTH_STENCIL_DESC>,
-+        depth: Sub<D>,
-         targets: Sub<D3D12_RT_FORMAT_ARRAY>,
-         dsv: Sub<DXGI_FORMAT>,
-         samples: Sub<DXGI_SAMPLE_DESC>,
-         topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
-     }
--    let mut stream = Stream {
--        root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
--        ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
--        ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
--        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
--        mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
--        raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
--        depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
--        targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
--        dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
--        samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
--        // The type the host derives from the mesh shader anyway, given: a
--        // pipeline library compares descriptions with it, and loads none
--        // made from a stream without it.
--        topology: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, host_topology(g)),
--    };
--    let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
--        SizeInBytes: size_of::<Stream>(),
--        pPipelineStateSubobjectStream: (&raw mut stream).cast(),
--    };
--    let device = device.cast::<ID3D12Device2>()?;
--    super::library::pipeline(
--        name,
--        // SAFETY: the stream holds whole subobjects pointing at live data.
--        |library, name| unsafe { library.LoadPipeline(name, &desc) },
--        // SAFETY: as above.
--        || unsafe { device.CreatePipelineState(&desc) },
--    )
-+    fn make<D>(
-+        device: &ID3D12Device,
-+        root: &ID3D12RootSignature,
-+        (ms, ps): (D3D12_SHADER_BYTECODE, D3D12_SHADER_BYTECODE),
-+        g: &GraphicsState,
-+        depth: Sub<D>,
-+        name: &str,
-+    ) -> windows::core::Result<ID3D12PipelineState> {
-+        use windows::core::Interface;
-+        let mut stream = Stream {
-+            root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
-+            ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
-+            ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
-+            mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
-+            raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
-+            depth,
-+            targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
-+            dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
-+            samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
-+            // The type the host derives from the mesh shader anyway, given: a
-+            // pipeline library compares descriptions with it, and loads none
-+            // made from a stream without it.
-+            topology: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, host_topology(g)),
-+        };
-+        stream_pipeline(device, &mut stream, name)
-+    }
-+    if depth_bounds {
-+        let depth = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1());
-+        make(device, root, (ms, ps), g, depth, name)
-+    } else {
-+        let depth = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth);
-+        make(device, root, (ms, ps), g, depth, name)
-+    }
- }
- 
- /// The bytes of shader code (none for an absent stage).
-@@ -870,4 +1021,326 @@ mod tests {
+@@ -1042,4 +1042,361 @@ mod tests {
          ];
          let _ = offsets(&inputs);
      }
 +
-+    /// `DEPTH_STENCIL1` sets the test; a later plain `DEPTH_STENCIL`
-+    /// clears it. Only pipelines with it get a new state text.
 +    #[test]
 +    fn depth_bounds_follow_the_last_depth_subobject() {
 +        #[repr(C, align(8))]
@@ -584,44 +136,74 @@ index f6c566a..478d3b4 100644
 +                ..Default::default()
 +            },
 +        );
++        let plain_sub = Sub11(11, D3D12_DEPTH_STENCIL_DESC::default());
 +        // SAFETY: whole subobjects of their kinds.
 +        unsafe { g.read(21, (&raw const sub).cast()) };
-+        assert!(g.depth_bounds && g.describe().contains(" depth-bounds-v2"));
-+        let sub = Sub11(11, D3D12_DEPTH_STENCIL_DESC::default());
++        assert!(g.depth_bounds && g.describe().ends_with(" depth bounds"));
++        // A later plain depth subobject turns the bounds off again...
 +        // SAFETY: as above.
-+        unsafe { g.read(11, (&raw const sub).cast()) };
++        unsafe { g.read(11, (&raw const plain_sub).cast()) };
 +        assert!(!g.depth_bounds);
-+        assert!(!g.describe().contains("depth-bounds"));
++        assert!(!g.describe().contains("depth bounds"));
++        // ...and a later subobject 21 turns them back on.
++        // SAFETY: as above.
++        unsafe { g.read(21, (&raw const sub).cast()) };
++        assert!(g.depth_bounds);
++        // SAFETY: as above.
++        unsafe { g.read(11, (&raw const plain_sub).cast()) };
 +        g.depth = GraphicsState::default().depth;
 +        assert_eq!(g.describe(), plain);
 +    }
 +
-+    /// Bounds without the depth test: the host description keeps depth
-+    /// read on (WARP skips the bounds otherwise) but never writes or
-+    /// rejects by depth; stencil and real depth tests are untouched.
++    /// A subobject 21's depth and stencil fields reach the host's
++    /// `DEPTH_STENCIL1` unchanged, with the bounds test on; a host without
++    /// the bounds test gets none (the plain description is used instead).
 +    #[test]
-+    fn bounds_only_host_state_preserves_depth_and_stencil_settings() {
-+        let mut g = GraphicsState { depth_bounds: true, ..GraphicsState::default() };
-+        g.depth.DepthEnable = false.into();
-+        g.depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-+        g.depth.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
-+        g.depth.StencilEnable = true.into();
-+        assert!(!g.depth1().DepthEnable.as_bool(), "no depth format");
++    fn host_depth_stencil1_keeps_the_depth_and_stencil_fields() {
++        let Some(host) = host() else {
++            return; // no host GPU here
++        };
++        #[repr(C, align(8))]
++        struct Sub21(u32, D3D12_DEPTH_STENCIL_DESC1);
++        let front = D3D12_DEPTH_STENCILOP_DESC {
++            StencilFailOp: D3D12_STENCIL_OP_ZERO,
++            StencilDepthFailOp: D3D12_STENCIL_OP_INCR,
++            StencilPassOp: D3D12_STENCIL_OP_REPLACE,
++            StencilFunc: D3D12_COMPARISON_FUNC_EQUAL,
++        };
++        let back = D3D12_DEPTH_STENCILOP_DESC {
++            StencilFailOp: D3D12_STENCIL_OP_INVERT,
++            StencilDepthFailOp: D3D12_STENCIL_OP_DECR_SAT,
++            StencilPassOp: D3D12_STENCIL_OP_INCR_SAT,
++            StencilFunc: D3D12_COMPARISON_FUNC_GREATER_EQUAL,
++        };
++        let title = D3D12_DEPTH_STENCIL_DESC1 {
++            DepthEnable: true.into(),
++            DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
++            DepthFunc: D3D12_COMPARISON_FUNC_GREATER,
++            StencilEnable: true.into(),
++            StencilReadMask: 0x3c,
++            StencilWriteMask: 0xc3,
++            FrontFace: front,
++            BackFace: back,
++            DepthBoundsTestEnable: true.into(),
++        };
++        let mut g = GraphicsState::default();
++        let sub = Sub21(21, title);
++        // SAFETY: `sub` is a whole subobject 21.
++        unsafe { g.read(21, (&raw const sub).cast()) };
++        assert!(g.depth_bounds);
 +
-+        g.depth_format = DXGI_FORMAT_D32_FLOAT;
-+        let bounds = g.depth1();
-+        assert!(bounds.DepthEnable.as_bool() && bounds.DepthBoundsTestEnable.as_bool());
-+        assert_eq!(bounds.DepthWriteMask, D3D12_DEPTH_WRITE_MASK_ZERO);
-+        assert_eq!(bounds.DepthFunc, D3D12_COMPARISON_FUNC_ALWAYS);
-+        assert!(bounds.StencilEnable.as_bool());
++        let Some(d) = g.depth_with_bounds(host) else {
++            assert!(!host.depth_bounds_supported, "a supporting host gets DEPTH_STENCIL1");
++            eprintln!("no host depth bounds support; skipped");
++            return;
++        };
++        assert_eq!(d, title);
 +
-+        g.depth.DepthEnable = true.into();
-+        let regular = g.depth1();
-+        assert_eq!(regular.DepthWriteMask, D3D12_DEPTH_WRITE_MASK_ALL);
-+        assert_eq!(regular.DepthFunc, D3D12_COMPARISON_FUNC_LESS);
-+        g.depth.DepthEnable = false.into();
++        // Without the bounds test the plain description is used.
 +        g.depth_bounds = false;
-+        assert!(!g.depth1().DepthEnable.as_bool());
++        assert!(g.depth_with_bounds(host).is_none());
 +    }
 +
 +    /// The PC `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's).
@@ -664,17 +246,19 @@ index f6c566a..478d3b4 100644
 +    }";
 +    const PS: &str = "float4 main() : SV_Target { return 1; }";
 +
-+    /// A graphics pipeline with `DepthBoundsTestEnable` (and the depth test
-+    /// off, so only the bounds gate the draw) loads back from the library,
-+    /// and its draws pass or are culled by the `OMSetDepthBounds` the list
-+    /// was given (`crate::draw::depth_bounds`), on the real host (WARP).
++    /// A vertex pipeline with `DepthBoundsTestEnable` (the depth test
++    /// always passing and not writing, so only the bounds gate the draw),
++    /// made by the stream the host pipelines use, loads back from the
++    /// library, and its draws pass or are culled by the bounds the draw
++    /// state gives the list (`crate::draw::State::set_depth_bounds`), on the
++    /// real host (WARP).
 +    #[test]
 +    fn depth_bounds_pipeline_loads_and_filters_draws() {
 +        use std::sync::atomic::Ordering;
 +        let Some(host) = host() else {
 +            return; // no host GPU here
 +        };
-+        if !host.depth_bounds() {
++        if !host.depth_bounds_supported {
 +            eprintln!("no host depth bounds support; skipped");
 +            return;
 +        }
@@ -693,7 +277,7 @@ index f6c566a..478d3b4 100644
 +        let sub = Sub21(
 +            21,
 +            D3D12_DEPTH_STENCIL_DESC1 {
-+                DepthEnable: false.into(),
++                DepthEnable: true.into(),
 +                DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ZERO,
 +                DepthFunc: D3D12_COMPARISON_FUNC_ALWAYS,
 +                DepthBoundsTestEnable: true.into(),
@@ -704,33 +288,39 @@ index f6c566a..478d3b4 100644
 +        unsafe { g.read(21, (&raw const sub).cast()) };
 +        assert!(g.depth_bounds);
 +        g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
++        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 +        g.targets.NumRenderTargets = 1;
 +        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
 +        g.depth_format = DXGI_FORMAT_D32_FLOAT;
++        let depth1 = g
++            .depth_with_bounds(host)
++            .expect("a host with the bounds test gets DEPTH_STENCIL1");
++        assert!(depth1.DepthBoundsTestEnable.as_bool());
 +
-+        let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
-+            // SAFETY: a borrowed pointer the description never releases.
-+            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
-+            VS: code(&vs),
-+            PS: code(&ps),
-+            BlendState: g.blend,
-+            SampleMask: g.sample_mask,
-+            RasterizerState: g.rasterizer,
-+            DepthStencilState: g.depth,
-+            IBStripCutValue: g.strip_cut,
-+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-+            NumRenderTargets: 1,
-+            RTVFormats: g.targets.RTFormats,
-+            DSVFormat: g.depth_format,
-+            SampleDesc: g.samples,
-+            ..Default::default()
-+        };
 +        let name = super::super::library::name("graphics depth-bounds test", &root_blob, &[&vs, &ps], &g.describe());
-+        let pso = graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
-+            .expect("depth-bounds pipeline made");
++        let make = || {
++            let vertex = VertexStream {
++                vs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, code(&vs)),
++                gs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, D3D12_SHADER_BYTECODE::default()),
++                input: Sub(
++                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT,
++                    D3D12_INPUT_LAYOUT_DESC::default(),
++                ),
++                strip_cut: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE, g.strip_cut),
++            };
++            stream_pipeline(
++                &host.device,
++                &root,
++                vertex,
++                code(&ps),
++                &g,
++                Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth1),
++                &name,
++            )
++        };
++        let pso = make().expect("depth-bounds pipeline made");
 +        let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-+        graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
-+            .expect("depth-bounds pipeline made again");
++        make().expect("depth-bounds pipeline made again");
 +        assert!(
 +            super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
 +            "the depth-bounds pipeline was compiled again instead of loaded from the library"
@@ -810,10 +400,9 @@ index f6c566a..478d3b4 100644
 +        // bounds: the first pixel's red.
 +        let draw = |min: f32, max: f32| -> u8 {
 +            let list = host.new_list().unwrap();
-+            let first = host.new_list().unwrap();
++            assert!(list.depth_bounds.is_some(), "the list of a supporting host sets bounds");
 +            let mut state = crate::draw::State::default();
-+            state.depth_bounds(&first, min, max);
-+            state.cut(&list);
++            state.set_depth_bounds(&list, min, max);
 +            let rtv = host.rtv(&color, None);
 +            let dsv = host.dsv(&depth, None);
 +            let viewport = D3D12_VIEWPORT {
@@ -890,10 +479,10 @@ index f6c566a..478d3b4 100644
 +    }
  }
 diff --git a/crates/victory-gpu/src/queue.rs b/crates/victory-gpu/src/queue.rs
-index 3da261b..49d7e7b 100644
+index 217c4cef41d694c4adb27418290bb2c8803ee7d6..c83d51c0aa20e293078f341ca76c954ba0500a2b 100644
 --- a/crates/victory-gpu/src/queue.rs
 +++ b/crates/victory-gpu/src/queue.rs
-@@ -807,4 +807,35 @@ mod tests {
+@@ -910,4 +910,35 @@ mod tests {
          Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
          assert!(at[1] > first);
      }
