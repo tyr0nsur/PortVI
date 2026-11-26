@@ -1,10 +1,13 @@
 """Build the pinned native runtime and exercise it with open test programs."""
 import argparse
+from contextlib import contextmanager
 import hashlib
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -14,6 +17,79 @@ ENGINE = ROOT / "engine"
 WORK = ROOT / ".work"
 TARGET = ROOT / "target"
 EXE = TARGET / "release" / "portvi.exe"
+_CACHE_NAME = re.compile(r"portvi-([a-f0-9]{20})-[a-z0-9_]{8}")
+_CACHE_OWNER = b"PortVI CLI managed Cargo cache v1\n"
+
+
+def _linked(path):
+    info = path.lstat()
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+
+def _claim(cache, state):
+    # Atomic rename awards the idle cache to exactly one runner. A crash
+    # leaves an active lease for inspection, even if a Cargo child survives.
+    marker = cache / (".portvi-" + state)
+    try:
+        if _linked(cache) or not cache.is_dir() or _linked(marker) or not marker.is_file():
+            return False
+        if marker.stat().st_size != len(_CACHE_OWNER) or marker.read_bytes() != _CACHE_OWNER:
+            return False
+        marker.rename(cache / ".portvi-active")
+    except FileNotFoundError:
+        return False
+    return True
+
+
+@contextmanager
+def build_cache(repo, revision):
+    """Reuse this revision and retire completed, runner-owned jobs."""
+    if not re.fullmatch(r"[a-f0-9]{20}", revision):
+        raise ValueError("Invalid PortVI build revision")
+    root = repo.resolve() / "target" / "builds"
+    for parent in (root.parent, root):
+        parent.mkdir(exist_ok=True)
+        if _linked(parent) or parent.resolve(strict=True) != parent:
+            raise RuntimeError(f"Unexpected build directory: {parent}")
+    current = None
+    try:
+        for cache in root.iterdir():
+            match = _CACHE_NAME.fullmatch(cache.name)
+            if not match:
+                continue
+            if not _claim(cache, "failed"):
+                if not _claim(cache, "ready"):
+                    continue
+                if match[1] == revision and current is None:
+                    current = cache
+                    continue
+            # Never descend into links or junctions during cleanup. Python
+            # rmtree on Windows removes nested junctions without walking them.
+            if cache.resolve(strict=True).parent != root or _linked(cache):
+                raise RuntimeError(f"Unexpected cache path: {cache}")
+            try:
+                shutil.rmtree(cache)
+            except OSError:
+                # Retry any remaining files before the next build.
+                if cache.is_dir():
+                    active = cache / ".portvi-active"
+                    if active.exists():
+                        active.rename(cache / ".portvi-failed")
+                    else:
+                        (cache / ".portvi-failed").write_bytes(_CACHE_OWNER)
+                raise
+        if current is None:
+            current = Path(tempfile.mkdtemp(prefix=f"portvi-{revision}-", dir=root))
+            (current / ".portvi-active").write_bytes(_CACHE_OWNER)
+        yield current
+    except Exception:
+        if current is not None:
+            (current / ".portvi-active").rename(current / ".portvi-failed")
+        raise
+    else:
+        (current / ".portvi-active").rename(current / ".portvi-ready")
 
 
 def git(directory, *args, capture=False):
@@ -118,10 +194,16 @@ def main():
         print(source)
         return
     cargo, rustc, version, env = toolchain(source)
-    if args.action in {"gpu", "texture"}:
+    with build_cache(ROOT, source.name) as cache:
+        env["CARGO_TARGET_DIR"] = str(cache)
+        run_action(args.action, source, cargo, rustc, version, env)
+
+
+def run_action(action, source, cargo, rustc, version, env):
+    if action in {"gpu", "texture"}:
         env.pop("VICTORY_WARP", None)
         env.pop("VICTORY_D3D12_WARP", None)
-        if args.action == "gpu":
+        if action == "gpu":
             case = "emit::valu_tests::v_med3_f32_on_physical_adapter"
             package = ["-p", "victory-shader", "--features", "host"]
             options = ["--ignored"]
@@ -143,7 +225,7 @@ def main():
             if marker not in result.stdout:
                 raise RuntimeError(f"Missing hardware test evidence: {marker}")
         return
-    if args.action == "test":
+    if action == "test":
         subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tools"],
                        cwd=ROOT, check=True)
         subprocess.run([cargo, version, "test", "--workspace", "--locked", "--", "--test-threads=1"],
@@ -159,7 +241,7 @@ def main():
                 staged = Path(staging) / artifact.name
                 shutil.copy2(artifact, staged)
                 staged.replace(EXE.parent / artifact.name)
-    if args.action == "smoke":
+    if action == "smoke":
         smoke(executable, rustc, version, env)
     else:
         print(EXE)

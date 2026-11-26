@@ -1,5 +1,9 @@
 # Native runtime engineering review
 
+## BC7 texture decoding on 26 November 2026
+
+PortVI includes the decoder changes from legayclightning22's VIctory PR #3386 at `7520d2f`. They correct the index layout in the bundled BC7 dictionary and select the channel rotation field only for modes 4 and 5. The two regression tests failed on the previous PortVI patch set. Repeating the format library tests with the fix gave 49 passes, zero failures and five ignored tests. This checks decoded texture blocks. The visual effect in a scene still needs a matched capture. [Upstream revision](https://github.com/Marvisak/VIctory/pull/3386/commits/7520d2f87548fc05c79a354632159e7c8f0accd7) · [PortVI patch and tests](../patches/0031-bc7-dictionary-and-rotation.patch)
+
 ## Native graphics refresh of 26 November 2026
 
 PortVI now pins VIctory at `63bcca4` and applies 30 patches. The 72 upstream commits since `61bfc77` include a null texture SRV correction and changes to dynamic descriptors on NVIDIA. A source-built compute dispatch read all 4,096 expected values through a null texture view on an RTX 4060 and on Microsoft WARP. The test checks the selected adapter. [Engine changes](https://github.com/Marvisak/VIctory/compare/61bfc773d3296252918572921237075d8a748649...63bcca43c6a00a758510398fa43096ce7e4f7df0) · [Null SRV correction](https://github.com/Marvisak/VIctory/commit/219878a0e7754511d89306331812971bb2153f5f) · [Readback fixture](../patches/0026-null-srv-readback.patch)
