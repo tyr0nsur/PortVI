@@ -14,7 +14,7 @@ PortVI is an experimental Windows x64 compatibility runtime built on Marvisak’
 | Null texture reads | Both the RTX 4060 and WARP returned all 4,096 expected texels in a compute dispatch. [Fixture and device checks](engineering-review.md#native-graphics-refresh-of-26-november-2026) |
 | Command-list lifetime | Both adapters passed the pipeline and root-signature retention and release fixture. |
 | Wave64 on the RTX 4060 | The split-wave first-lane fixture returned the expected thread ID in groups of 64 and 128 threads. Native and split-wave row shuffles matched 143,360 lane results. [Device tests](engineering-review.md#wave64-on-a-32-lane-gpu) |
-| Scene capture | PortVI has yet to publish a measured scene capture. Scene FPS and stability are unmeasured. |
+| Introductory sequence | A preliminary RTX 4060 capture showed partial geometry. Two 120 s runs recorded 96 and 121 successful DXGI presents. [Revision, output modes and frame times](engineering-review.md#preliminary-startup-frame-timings) |
 
 [Engineering evidence and commands](engineering-review.md#component-tests) · [Windows CI](https://github.com/tyr0nsur/PortVI/actions/workflows/windows.yml?query=branch%3Amain) · [Contribute hardware results](../CONTRIBUTING.md)
 
