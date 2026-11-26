@@ -1,5 +1,11 @@
 # Native runtime engineering review
 
+## Texture copy order and shader masks on 27 November 2026
+
+The texture upload at the start of a submission now sees CPU memory copies recorded before the first GPU use. A copy recorded after a draw takes effect on the next texture upload. The distinction also applies across command lists in the same submission. AvatarManz's texture upload changes prompted this check. The PortVI regression exercises both orders with a BC4 texture and reads back the texels from the GPU. [AvatarManz change](https://github.com/avatarmanz/VIctory-7900XTX/commit/5d6bd84) · [PortVI implementation and readback test](../patches/0033-stage-leading-texture-copies.patch)
+
+When a Wave64 shader saves a lane predicate in two scalar words and restores them, the translator now recognizes the pair through scalar moves. The test restores the original pair and then substitutes the low word for the high word. Only the intact pair recovers the predicate. All 18 active structuring tests passed. [DexNom change](https://github.com/DexNom/VIctory/commit/76749ce58da23a43a3500454a8b69c53f05aa477) · [PortVI shader regression](../patches/0032-dexnom-wave64-scalar-copies.patch)
+
 ## BC7 texture decoding on 26 November 2026
 
 PortVI includes the decoder changes from legayclightning22's VIctory PR #3386 at `7520d2f`. They correct the index layout in the bundled BC7 dictionary and select the channel rotation field only for modes 4 and 5. The two regression tests failed on the previous PortVI patch set. Repeating the format library tests with the fix gave 49 passes, zero failures and five ignored tests. This checks decoded texture blocks. The visual effect in a scene still needs a matched capture. [Upstream revision](https://github.com/Marvisak/VIctory/pull/3386/commits/7520d2f87548fc05c79a354632159e7c8f0accd7) · [PortVI patch and tests](../patches/0031-bc7-dictionary-and-rotation.patch)
