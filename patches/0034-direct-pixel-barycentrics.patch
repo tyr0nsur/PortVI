@@ -1,0 +1,502 @@
+From: The VIctory, DexNom and PortVI contributors
+Subject: Probe center pixel I/J in D3D primitive order with an opt-in feature
+Upstream: https://github.com/Marvisak/VIctory/pull/281 (d9bbff571eabf7defe6b106349acda49d1eaa3f8)
+Upstream: https://github.com/Marvisak/VIctory/pull/442 (b6ccc95950ab6d694671acf5cb6c72fa957e31ee)
+Upstream: https://github.com/DexNom/VIctory/tree/64bd58f5fb794216894bc0e33e03a3a64d19c347
+
+This experimental translation uses API-order triangle weights. A GFX10.3
+primitive can rotate the vertex order, so the normal translation and its
+cached results remain separate. The test uses a source-built shader and
+checks direct perspective and no-perspective center weights by readback.
+
+diff --git a/crates/victory-gpu/Cargo.toml b/crates/victory-gpu/Cargo.toml
+index bc8e4270be5f174b527262d1d474b48bbddffe65..f57aeb2c73c40a4defd12a66902b858c2e6cc8c5 100644
+--- a/crates/victory-gpu/Cargo.toml
++++ b/crates/victory-gpu/Cargo.toml
+@@ -21,6 +21,7 @@ tempfile.workspace = true
+ victory-shader = { workspace = true, features = ["host", "fixtures"] }
+ 
+ [features]
++experimental-barycentrics = ["victory-shader/experimental-barycentrics"]
+ # Expose the end-to-end texture fixture to the storage crate's tests.
+ texture-probe = []
+ # Debugging switches (frame capture, the host debug layer, per-draw data).
+diff --git a/crates/victory-gpu/src/pipeline/depth_bounds_test.rs b/crates/victory-gpu/src/pipeline/depth_bounds_test.rs
+index 2d429b99241d943467963e2690d68a1e1b2711dd..72a97815ac784f0cd0e002b55a46a50fdcc58f39 100644
+--- a/crates/victory-gpu/src/pipeline/depth_bounds_test.rs
++++ b/crates/victory-gpu/src/pipeline/depth_bounds_test.rs
+@@ -53,7 +53,7 @@ fn fullscreen_vertex_shader() -> Arc<Shader> {
+     host_shader("vertex", victory_shader::HwStage::Vs, bytes)
+ }
+ 
+-fn host_shader(stage: &'static str, hw_stage: victory_shader::HwStage, bytes: &[u8]) -> Arc<Shader> {
++pub(super) fn host_shader(stage: &'static str, hw_stage: victory_shader::HwStage, bytes: &[u8]) -> Arc<Shader> {
+     let shader = shader(stage, bytes);
+     shader.translated.get_or_init(|| Some(Translated {
+         host: victory_shader::emit::HostShader {
+diff --git a/crates/victory-gpu/src/pipeline/host.rs b/crates/victory-gpu/src/pipeline/host.rs
+index 03e393b9dd7ec9392795076e45ec21d152987296..3fb4fa37cece9175313c3a7e1c0299523e2e0c9b 100644
+--- a/crates/victory-gpu/src/pipeline/host.rs
++++ b/crates/victory-gpu/src/pipeline/host.rs
+@@ -1449,7 +1449,6 @@ mod tests {
+     fn host_pipeline_new_binds_and_draws_the_linked_mesh_and_pixel_programs() {
+         use victory_shader::emit::{MESH_OUTPUT_LIMIT, mesh_output_bytes};
+         use victory_shader::native::fixture;
+-        use windows::core::Interface;
+         let Some(host) = host() else {
+             return; // no host GPU here
+         };
+@@ -1504,6 +1503,15 @@ mod tests {
+                     && s.view_addresses.is_none()
+             });
+         assert!(plain, "the fixture binds user data at most");
++        let texels = readback_16x16(host, &made);
++        assert!(
++            texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]),
++            "unexpected texel {:?}",
++            texels.iter().find(|t| **t != [1.0, 0.5, 0.25, 1.0])
++        );
++    }
++
++    fn readback_16x16(host: &crate::host::Host, made: &HostPipeline) -> Vec<[f32; 4]> {
+         let (width, height) = (16u32, 16u32);
+         let color = {
+             let heap = D3D12_HEAP_PROPERTIES {
+@@ -1563,7 +1571,6 @@ mod tests {
+             out.unwrap()
+         };
+         let list = host.new_list().unwrap();
+-        let l6 = list.list.cast::<ID3D12GraphicsCommandList6>().expect("a mesh-capable list");
+         let rtv = host.rtv(&color, None);
+         let viewport = D3D12_VIEWPORT {
+             TopLeftX: 0.0,
+@@ -1589,7 +1596,12 @@ mod tests {
+                     list.list.SetGraphicsRoot32BitConstants(param, dwords, zeros.as_ptr().cast(), 0);
+                 }
+             }
+-            l6.DispatchMesh(1, 1, 1);
++            if made.mesh {
++                list.list.cast::<ID3D12GraphicsCommandList6>().unwrap().DispatchMesh(1, 1, 1);
++            } else {
++                list.list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++                list.list.DrawInstanced(3, 1, 0, 0);
++            }
+             list.list.ResourceBarrier(&[crate::host::transition(
+                 &color,
+                 D3D12_RESOURCE_STATE_RENDER_TARGET,
+@@ -1623,16 +1635,88 @@ mod tests {
+         let mut at = std::ptr::null_mut();
+         // SAFETY: `execute` waited for the GPU; the buffer holds
+         // `pitch * height` bytes of 16-byte texels.
+-        let texels: Vec<[f32; 4]> = unsafe {
++        unsafe {
+             readback.Map(0, None, Some(&mut at)).unwrap();
+             let all = std::slice::from_raw_parts(at.cast::<[f32; 4]>(), (pitch * height / 16) as usize).to_vec();
+             readback.Unmap(0, None);
+             all
++        }
++    }
++
++    #[test]
++    #[cfg(feature = "experimental-barycentrics")]
++    fn direct_barycentrics_match_a_projective_triangle() {
++        use victory_shader::native::fixture;
++        use windows::Win32::Graphics::Dxgi::{
++            CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1,
++            IDXGIFactory4,
+         };
+-        assert!(
+-            texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]),
+-            "unexpected texel {:?}",
+-            texels.iter().find(|t| **t != [1.0, 0.5, 0.25, 1.0])
++        let (Some(host), Some(dxc)) = (host(), dxc()) else {
++            eprintln!("skipped barycentric readback: no D3D12 device or PC dxc");
++            return;
++        };
++        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
++        // SAFETY: the output structure has the type and size requested.
++        let supported = unsafe {
++            host.device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, (&raw mut options).cast(), size_of_val(&options) as u32)
++        };
++        if supported.is_err() || !options.BarycentricsSupported.as_bool() {
++            eprintln!("skipped barycentric readback: unsupported adapter");
++            return;
++        }
++        // After division by W, the three projected vertices lie exactly on
++        // the corners (0,0), (16,0), (0,16) of the viewport.
++        let dir = tempfile::tempdir().unwrap();
++        let vs = compile(&dxc, dir.path(), r#"
++            float4 main(uint id : SV_VertexID) : SV_Position {
++                float w = id == 0 ? 1.0 : (id == 1 ? 2.0 : 4.0);
++                float2 xy = float2(id == 1 ? 1.0 : -1.0, id == 2 ? -1.0 : 1.0);
++                return float4(xy * w, 0.5 * w, w);
++            }
++        "#, "vs_6_5");
++        let vs = super::super::depth_bounds_test::host_shader("vertex", victory_shader::HwStage::Vs, &vs);
++        let ps = Arc::new(Shader::new("pixel", &fixture::barycentric_pixel_pair()));
++        ps.translated().expect("direct perspective/linear center reads must translate");
++        let mut state = GraphicsState::default();
++        state.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
++        state.depth.DepthEnable = false.into();
++        state.depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
++        state.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
++        state.targets = targets(&[DXGI_FORMAT_R32G32B32A32_FLOAT]);
++        let made = HostPipeline::new(&[vs, ps], Some(&state)).expect("a barycentric pixel pipeline");
++        let texels = readback_16x16(host, &made);
++        let mut inside = 0;
++        let mut outside = 0;
++        for (index, &actual) in texels.iter().enumerate() {
++            let (x, y) = (index % 16, index / 16);
++            if x + y == 15 {
++                continue; // The center lies on the diagonal shared-edge boundary.
++            }
++            if x + y > 15 {
++                assert_eq!(actual, [0.0; 4], "outside the triangle at {x},{y}");
++                outside += 1;
++                continue;
++            }
++            let i = (x as f32 + 0.5) / 16.0;
++            let j = (y as f32 + 0.5) / 16.0;
++            let inv_w = 1.0 - i - j + i / 2.0 + j / 4.0;
++            let expected = [i / 2.0 / inv_w, j / 4.0 / inv_w, i, j];
++            for (v, e) in actual.into_iter().zip(expected) {
++                assert!((v - e).abs() < 0.0005, "pixel {x},{y}: {actual:?}, expected {expected:?}");
++            }
++            inside += 1;
++        }
++        assert_eq!((inside, outside), (120, 120));
++        // SAFETY: query the adapter associated with this device's LUID.
++        let adapter = unsafe {
++            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
++            factory.EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid()).unwrap().GetDesc1().unwrap()
++        };
++        let name = String::from_utf16_lossy(&adapter.Description);
++        let software = adapter.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
++        eprintln!(
++            "direct barycentric readback on {} (software={software}): {inside} interior and {outside} exterior pixels matched",
++            name.trim_end_matches('\0')
+         );
+     }
+ }
+diff --git a/crates/victory-shader/Cargo.toml b/crates/victory-shader/Cargo.toml
+index 827be6333ccc124ee1577196c8ba6be24a343aa5..e625801ea701c9439364198bbbafd59cafd7f10e 100644
+--- a/crates/victory-shader/Cargo.toml
++++ b/crates/victory-shader/Cargo.toml
+@@ -18,6 +18,9 @@ host = ["dep:windows"]
+ diagnostics = []
+ # Console container fixtures (`native::fixture`) for other crates' tests.
+ fixtures = []
++# Expose center-sampled raw pixel I/J in D3D primitive order for experiments.
++# GFX10.3 may cyclically rotate native I/J per quad.
++experimental-barycentrics = []
+ 
+ [[bench]]
+ name = "guard_runs"
+diff --git a/crates/victory-shader/src/emit/container.rs b/crates/victory-shader/src/emit/container.rs
+index bf8d44fee506132af573ace4a75d7af0864f5630..7964cb6bd39130fe007251a4e92767e71bb88da8 100644
+--- a/crates/victory-shader/src/emit/container.rs
++++ b/crates/victory-shader/src/emit/container.rs
+@@ -68,6 +68,7 @@ impl SigElement {
+             18 => 68,
+             19 => 67,
+             20 => 69,
++            28 => 23, // SV_Barycentrics
+             30 => 25, // cull primitive
+             _ => 0,
+         }
+diff --git a/crates/victory-shader/src/emit/host.rs b/crates/victory-shader/src/emit/host.rs
+index 19de881228392d913487d6cb32ed72e3ea623361..e6b4dfdc2e5b9ab63db5bd70fb4a73dbfb2c1cd0 100644
+--- a/crates/victory-shader/src/emit/host.rs
++++ b/crates/victory-shader/src/emit/host.rs
+@@ -23,7 +23,8 @@ pub struct Host {
+ fn sig(dxil: &[u8], fourcc: FourCC) -> Result<Vec<SigElement>, String> {
+     let c = Container::parse(dxil).map_err(|e| e.to_string())?;
+     match c.part(fourcc) {
+-        Some(p) => super::signature(p.data).map_err(|e| e.to_string()),
++        Some(p) => super::signature_rows(p.data, cfg!(feature = "experimental-barycentrics"))
++            .map_err(|e| e.to_string()),
+         None => Ok(Vec::new()),
+     }
+ }
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index a11c48d56a5c39d21dc1e5de8940924bdaea2012..7cabe9b81d7dffbfa7e7098f0c282b23d1929f6a 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -150,8 +150,11 @@ pub(crate) fn lower_pruned(
+     // Whether a source varies by lane is a property of the original SSA.
+     // Retries discard unused values but cannot change that proof.
+     let alike = std::cell::OnceCell::new();
++    let mut direct_centers = false;
+     loop {
+-        match Lower::new(parts, &bad, keep, &alike).run() {
++        let mut pass = Lower::new(parts, &bad, keep, &alike);
++        pass.direct_centers = direct_centers;
++        match pass.run() {
+             Ok(l) => return Ok(l),
+             Err(Stop::Retry(v, why)) => {
+                 if bad.insert(v, why).is_some() {
+@@ -161,6 +164,13 @@ pub(crate) fn lower_pruned(
+                     });
+                 }
+             }
++            // Preserve ordinary interpolation and already proven dead input reads.
++            Err(Stop::Fail(ShaderError::Unsupported { what: "barycentrics read directly", .. }))
++                if cfg!(feature = "experimental-barycentrics") && !direct_centers =>
++            {
++                direct_centers = true;
++                bad.clear();
++            }
+             Err(Stop::Fail(e)) => return Err(e),
+         }
+     }
+@@ -237,6 +247,7 @@ type EntryAddress = (usize, u32);
+ 
+ struct Lower<'a> {
+     s: Shader,
++    direct_centers: bool,
+     x: &'a Parts<'a>,
+     bad: &'a HashMap<Value, Why>,
+     lane_fail: HashMap<Value, Why>,
+@@ -832,6 +843,7 @@ impl<'a> Lower<'a> {
+             s,
+             x,
+             bad,
++            direct_centers: false,
+             lane_fail: HashMap::new(),
+             vals: HashMap::new(),
+             floats: HashMap::new(),
+@@ -1680,6 +1692,17 @@ impl<'a> Lower<'a> {
+                     None => Val::Missing("a vertex input the signature lacks"),
+                 };
+             }
++            Input::Barycentric {
++                kind,
++                index: index @ 0..=1,
++            } if self.direct_centers => {
++                let mode = match kind {
++                    Barycentric::PerspectiveCenter => 2,
++                    Barycentric::LinearCenter => 4,
++                    _ => return Val::Missing("barycentrics read directly"),
++                };
++                return self.direct_center(mode, index);
++            }
+             Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
+             Input::PrimitiveId => return Val::Missing("the primitive id"),
+             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
+@@ -1770,6 +1793,33 @@ impl<'a> Lower<'a> {
+         })
+     }
+ 
++    /// GFX10 interpolates P0 + I*(P1-P0) + J*(P2-P0). On a D3D triangle
++    /// Y/Z are the weights of API vertices 1/2. Native hardware may rotate
++    /// P0 per quad; this API-order model is explicitly experimental.
++    fn direct_center(&mut self, mode: u8, coordinate: u8) -> Val {
++        let id = match self.s.inputs.iter().position(|e| e.kind == 28 && e.interp == mode) {
++            Some(id) => id,
++            None => {
++                let index = self.s.inputs.iter().filter(|e| e.kind == 28).count() as u32;
++                self.s.inputs.push(SigElement {
++                    name: "SV_Barycentrics".into(),
++                    index,
++                    kind: 28,
++                    comp: 9,
++                    interp: mode,
++                    row: None,
++                    col: 0,
++                    cols: 3,
++                    usage: 0,
++                    half: false,
++                });
++                self.s.inputs.len() - 1
++            }
++        };
++        self.s.flags |= flags::BARYCENTRICS;
++        self.load_any_input(id, coordinate + 1)
++    }
++
+     fn load_input(&mut self, id: usize, col: u8) -> Val {
+         if self.s.inputs[id].half {
+             // shortcut: 16-bit vertex inputs (the fetch routine's) are not
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index 4079886e1ca97e486857122cda4b435eb909dc19..d97a71029e05e1189016c4ba6aa5b164dce984c3 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -496,7 +496,7 @@ fn prepare(container: &[u8]) -> Result<Prepared<'_>, ShaderError> {
+ /// usage relative to the element's starting column.
+ fn emitted_signature(c: &Container<'_>, tag: FourCC) -> Result<Vec<container::SigElement>, ShaderError> {
+     let Some(part) = c.part(tag) else { return Ok(Vec::new()); };
+-    let mut elements = signature(part.data)?;
++    let mut elements = signature_rows(part.data, cfg!(feature = "experimental-barycentrics"))?;
+     let base = crate::dxbc::u32_at(part.data, 4)? as usize;
+     for (index, e) in elements.iter_mut().enumerate() {
+         let rw = part.data[base + index * 32 + 25];
+@@ -815,6 +815,13 @@ fn emit_pruned(
+ 
+ /// The rows of an `ISG1`/`OSG1` part.
+ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
++    signature_rows(part, false)
++}
++
++fn signature_rows(
++    part: &[u8],
++    host_barycentrics: bool,
++) -> Result<Vec<container::SigElement>, ShaderError> {
+     use crate::dxbc::u32_at;
+     let count = u32_at(part, 0)? as usize;
+     let base = u32_at(part, 4)? as usize;
+@@ -856,6 +863,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
+             8 => 2,
+             9 => 13,
+             10 => 12,
++            23 if host_barycentrics => 28, // our unpacked SV_Barycentrics row
+             64 => 16,
+             65 => 17,
+             66 => 14,
+@@ -928,6 +936,42 @@ mod tests {
+     use super::*;
+     use crate::native::{ComputeIo, StageIo};
+ 
++    #[test]
++    fn direct_pixel_centers_require_opt_in_and_distinct_perspectives() {
++        use crate::native::fixture;
++        let is_direct_refusal = |r| matches!(r, Err(ShaderError::Unsupported {
++            what: "barycentrics read directly", ..
++        }));
++        let bytes = fixture::barycentric_pixel_pair();
++        let result = translate(&bytes);
++        if cfg!(feature = "experimental-barycentrics") {
++            let shader = result.unwrap();
++            let c = Container::parse(&shader.dxil).unwrap();
++            let inputs = emitted_signature(&c, FourCC::ISG1).unwrap();
++            assert_eq!(inputs.len(), 2);
++            for (index, e) in inputs.iter().enumerate() {
++                assert_eq!((e.kind, e.index, e.row, e.usage), (28, index as u32, None, 0b110));
++            }
++            let flags = c.part(FourCC::SFI0).unwrap().data;
++            assert_ne!(u64::from_le_bytes(flags[..8].try_into().unwrap()) & 0x2_0000, 0);
++        } else {
++            assert!(is_direct_refusal(result));
++        }
++        let target = fixture::Row {
++            name: "SV_Target",
++            index: 0,
++            system_value: 64,
++            register: 0,
++            mask: 0xf,
++        };
++        // Reuse v0/v1 directly for R/G; refuse sample, centroid, and pull-model.
++        let words = [0xF800_180F, 0x0100_0100, 0xBF81_0000];
++        for input_addr in [1, 4, 8, 16, 64] {
++            let blob = fixture::pixel_with_input_addr(&words, &[], &[], &[target], input_addr);
++            assert!(is_direct_refusal(translate(&blob)), "input mask {input_addr:#x}");
++        }
++    }
++
+     #[test]
+     fn indexed_move_initializes_an_input_before_its_first_use() {
+         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -952,7 +996,8 @@ mod tests {
+ 
+         // A two-block do-while loop writes v[M0] from v2, then exports v1.
+         // On the first two passes M0 selects v0 and v1 respectively. Both
+-        // registers initially contain raw perspective-center barycentrics.
++        // registers initially contain raw perspective barycentrics. With the experimental
++        // center model enabled, centroid keeps the missing-input controls meaningful.
+         let words = |case| {
+             let init = match case {
+                 WrongStart => 0xbe80_0382,   // s_mov_b32 s0, 2
+@@ -1059,7 +1104,7 @@ mod tests {
+                 used: vec![],
+                 io: StageIo::Ps {
+                     inputs: vec![],
+-                    input_addr: 2,
++                    input_addr: if cfg!(feature = "experimental-barycentrics") { 4 } else { 2 },
+                     db_shader_control: 0,
+                     patches: vec![],
+                 },
+diff --git a/crates/victory-shader/src/emit/shader.rs b/crates/victory-shader/src/emit/shader.rs
+index 1ce68176da1523548c80d60fb712709f81e4fed8..e0165976e5afe73a2bfc28787ea244e9037a53d5 100644
+--- a/crates/victory-shader/src/emit/shader.rs
++++ b/crates/victory-shader/src/emit/shader.rs
+@@ -158,6 +158,7 @@ pub(crate) mod flags {
+     pub const ROVS: u64 = 1 << 18;
+     pub const WAVE_OPS: u64 = 1 << 19;
+     pub const INT64: u64 = 1 << 20;
++    pub const BARYCENTRICS: u64 = 1 << 22;
+     /// 64-bit floating point (`fptrunc` from a `double`).
+     pub const FLOAT64: u64 = 1 << 2;
+     pub const ATOMIC64_TYPED: u64 = 1 << 27;
+@@ -1064,6 +1065,9 @@ impl Shader {
+         if self.flags & flags::INT64 != 0 {
+             features |= 0x8000;
+         }
++        if self.flags & flags::BARYCENTRICS != 0 {
++            features |= 0x2_0000;
++        }
+         if self.flags & flags::RESOURCE_HEAP != 0 {
+             features |= 0x200_0000;
+         }
+diff --git a/crates/victory-shader/src/lib.rs b/crates/victory-shader/src/lib.rs
+index b4b7c844cc5c7ec9db25cb4979d33e62f33e7d77..7019252d6d873e6c76e0f3475b4863d741a5dde4 100644
+--- a/crates/victory-shader/src/lib.rs
++++ b/crates/victory-shader/src/lib.rs
+@@ -27,7 +27,10 @@ pub use native::{
+ /// build script, the workspace's lock file and the compiler's version. Caches
+ /// of translations key on it, so a changed translator never serves an old
+ /// translation.
++#[cfg(not(feature = "experimental-barycentrics"))]
+ pub const SOURCE_HASH: &str = env!("VICTORY_SHADER_SOURCE_HASH");
++#[cfg(feature = "experimental-barycentrics")]
++pub const SOURCE_HASH: &str = concat!(env!("VICTORY_SHADER_SOURCE_HASH"), "-api-order-barycentrics");
+ 
+ #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+ pub enum ShaderError {
+diff --git a/crates/victory-shader/src/native.rs b/crates/victory-shader/src/native.rs
+index 63c4a92a17e437e3757e7e67d0217905ef36e650..39eb48bb876d69c7f633e978560d88a4a642cb7c 100644
+--- a/crates/victory-shader/src/native.rs
++++ b/crates/victory-shader/src/native.rs
+@@ -954,13 +954,22 @@ pub mod fixture {
+     /// A wave32 pixel program reading barycentrics I/J in v0/v1: `inputs`
+     /// are (signature row, channel mask, `v_interp` attribute).
+     pub fn pixel(code: &[u32], inputs: &[(u8, u8, u8)], isg1: &[Row], osg1: &[Row]) -> Vec<u8> {
++        pixel_with_input_addr(code, inputs, isg1, osg1, 2)
++    }
++
++    pub(crate) fn pixel_with_input_addr(
++        code: &[u32],
++        inputs: &[(u8, u8, u8)],
++        isg1: &[Row],
++        osg1: &[Row],
++        input_addr: u32,
++    ) -> Vec<u8> {
+         let mut data = stage_data();
+         for (k, &(row, mask, attr)) in inputs.iter().enumerate() {
+             data[PS_INPUTS + 8 * k..][..8].copy_from_slice(&[6, row, mask, attr, 0, 0, 0, 0]);
+         }
+         data[PS_INPUT_COUNT..][..4].copy_from_slice(&(inputs.len() as u32).to_le_bytes());
+-        // PERSP_CENTER_ENA: I and J in v0 and v1.
+-        data[PS_INPUT_ADDR..][..4].copy_from_slice(&2u32.to_le_bytes());
++        data[PS_INPUT_ADDR..][..4].copy_from_slice(&input_addr.to_le_bytes());
+         let dxil = program(HwStage::Ps, code, &data);
+         let (isg1, osg1) = (signature(isg1), signature(osg1));
+         container(&[
+@@ -970,6 +979,19 @@ pub mod fixture {
+         ])
+     }
+ 
++    /// Export perspective-center I/J (RG), screen-linear-center I/J (BA).
++    pub fn barycentric_pixel_pair() -> Vec<u8> {
++        let words = [0xF800_180F, 0x0302_0100, 0xBF81_0000];
++        let target = Row {
++            name: "SV_Target",
++            index: 0,
++            system_value: 64,
++            register: 0,
++            mask: 0xF,
++        };
++        pixel_with_input_addr(&words, &[], &[], &[target], (1 << 1) | (1 << 5))
++    }
++
+     /// `exp prim` corner indices of triangle (0, 1, 2).
+     pub const TRIANGLE: u32 = 1 << 10 | 2 << 20;
+ 
