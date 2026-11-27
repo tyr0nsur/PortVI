@@ -1,0 +1,177 @@
+From: Garu667, the VIctory-NVIDIA contributors, and PortVI contributors
+Subject: Allocate distinct console threads for tiled multidimensional compute groups
+Upstream: https://github.com/trustno1-coder/VIctory-NVIDIA/pull/30 (2dc3df1c72275a1086330ad3b7cba7f9494fe874)
+
+Reserve thread IDs from a group counter for multi-wave, multidimensional
+compute programs that depend on lane order. The counter has its own shared
+storage and partial waves reserve from the end of the group. Programs using
+all 32 KiB of guest LDS keep the existing path. Translation source changes
+already invalidate both disk and in-memory shader caches on this base.
+
+diff --git a/crates/victory-shader/src/emit/halves_tests.rs b/crates/victory-shader/src/emit/halves_tests.rs
+index eb3589d65c6ad37ffe3beb4ebc78b944b0080fc1..91ca09482f97a76f56a2cd2922821cdf05322045 100644
+--- a/crates/victory-shader/src/emit/halves_tests.rs
++++ b/crates/victory-shader/src/emit/halves_tests.rs
+@@ -164,6 +164,53 @@ fn shader(l: lower::Lowered) -> super::HostShader {
+     }
+ }
+ 
++/// Hardware case from VIctory-NVIDIA #30, including groups with a partial wave.
++/// Every invocation stores one at its console flat ID. An unwritten dword
++/// exposes a missing thread even when another thread stores twice at the same ID.
++#[test]
++fn two_dimensional_groups_cover_their_console_thread_ids() {
++    let _guard = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
++    let hosts = Host::each_hardware();
++    for (shift, height) in [(5, 2), (5, 3), (4, 3), (3, 7)] {
++        let width = 1u32 << shift;
++        let threads = width * height;
++        let mut words = PROLOGUE.to_vec();
++        words.extend([
++            0xD765_0003, 0x0001_007E,  // v_mbcnt_lo_u32_b32 v3, exec_lo, 0
++            0x3408_0280 | shift,       // v_lshlrev_b32 v4, shift, v1
++            0x4A08_0104,               // v_add_nc_u32 v4, v4, v0
++            0x3420_0882,               // v_lshlrev_b32 v16, 2, v4
++            0x7E0A_0281,               // v_mov_b32 v5, 1
++        ]);
++        words.extend(store(5, 0));
++        words.push(S_ENDPGM);
++        let mut program = native(&words, false, threads, 0);
++        if let StageIo::Cs(cs) = &mut program.io {
++            cs.threads = [width, height, 1];
++            cs.rsrc2 |= 1 << 11; // thread IDs x and y in v0 and v1
++        }
++        let program = shader(lowered(&program, true).expect("lower wave32 program"));
++        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
++            v.validate(&mut program.dxil.clone()).expect("validate thread allocation");
++        }
++        for (adapter, host) in &hosts {
++            let (root, pso) = host.compute_pipeline(&program).expect("create wave32 pipeline");
++            let ud = vec![0u32; program.user_data_dwords().max(1) as usize];
++            let views = [
++                View::Texture(1, 1, &[[0.0; 4]]),
++                View::Buffer { data: &[0; 4], stride: Stride::Structured(16) },
++                View::RawUav(threads),
++            ];
++            let out = host.dispatch(&root, &pso, &Dispatch {
++                roots: vec![(0, Root::Constants(ud))], views: &views, samplers: &[], groups: [1; 3],
++            }).expect("read console thread IDs");
++            let written = out[0][..threads as usize].iter().filter(|&&word| word == 1).count();
++            eprintln!("{adapter}: {width}x{height}: {written}/{threads} console threads wrote their output");
++            assert_eq!(written, threads as usize, "{width}x{height} on {adapter}");
++        }
++    }
++}
++
+ fn refusal(words: &[u32], threads: u32, lds_bytes: u32) -> String {
+     match lowered(&native(words, true, threads, lds_bytes), true) {
+         Ok(_) => "translated".into(),
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 7cabe9b81d7dffbfa7e7098f0c282b23d1929f6a..e8cf7adfc5849e70fe476d3e8f2f2a6e38ee9acb 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -3164,12 +3164,9 @@ impl<'a> Lower<'a> {
+     }
+ 
+     /// Component `c` of the thread id in the group. With console lanes, the
+-    /// thread is relabelled so that its host lane is its console lane: the
+-    /// flat id is the wave's first lane's, rounded down to the wave size,
+-    /// plus the lane index. (A bijection while each host wave holds a
+-    /// wave-aligned run of flat ids, as the console's waves do.) In
+-    /// [`Lower::halves`] the runs are 32 long: two host waves per console
+-    /// wave, in order.
++    /// thread takes a flat console ID from [`Lower::relabelled_flat`].
++    /// Convert it back to the original group dimensions. In [`Lower::halves`]
++    /// two host waves of 32 represent one console wave of 64.
+     fn thread_id(&mut self, c: u8) -> Val {
+         if !self.console_lanes {
+             return self.compute_id("threadIdInGroup.i32", 95, c);
+diff --git a/crates/victory-shader/src/emit/lower/halves.rs b/crates/victory-shader/src/emit/lower/halves.rs
+index 31a96b74c6df270a91ffeef91b505ae26ce0ee20..a67a1e5b4635a77024313532c77211d92b6b7e47 100644
+--- a/crates/victory-shader/src/emit/lower/halves.rs
++++ b/crates/victory-shader/src/emit/lower/halves.rs
+@@ -50,6 +50,7 @@
+ //! ported from fxceless/victory-fork (#497 there).
+ 
+ use super::*;
++use crate::emit::bitcode::Rmw;
+ 
+ /// Console lanes per host wave in halves.
+ const HALF: u32 = 32;
+@@ -135,13 +136,23 @@ impl Lower<'_> {
+             })
+     }
+ 
+-    /// The flat thread id, relabelled so that each host wave holds a run of
+-    /// [`Shader::wave_size`]-aligned ids from its first lane (see
+-    /// [`Lower::thread_id`]); made once, in the entry block.
++    /// A flat console thread ID made once in the entry block for the whole group.
+     pub(super) fn relabelled_flat(&mut self) -> V {
+         if let Some(f) = self.relabelled {
+             return f;
+         }
++        let wave = self.s.wave_size.expect("set with console lanes");
++        let [x, y, z] = self.s.threads.expect("compute thread group");
++        let group = x * y * z;
++        // A multidimensional group can be tiled across waves. The first
++        // flat IDs of two host waves can therefore round to the same base.
++        // The counter occupies one private dword of D3D's 32 KiB of TGSM.
++        if group > wave && (y > 1 || z > 1) && self.s.lds_dwords < 8192 {
++            let f = self.ticketed_flat(wave, group);
++            self.relabelled = Some(f);
++            self.s.flags |= flags::WAVE_OPS;
++            return f;
++        }
+         let e = self.s.entry;
+         let i32t = self.s.t.i32;
+         let flat = self.s.op(
+@@ -160,7 +171,6 @@ impl Lower<'_> {
+             118,
+             &[flat],
+         );
+-        let wave = self.s.wave_size.expect("set with console lanes");
+         let mask = self.s.m.i32(!(wave - 1));
+         let base = self.s.m.bin(e, Bin::And, first, mask);
+         let lane = self
+@@ -172,6 +182,41 @@ impl Lower<'_> {
+         f
+     }
+ 
++    /// Adapted from VIctory-NVIDIA #30 and Vice-Tay c125c0c. Full waves
++    /// reserve aligned runs from the start and partial waves reserve from
++    /// the end. A group has at most 1024 threads, so the two 16-bit counters
++    /// cannot carry into each other. The console's LDS is separately bounded.
++    fn ticketed_flat(&mut self, wave: u32, group: u32) -> V {
++        let (e, i32t) = (self.s.entry, self.s.t.i32);
++        let zero = self.s.m.i32(0);
++        let one = self.s.m.i32(1);
++        let tickets = self.s.m.global("console_thread_tickets", i32t, 3);
++        self.s.m.atomic(e, Rmw::Xchg, tickets, zero);
++        let sync = self.s.m.i32(1 | 8);
++        self.s.op(e, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[sync]);
++
++        let (sum, unsigned) = (self.s.m.i8(0), self.s.m.i8(1));
++        let count = self.s.op(e, "waveActiveOp.i32", Attr::NoUnwind, i32t, 119, &[one, sum, unsigned]);
++        let rank = self.s.op(e, "wavePrefixOp.i32", Attr::NoUnwind, i32t, 121, &[one, sum, unsigned]);
++        let width = self.s.m.i32(wave);
++        let full = self.s.m.cmp(e, pred::EQ, count, width);
++        let leader = self.s.m.cmp(e, pred::EQ, rank, zero);
++        let shift = self.s.m.i32(16);
++        let partial = self.s.m.bin(e, Bin::Shl, count, shift);
++        let reservation = self.s.m.select(e, full, width, partial);
++        let add = self.s.m.select(e, leader, reservation, zero);
++        let old = self.s.m.atomic(e, Rmw::Add, tickets, add);
++        let found = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
++        let low_mask = self.s.m.i32(0xffff);
++        let front = self.s.m.bin(e, Bin::And, found, low_mask);
++        let reserved = self.s.m.bin(e, Bin::LShr, found, shift);
++        let size = self.s.m.i32(group);
++        let end = self.s.m.bin(e, Bin::Sub, size, reserved);
++        let back = self.s.m.bin(e, Bin::Sub, end, count);
++        let base = self.s.m.select(e, full, front, back);
++        self.s.m.bin(e, Bin::Add, base, rank)
++    }
++
+     /// This lane's index in its console wave: the host lane, or in halves
+     /// the host lane in the half the host wave holds.
+     pub(super) fn console_lane(&mut self) -> V {
