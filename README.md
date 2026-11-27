@@ -90,6 +90,8 @@ This builds `target\release\portvi.exe`, compiles the [open x64 probe](probes/ru
 
 To try direct barycentric reads in a separate runtime, run `python portvi.py smoke --experimental-barycentrics`. It builds `target\release\experimental-barycentrics\portvi.exe` and runs the native probe. The translation assumes Direct3D primitive vertex order. Console hardware can rotate that order, so scene comparisons still require a reference image.
 
+Textures keep their full mip chains by default. For a memory-constrained run, set `$env:VICTORY_TEXTURE_DROP_MIPS = '1'` before launching the runtime. Values from 1 to 4 omit the largest levels of eligible CPU-filled 2D textures, including arrays and cubes. This reduces fine texture detail. Use `Remove-Item Env:VICTORY_TEXTURE_DROP_MIPS` before a full-detail comparison. [Upstream implementation](https://github.com/fxceless/victory-fork/pull/610)
+
 <details>
 <summary><strong>Inspect and run your own executable</strong></summary>
 
