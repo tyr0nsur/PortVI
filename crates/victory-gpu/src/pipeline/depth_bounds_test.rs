@@ -67,6 +67,7 @@ pub(super) fn host_shader(stage: &'static str, hw_stage: victory_shader::HwStage
             root_uavs: Vec::new(),
             memory: false,
             memory_writes: false,
+            root_indexed_views: Vec::new(),
             view_addresses: false,
             heap: false,
             heap_writes: false,

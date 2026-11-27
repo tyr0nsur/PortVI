@@ -10,6 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use victory_shader::resource::RootIndexedView;
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
@@ -49,6 +50,35 @@ pub(crate) struct IndexView {
     address: u64,
     size: u32,
     format: u32,
+}
+
+/// A table descriptor used by this draw. Root-indexed accesses use the kind
+/// of the selected resource view, including a placed texture alias.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TableAccess {
+    slot: u8,
+    dword: u32,
+    declared: Option<ResourceType>,
+}
+
+impl TableAccess {
+    fn used(u: &UsedResource) -> Self {
+        Self { slot: u.slot, dword: u.table_offset_dwords, declared: Some(u.kind) }
+    }
+
+    fn needs_snapshot(self, table: u64, direct: u32, locate: impl FnOnce(u64) -> Option<u32>) -> Option<bool> {
+        let address = table.checked_add(u64::from(self.dword) * 4)?;
+        Some(locate(address)? >= direct)
+    }
+
+    fn kind(self, view: &View) -> Option<ResourceType> {
+        self.declared.or_else(|| match view {
+            View::Shader(..) | View::Placed(false, ..) => Some(ResourceType::Srv),
+            View::Unordered(..) | View::Placed(true, ..) => Some(ResourceType::Uav),
+            View::Constant(..) => Some(ResourceType::Cbv),
+            _ => None,
+        })
+    }
 }
 
 /// What one title list has set, and what its host list was last given.
@@ -708,7 +738,7 @@ impl State {
                     .host()
                     .and_then(|h| h.view_addresses());
             }
-            let made = self.tables(list, &t.used, compute, t.host.view_addresses);
+            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute, t.host.view_addresses);
             // A depth copy of ours made readable a texture the tables hold
             // (`crate::twin`), with a compute pipeline: this one's again
             // (root arguments are set below).
@@ -733,10 +763,10 @@ impl State {
                 if n.is_power_of_two() {
                     tracing::warn!(
                         dropped = n,
-                        "a draw or dispatch dropped: no dynamic slots for its tables"
+                        "a draw or dispatch dropped: its descriptor table could not be prepared"
                     );
                 }
-                not_run("no dynamic slots for its tables");
+                not_run("a descriptor table could not be prepared");
                 return false;
             }
             // Root views a shader reads as title memory: the copies holding
@@ -1244,19 +1274,37 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn indexed_table_accesses(&self, used: &[UsedResource], indexed: &[RootIndexedView], compute: bool) -> Vec<TableAccess> {
+        let mut selected: Vec<TableAccess> = Vec::new();
+        for view in indexed {
+            let constant = self.user_value(compute, view.constant_slot, RootType::Constants, view.constant_dword);
+            let descriptor = view.descriptor(constant);
+            let slot = view.table_slot;
+            let access = TableAccess { slot, dword: descriptor * 8, declared: None };
+            if !used.iter().any(|u| u.root == RootType::Table && u.slot == slot && u.table_offset_dwords / 8 == descriptor)
+                && !selected.contains(&access)
+            {
+                selected.push(access);
+            }
+        }
+        selected
+    }
+
+    fn table_entry(&self, list: &HostList, u: TableAccess, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
-        let handle = table + u64::from(u.table_offset_dwords) * 4;
-        let Some(heap) = self.heap_of(handle) else {
+        let Some(handle) = table.checked_add(u64::from(u.dword) * 4) else { return };
+        let Some(heap) = self.heap_of(*table) else {
             return;
         };
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u, &view, true);
+        if let Some(view) = host.mirror(index, handle, true)
+            && let Some(kind) = u.kind(&view)
+        {
+            readable_as(list, kind, &view, true);
         }
     }
 
@@ -1269,33 +1317,52 @@ impl State {
     ///
     /// Within a list, the same table holding the same descriptors is made
     /// once.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool, view_addresses: bool) -> Vec<(u8, u32)> {
-        let tables = |u: &&UsedResource| u.root == RootType::Table;
+    fn tables(
+        &mut self, list: &HostList, used: &[UsedResource], indexed: &[RootIndexedView], compute: bool, view_addresses: bool,
+    ) -> Vec<(u8, u32)> {
+        let selected = self.indexed_table_accesses(used, indexed, compute);
+        let accesses = || {
+            used.iter().filter(|u| u.root == RootType::Table)
+                .map(TableAccess::used).chain(selected.iter().copied())
+        };
         let mut fresh: Vec<u8> = Vec::new();
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
-        for u in used.iter().filter(tables) {
+        for u in accesses() {
             if fresh.contains(&u.slot) {
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+                self.table_failed |= u.declared.is_none();
                 continue;
             };
-            let end = table + u64::from(u.table_offset_dwords) * 4;
             let Some(heap) = self.heap_of(table) else {
+                self.table_failed |= u.declared.is_none();
                 continue;
             };
-            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
+            if u.declared.is_none() && (heap.samplers() || (table - heap.start) % 32 != 0) {
+                self.table_failed = true;
                 continue;
-            };
-            if index >= host.count() {
-                fresh.push(u.slot);
             }
+            let Some(host) = heap.host() else {
+                self.table_failed |= u.declared.is_none();
+                continue;
+            };
+            match u.needs_snapshot(table, host.count(), |end| heap.index(end)) {
+                Some(true) => fresh.push(u.slot),
+                // A computed index outside the title heap is never a valid
+                // offset into an unrelated range of the host descriptor heap.
+                None if u.declared.is_none() => self.table_failed = true,
+                _ => {}
+            }
+        }
+        if self.table_failed {
+            return Vec::new();
         }
         fresh.sort_unstable();
         fresh.dedup();
-        for u in used.iter().filter(tables) {
+        for u in accesses() {
             if !fresh.contains(&u.slot) {
                 self.table_entry(list, u, compute);
             }
@@ -1305,20 +1372,25 @@ impl State {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
-                .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
+            let entries: Vec<_> = accesses().filter(|u| u.slot == slot).collect();
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
             let Some(host) = heap.host() else {
                 continue;
             };
-            let (start, end) = fresh_range(entries.iter().map(|u| u.table_offset_dwords / 8), host.first_dynamic());
+            let available = heap.remaining(table).unwrap_or(0);
+            let offsets = entries.iter().map(|u| u.dword / 8);
+            let Some((start, end)) = checked_fresh_range(offsets, host.first_dynamic(), available, host.dynamic_capacity()) else {
+                self.table_failed = true;
+                continue;
+            };
+            if heap.samplers() || (table - heap.start) % 32 != 0 {
+                self.table_failed = true;
+                continue;
+            }
             let n = end - start;
-            let metadata = view_addresses && entries.iter().any(|u| u.kind != ResourceType::Sampler);
+            let metadata = view_addresses && entries.iter().any(|u| u.declared != Some(ResourceType::Sampler));
             if metadata && host.view_addresses().is_none() {
                 self.table_failed = true;
                 continue;
@@ -1338,10 +1410,12 @@ impl State {
                 (host.id, table, h.finish())
             };
             if let Some(&base) = self.fresh_tables.get(&key) {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
-                    let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view, true);
+                for u in entries.iter().filter(|u| u.declared != Some(ResourceType::Cbv)) {
+                    let handle = table + u64::from(u.dword) * 4;
+                    if let Some(view) = crate::descriptor::view(handle)
+                        && let Some(kind) = u.kind(&view)
+                    {
+                        readable_as(list, kind, &view, true);
                     }
                 }
                 made.push((slot, base * 32));
@@ -1368,12 +1442,12 @@ impl State {
             // arrays).
             for k in start..end {
                 let index = base + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                let used = entries.iter().find(|u| u.dword / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(view) => {
                         host.make_at(index, &view);
-                        if let Some(u) = used {
-                            readable(list, u, &view, true);
+                        if let Some(kind) = used.and_then(|u| u.kind(&view)) {
+                            readable_as(list, kind, &view, true);
                         }
                     }
                     None => {
@@ -1923,6 +1997,10 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 /// writes through the view mark their pages (every translated shader's do);
 /// the host's own (clears) do not.
 fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
+    readable_as(list, u.kind, view, marked);
+}
+
+fn readable_as(list: &HostList, kind: ResourceType, view: &View, marked: bool) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -1941,7 +2019,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
     if let Some((shadow, address, len)) = range
         && len > 0
     {
-        let uav = u.kind == ResourceType::Uav;
+        let uav = kind == ResourceType::Uav;
         let (refresh_at, refresh_len) = if uav && marked && shadow.marked() {
             shadow.page_range(address, len)
         } else {
@@ -1952,7 +2030,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
             shadow.gpu_writes(list, address, len, marked);
         }
     }
-    match (view, u.kind) {
+    match (view, kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
             // A view of memory the GPU writes through another title texture
             // whose host copy this one could not share reads that copy.
@@ -2080,9 +2158,20 @@ fn fresh_range(entries: impl Iterator<Item = u32> + Clone, first_dynamic: u32) -
     (start, end)
 }
 
+/// Validate both heaps before hashing any descriptor words. An extreme
+/// constant must neither walk past the title allocation nor exhaust scratch.
+fn checked_fresh_range(
+    entries: impl Iterator<Item = u32> + Clone, first_dynamic: u32, available: u32, capacity: u32,
+) -> Option<(u32, u32)> {
+    let (start, end) = fresh_range(entries, first_dynamic);
+    (end <= available && end - start <= capacity).then_some((start, end))
+}
+
 #[cfg(test)]
 mod tests {
     mod descriptor_counts;
+    #[cfg(feature = "diagnostics")]
+    mod root_indexed_readback;
 
     use super::*;
 
@@ -4094,6 +4183,45 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// A table made afresh takes dynamic slots from its first used entry
     /// on, and the offset the shader is given still leads each entry to its
     /// slot.
+    #[test]
+    fn root_selected_texture_expands_the_direct_and_cached_table_span() {
+        let mut state = State::default();
+        state.set_constants(false, 2, &[71, 3], 0);
+        state.set_constants(true, 2, &[71, 1], 0);
+        let indexed = RootIndexedView {
+            table_slot: 7, constant_slot: 2, constant_dword: 1, byte_offset: 32, shift: 5,
+        };
+        let declared = UsedResource { slot: 7, table_offset_dwords: 0, ..used(ResourceType::Srv) };
+        let used = [declared];
+        let evaluate = |compute| state.indexed_table_accesses(&used, &[indexed, indexed], compute);
+        let resolved = evaluate(false);
+        assert_eq!(resolved, [TableAccess { slot: 7, dword: 32, declared: None }]);
+        let selected = resolved[0];
+        let offsets = [0, selected.dword / 8];
+        // The array starts at slot 5, with direct slots 0..8. Element 4
+        // cannot be addressed directly. Its snapshot needs five entries.
+        let heap_start = 4096;
+        let table = heap_start + 5 * 32;
+        let locate = |address: u64| {
+            let index = address.checked_sub(heap_start)? / 32;
+            (index < 11).then_some(index as u32)
+        };
+        assert_eq!(TableAccess::used(&declared).needs_snapshot(table, 8, locate), Some(false));
+        assert_eq!(selected.needs_snapshot(table, 8, locate), Some(true));
+        assert_eq!(selected.needs_snapshot(table + 64, 8, locate), None);
+        assert_eq!(checked_fresh_range(offsets.into_iter(), 8, 6, 5), Some((0, 5)));
+        assert!(checked_fresh_range(offsets.into_iter(), 8, 4, 5).is_none());
+        assert!(checked_fresh_range(offsets.into_iter(), 8, 6, 4).is_none());
+        let views = [View::Shader(19, None), View::Shader(20, None), View::Shader(21, None),
+                     View::Shader(22, None), View::Shader(23, None)];
+        let texture = &views[selected.dword as usize / 8];
+        assert_eq!(texture, &View::Shader(23, None));
+        assert_eq!(selected.kind(texture), Some(ResourceType::Srv));
+        assert_eq!(evaluate(true)[0].dword, 16);
+        let covered = [UsedResource { table_offset_dwords: 32, ..declared }];
+        assert!(state.indexed_table_accesses(&covered, &[indexed], false).is_empty());
+    }
+
     #[test]
     fn a_fresh_table_takes_slots_from_its_first_used_entry() {
         assert_eq!(fresh_range([123, 120].into_iter(), 721_469), (120, 124));

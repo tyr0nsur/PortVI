@@ -74,6 +74,20 @@ pub(crate) fn heap<'a>(this: This) -> &'a Heap {
 }
 
 impl Heap {
+    /// Install the normal capped host layout at a small limit before any
+    /// test descriptors are written. No process-wide heap setting changes.
+    #[cfg(all(test, windows, feature = "diagnostics"))]
+    pub(crate) fn set_test_view_capacity(&self, views: u32) {
+        assert!(!self.samplers() && self.host.get().is_none());
+        let heap = host::HostHeap::sized(false, self.desc.count, views).expect("capped D3D12 view heap");
+        assert!(self.host.set(Some(heap)).is_ok());
+    }
+
+    /// Number of slots remaining from a valid handle in the title heap.
+    pub(crate) fn remaining(&self, handle: u64) -> Option<u32> {
+        self.index(handle).map(|index| self.desc.count - index)
+    }
+
     /// Whether this is a sampler heap.
     pub(crate) fn samplers(&self) -> bool {
         self.desc.kind == SAMPLERS

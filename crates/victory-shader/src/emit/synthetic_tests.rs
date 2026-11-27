@@ -120,6 +120,7 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
         root_uavs: lowered.root_uavs,
         memory: lowered.memory,
         memory_writes: lowered.memory_writes,
+        root_indexed_views: lowered.root_indexed_views,
         view_addresses: lowered.view_addresses,
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
@@ -128,6 +129,10 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
 }
 
 fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError> {
+    lowered_with_remap(native, false)
+}
+
+fn lowered_with_remap(native: &NativeProgram, view_remap: bool) -> Result<lower::Lowered, crate::ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
@@ -143,9 +148,25 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         prims: Vec::new(),
         mesh_stride: 0,
         host_wave32: false,
-        view_remap: false,
+        view_remap,
         view_marks: false,
     })
+}
+
+#[test]
+fn root_indexed_texture_keeps_its_uniform_offset_through_dxil_lowering() {
+    let native = crate::native::fixture::root_indexed_texture(true);
+    for remap in [false, true] {
+        let result = lowered_with_remap(&native, remap).expect("lower root-indexed texture");
+        assert_eq!(result.root_indexed_views, [resource::RootIndexedView {
+            table_slot: 7, constant_slot: 2, constant_dword: 1, byte_offset: 32, shift: 5,
+        }]);
+        assert_eq!(&result.dxil[..4], b"DXBC");
+        assert!(result.heap_handles >= 2);
+        if let Ok(mut validator) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            validator.validate(&mut result.dxil.clone()).expect("validate root-indexed texture");
+        }
+    }
 }
 
 /// The first texel of a footprint (see `Lower::gather_first`).
@@ -915,6 +936,7 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
             root_uavs: l.root_uavs,
             memory: l.memory,
             memory_writes: l.memory_writes,
+            root_indexed_views: l.root_indexed_views,
             view_addresses: l.view_addresses,
             heap: l.heap,
             heap_writes: l.heap_writes,

@@ -21,6 +21,7 @@ use std::sync::{Mutex, OnceLock};
 
 use victory_pipeline::{Cache, Converter};
 use victory_shader::emit::{HostShader, Options, StaticSampler, UserData};
+use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -303,6 +304,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
     // Every field by name: a field added to `HostShader` must be added here
     // (and to `decode`).
     let HostShader {
+        root_indexed_views,
         stage,
         dxil,
         user_data,
@@ -368,6 +370,12 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
             | u32::from(*heap_writes) << 4
             | u32::from(*view_marks) << 5,
     );
+    word(&mut out, root_indexed_views.len() as u32);
+    for view in root_indexed_views {
+        out.extend([view.table_slot, view.constant_slot, view.shift]);
+        word(&mut out, view.constant_dword);
+        word(&mut out, view.byte_offset);
+    }
     out
 }
 
@@ -429,7 +437,20 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
     let memory = r.word()?;
+    let count = r.word()? as usize;
+    if count > r.0.len() / 11 {
+        return None;
+    }
+    let mut root_indexed_views = Vec::with_capacity(count);
+    for _ in 0..count {
+        let &[table_slot, constant_slot, shift] = r.take(3)? else { return None };
+        if shift >= 32 { return None; }
+        root_indexed_views.push(RootIndexedView {
+            table_slot, constant_slot, shift, constant_dword: r.word()?, byte_offset: r.word()?,
+        });
+    }
     r.0.is_empty().then_some(Ok(HostShader {
+        root_indexed_views,
         stage,
         dxil,
         user_data,
@@ -453,6 +474,9 @@ mod tests {
 
     fn shader() -> HostShader {
         HostShader {
+            root_indexed_views: vec![RootIndexedView {
+                table_slot: 7, constant_slot: 2, constant_dword: 1, byte_offset: 32, shift: 5,
+            }],
             stage: HwStage::Ps,
             dxil: b"DXBC and the rest".to_vec(),
             user_data: vec![UserData {

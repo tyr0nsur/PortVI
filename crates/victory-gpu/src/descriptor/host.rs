@@ -256,7 +256,7 @@ impl HostHeap {
     /// [`HostHeap::new`] for view heaps of `views` slots (what translated
     /// shaders index: `victory_shader::emit::heap_views`), the most the
     /// host makes unless it is `HEAP_VIEWS_MAX`.
-    fn sized(sampler: bool, count: u32, views: u32) -> Option<Self> {
+    pub(super) fn sized(sampler: bool, count: u32, views: u32) -> Option<Self> {
         let host = host()?;
         let title_count = count;
         // Title slots past the direct ones live in an overflow range,
@@ -588,6 +588,11 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// Largest consecutive allocation possible even when every dynamic slot is free.
+    pub(crate) fn dynamic_capacity(&self) -> u32 {
+        self.dynamic
     }
 
     /// Lowest physical index that can hold a freshly materialized root table.
