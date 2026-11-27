@@ -1096,8 +1096,8 @@ extern "system" fn clear_rtv(
         else {
             return;
         };
-        let (Some(texture), Some(host)) = (
-            crate::resource::host_resource(record.resource),
+        let (Some((texture, desc)), Some(host)) = (
+            record.target(),
             crate::host::host(),
         ) else {
             return;
@@ -1111,7 +1111,7 @@ extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
-        let rtv = host.rtv(&texture, record.desc().as_ref());
+        let rtv = host.rtv(&texture, desc.as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {

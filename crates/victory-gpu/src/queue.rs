@@ -344,6 +344,38 @@ fn account_frame(frame: u64) {
     }
 }
 
+/// Present can read a target right after its last draw, without any
+/// shader-read barrier: pack B4G4R4A4 planes whose newest colours are
+/// still in their RGBA8 render surface (`crate::twin`) first.
+#[cfg(windows)]
+fn commit_bgra4_planes(host: &crate::host::Host, planes: &[Plane]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    const COPY_SOURCE: u32 = 0x800;
+    let mut sync = None;
+    for plane in planes.iter().filter(|p| p.count != 0 && !p.resources.is_null()) {
+        // SAFETY: an active plane supplies at least its leading resource.
+        let resource = unsafe { *plane.resources };
+        let Some(copy) = crate::resource::made_copy(resource) else { continue };
+        let pending = copy.twin.get().and_then(Option::as_ref)
+            .is_some_and(|t| t.bgra4 && t.newer.load(Relaxed) == crate::twin::TWIN);
+        if !pending {
+            continue;
+        }
+        if sync.is_none() {
+            sync = host.new_list().ok();
+        }
+        if let Some(list) = &sync {
+            let prior = copy.state.load(Relaxed);
+            crate::list::ensure_state(list, resource, COPY_SOURCE);
+            crate::list::ensure_state(list, resource, prior);
+        }
+    }
+    if let Some(list) = sync {
+        list.close();
+        host.execute(&[&list]);
+    }
+}
+
 /// One plane of a `PresentX` call (0x48-byte stride): frame token,
 /// resource count, and pointer to the plane's resources.
 #[repr(C)]
@@ -541,6 +573,7 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         // SAFETY: the title passes the plane descriptions.
         let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
+        commit_bgra4_planes(host, slice);
         let mut resources: Vec<(This, std::sync::Arc<crate::resource::HostTexture>, u32, bool)> =
             Vec::with_capacity(slice.len());
         for plane in slice {

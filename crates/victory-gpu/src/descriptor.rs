@@ -348,6 +348,25 @@ impl RtvRecord {
         self.host_desc(TEXTURE_2D)
     }
 
+    /// Physical target and typed descriptor for an RTV, including packed
+    /// colour targets with a separate writable surface.
+    #[cfg(windows)]
+    pub(crate) fn target(&self) -> Option<(
+        windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        Option<windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC>,
+    )> {
+        let copy = crate::resource::host_copy(self.resource)?;
+        let mut desc = self.desc();
+        if let Some(twin) = copy.twin.get().and_then(Option::as_ref).filter(|t| t.bgra4 && t.write_states & 0x4 != 0) {
+            if let Some(d) = desc.as_mut() {
+                if !matches!(d.Format.0 as u32, 0 | crate::twin::BGRA4) { return None; }
+                d.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(crate::twin::RGBA8 as i32);
+            }
+            return Some((twin.planes[0].texture.clone(), desc));
+        }
+        Some((copy.texture.clone(), desc))
+    }
+
     /// The depth view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn depth_desc(

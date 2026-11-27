@@ -414,13 +414,13 @@ impl State {
                 );
                 continue;
             };
-            let Some(texture) = crate::resource::host_resource(record.resource) else {
+            let Some((texture, desc)) = record.target() else {
                 continue;
             };
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
-            rtvs.push(host.rtv(&texture, record.desc().as_ref()));
+            rtvs.push(host.rtv(&texture, desc.as_ref()));
         }
         self.depth = 0;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -584,7 +584,12 @@ impl State {
         }
         const RENDER_TARGET: u32 = 0x4;
         const DEPTH_WRITE: u32 = 0x10;
-        for &t in &self.targets {
+        for (slot, &t) in self.targets.iter().enumerate() {
+            if slot < 8 && p.bgra4_blends & (1 << slot) != 0 {
+                // A previous draw may have left intermediate 8-bit results in
+                // the render surface. Blend against the native 4-bit destination.
+                crate::list::ensure_state(list, t as This, 0x800);
+            }
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
         if self.depth != 0 {
@@ -2882,6 +2887,386 @@ void main(uint3 id : SV_DispatchThreadID) {
     o.Store4((id.y * 64 + id.x) * 16, asuint(t.Load(int3(id.xy, 0))));
 }
 "#;
+
+    /// Create the observed 2560x1440, single-sample target with its optimized
+    /// clear value. Every pixel shader output is rounded back to its packed
+    /// B4G4R4A4 word, including alpha; all 65536 words occur in this image.
+    #[test]
+    fn bgra4_2560x1440_draw_writes_all_packed_words() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        let host = crate::host::host().expect("B4G4R4A4 draw requires a D3D12 adapter");
+        let (w, h) = (2560u32, 1440u32);
+        let desc = texture_words(w, h, 115, 0x100, 1);
+        let info = [1u32, 0, 0, 0, 0];
+        let optimized = [115u32, 0.2f32.to_bits(), 0.4f32.to_bits(), 0.6f32.to_bits(), 1.0f32.to_bits()];
+        let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc,0x79,0x5b,0x5c,0x98,0x04,0x0f,0xad]);
+        let mut object = std::ptr::null();
+        assert_eq!(crate::resource::create_committed(std::ptr::null(), info.as_ptr().cast(), 0,
+            desc.as_ptr().cast(), 0x4, optimized.as_ptr().cast(), &iid, &mut object), 0);
+        let packed = crate::resource::host_resource(object).expect("2560x1440 packed backing");
+        let mut slot = [0u8; 128];
+        let handle = slot.as_mut_ptr() as u64;
+        crate::descriptor::create_rtv(std::ptr::null(), object, &[115, 4, 0, 0, 0, 0], handle);
+        let (render, typed) = crate::descriptor::rtv_record(handle).unwrap().target().unwrap();
+        let rtv = host.rtv(&render, typed.as_ref());
+        let mut graphics = crate::pipeline::host::GraphicsState::default();
+        let stream: [u32; 10] = [15, 115, 0, 0, 0, 0, 0, 0, 0, 1];
+        // SAFETY: a complete render-target format array subobject.
+        unsafe { graphics.read(15, stream.as_ptr().cast()) };
+        assert_eq!(graphics.targets.RTFormats[0], unsafe { render.GetDesc() }.Format);
+        const SHADERS: &str = r#"
+#define RS "RootFlags(0)"
+[RootSignature(RS)]
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    return float4(id == 1 ? 3 : -1, id == 2 ? -3 : 1, 0, 1);
+}
+float4 ps(float4 p : SV_Position) : SV_Target {
+    uint v = ((uint)p.y * 2560 + (uint)p.x) & 65535;
+    uint4 q = (v >> uint4(8,4,0,12)) & 15;
+    return (q*17 + uint4(2,4,5,7)) / 255.0;
+}"#;
+        let compile = |entry, target| {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: input source and entry points outlive the compiler.
+            unsafe { D3DCompile(SHADERS.as_ptr().cast(), SHADERS.len(), s!("bgra4"), None, None,
+                entry, target, 0, 0, &mut code, None) }.unwrap();
+            code.unwrap()
+        };
+        let (vs, ps) = (compile(s!("vs"), s!("vs_5_1")), compile(s!("ps"), s!("ps_5_1")));
+        // SAFETY: both blobs remain alive until the graphics pipeline is built.
+        let bytecode = |b: &ID3DBlob| unsafe { D3D12_SHADER_BYTECODE {
+            pShaderBytecode: b.GetBufferPointer(), BytecodeLength: b.GetBufferSize(),
+        } };
+        let root: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0,
+            std::slice::from_raw_parts(vs.GetBufferPointer().cast::<u8>(), vs.GetBufferSize())) }.unwrap();
+        let mut p = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            pRootSignature: unsafe { std::mem::transmute_copy(&root) }, VS: bytecode(&vs), PS: bytecode(&ps),
+            SampleMask: u32::MAX, PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, NumRenderTargets: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default()
+        };
+        p.RTVFormats[0] = graphics.targets.RTFormats[0];
+        p.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xf;
+        p.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        p.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        p.RasterizerState.DepthClipEnable = true.into();
+        let pso: ID3D12PipelineState = unsafe { host.device.CreateGraphicsPipelineState(&p) }.unwrap();
+        let list = host.new_list().unwrap();
+        crate::list::ensure_state(&list, object, 0x4);
+        let l = &list.list;
+        // SAFETY: graphics PSO and RTV agree; all resources live through execution.
+        unsafe {
+            l.OMSetRenderTargets(1, Some(&rtv), false, None);
+            l.RSSetViewports(&[D3D12_VIEWPORT { Width:w as f32, Height:h as f32, MaxDepth:1., ..Default::default() }]);
+            l.RSSetScissorRects(&[windows::Win32::Foundation::RECT { right:w as i32, bottom:h as i32, ..Default::default() }]);
+            l.SetGraphicsRootSignature(&root); l.SetPipelineState(&pso);
+            l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            l.DrawInstanced(3, 1, 0, 0);
+        }
+        // Return to the original packed surface and copy its actual bytes out.
+        crate::list::ensure_state(&list, object, 0x800);
+        let mut f = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut len = 0;
+        unsafe { host.device.GetCopyableFootprints(&packed.GetDesc(), 0, 1, 0, Some(&mut f), None, None, Some(&mut len)) };
+        let (output, data) = list.readback(host, len).unwrap();
+        unsafe {
+            let to = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&output),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f } };
+            let from = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&packed),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+            l.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let rows = unsafe { std::slice::from_raw_parts(data, len as usize) };
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let at = f.Offset as usize + y*f.Footprint.RowPitch as usize + x*2;
+                let got = u16::from_le_bytes([rows[at], rows[at+1]]);
+                assert_eq!(got, (y*w as usize + x) as u16, "packed pixel {x},{y}");
+            }
+        }
+        unsafe { host.device.GetDeviceRemovedReason() }.unwrap();
+        eprintln!("B4G4R4A4 2560x1440: 3686400 packed pixels matched, all 65536 RGBA combinations");
+    }
+
+    /// Per-pixel nibbles (r, g, b, a) of the overlapping-blend fixture; the
+    /// shader below computes the same hash.
+    fn bgra4_blend_nibbles(x: u32, y: u32, seed: u32) -> [u32; 4] {
+        let mut h = x.wrapping_mul(0x9e37_79b1) ^ y.wrapping_mul(0x85eb_ca77) ^ seed;
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x2c1b_3c6d);
+        h ^= h >> 12;
+        [h & 15, (h >> 4) & 15, (h >> 8) & 15, (h >> 12) & 15]
+    }
+
+    /// Three draws into the 2560x1440 B4G4R4A4 target, the last two alpha
+    /// blended and overlapping in the middle third. A console target holds
+    /// four bits per channel between draws, so the third draw must blend
+    /// against the second's result rounded to four bits, not the 8-bit
+    /// value the RGBA8 render surface could keep. Every input is a multiple
+    /// of 1/15, so each blend result is a ratio n/225 that is never a
+    /// rounding tie, at four or at eight bits: the expected words are exact.
+    #[test]
+    fn bgra4_overlapping_blends_round_to_four_bits_between_draws() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        let host = crate::host::host().expect("B4G4R4A4 blending requires a D3D12 adapter");
+        let (w, h) = (2560u32, 1440u32);
+        let (left_end, right_start) = (1700u32, 860u32);
+        let desc = texture_words(w, h, 115, 0x100, 1);
+        let info = [1u32, 0, 0, 0, 0];
+        let optimized = [115u32, 0, 0, 0, 0];
+        let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc,0x79,0x5b,0x5c,0x98,0x04,0x0f,0xad]);
+        let mut object = std::ptr::null();
+        assert_eq!(crate::resource::create_committed(std::ptr::null(), info.as_ptr().cast(), 0,
+            desc.as_ptr().cast(), 0x4, optimized.as_ptr().cast(), &iid, &mut object), 0);
+        let packed = crate::resource::host_resource(object).expect("2560x1440 packed backing");
+        let mut slot = [0u8; 128];
+        let handle = slot.as_mut_ptr() as u64;
+        crate::descriptor::create_rtv(std::ptr::null(), object, &[115, 4, 0, 0, 0, 0], handle);
+        let (render, typed) = crate::descriptor::rtv_record(handle).unwrap().target().unwrap();
+        let rtv = host.rtv(&render, typed.as_ref());
+
+        // The title's stream: a B4G4R4A4 target, alpha blended.
+        let mut blend = D3D12_BLEND_DESC::default();
+        blend.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: true.into(),
+            SrcBlend: D3D12_BLEND_SRC_ALPHA, DestBlend: D3D12_BLEND_INV_SRC_ALPHA, BlendOp: D3D12_BLEND_OP_ADD,
+            SrcBlendAlpha: D3D12_BLEND_ONE, DestBlendAlpha: D3D12_BLEND_INV_SRC_ALPHA, BlendOpAlpha: D3D12_BLEND_OP_ADD,
+            LogicOp: D3D12_LOGIC_OP_NOOP, RenderTargetWriteMask: 0xf, ..Default::default()
+        };
+        #[repr(C)]
+        struct BlendSub { kind: u32, desc: D3D12_BLEND_DESC }
+        let sub = BlendSub { kind: 8, desc: blend };
+        let mut graphics = crate::pipeline::host::GraphicsState::default();
+        let stream: [u32; 10] = [15, 115, 0, 0, 0, 0, 0, 0, 0, 1];
+        // SAFETY: complete render-target format and blend subobjects.
+        unsafe {
+            graphics.read(15, stream.as_ptr().cast());
+            graphics.read(8, (&raw const sub).cast());
+        }
+        assert_eq!(graphics.targets.RTFormats[0], unsafe { render.GetDesc() }.Format);
+        let repack = graphics.bgra4_blends();
+        assert_eq!(repack, u8::from(!host.native_bgra4_rtv), "blended expanded targets repack before each draw");
+
+        const SHADERS: &str = r#"
+#define RS "RootFlags(0)"
+[RootSignature(RS)]
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    return float4(id == 1 ? 3 : -1, id == 2 ? -3 : 1, 0, 1);
+}
+float4 nibbles(float4 p, uint seed) {
+    uint h = ((uint)p.x * 0x9e3779b1u) ^ ((uint)p.y * 0x85ebca77u) ^ seed;
+    h ^= h >> 15; h *= 0x2c1b3c6du; h ^= h >> 12;
+    return float4((h >> uint4(0, 4, 8, 12)) & 15) / 15.0;
+}
+float4 ps1(float4 p : SV_Position) : SV_Target { return nibbles(p, 0x1234u); }
+float4 ps2(float4 p : SV_Position) : SV_Target { return nibbles(p, 0xbeefu); }
+float4 ps3(float4 p : SV_Position) : SV_Target { return nibbles(p, 0x5a5au); }
+"#;
+        let compile = |entry, target| {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: input source and entry points outlive the compiler.
+            unsafe { D3DCompile(SHADERS.as_ptr().cast(), SHADERS.len(), s!("bgra4blend"), None, None,
+                entry, target, 0, 0, &mut code, None) }.unwrap();
+            code.unwrap()
+        };
+        let vs = compile(s!("vs"), s!("vs_5_1"));
+        let shaders = [compile(s!("ps1"), s!("ps_5_1")), compile(s!("ps2"), s!("ps_5_1")), compile(s!("ps3"), s!("ps_5_1"))];
+        // SAFETY: the blobs remain alive until the graphics pipelines are built.
+        let bytecode = |b: &ID3DBlob| unsafe { D3D12_SHADER_BYTECODE {
+            pShaderBytecode: b.GetBufferPointer(), BytecodeLength: b.GetBufferSize(),
+        } };
+        let root: ID3D12RootSignature = unsafe { host.device.CreateRootSignature(0,
+            std::slice::from_raw_parts(vs.GetBufferPointer().cast::<u8>(), vs.GetBufferSize())) }.unwrap();
+        let pso = |ps: &ID3DBlob, blended: bool| -> ID3D12PipelineState {
+            let mut p = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: unsafe { std::mem::transmute_copy(&root) }, VS: bytecode(&vs), PS: bytecode(ps),
+                SampleMask: u32::MAX, PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, NumRenderTargets: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default()
+            };
+            p.RTVFormats[0] = graphics.targets.RTFormats[0];
+            p.BlendState.RenderTarget[0].RenderTargetWriteMask = 0xf;
+            if blended { p.BlendState = blend; }
+            p.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            p.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            p.RasterizerState.DepthClipEnable = true.into();
+            unsafe { host.device.CreateGraphicsPipelineState(&p) }.unwrap()
+        };
+        let psos = [pso(&shaders[0], false), pso(&shaders[1], true), pso(&shaders[2], true)];
+        let scissors = [(0, w), (0, left_end), (right_start, w)];
+
+        let list = host.new_list().unwrap();
+        let l = &list.list;
+        for (i, (pso, (left, right))) in psos.iter().zip(scissors).enumerate() {
+            // What `Draw::prepare` does for a pipeline that blends into an
+            // expanded B4G4R4A4 target: pack and expand it again first.
+            if i > 0 && repack & 1 != 0 {
+                crate::list::ensure_state(&list, object, 0x800);
+            }
+            crate::list::ensure_state(&list, object, 0x4);
+            // SAFETY: graphics PSO and RTV agree; all resources live through execution.
+            unsafe {
+                l.OMSetRenderTargets(1, Some(&rtv), false, None);
+                l.RSSetViewports(&[D3D12_VIEWPORT { Width:w as f32, Height:h as f32, MaxDepth:1., ..Default::default() }]);
+                l.RSSetScissorRects(&[RECT { left: left as i32, right: right as i32, bottom: h as i32, ..Default::default() }]);
+                l.SetGraphicsRootSignature(&root); l.SetPipelineState(pso);
+                l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                l.DrawInstanced(3, 1, 0, 0);
+            }
+        }
+        crate::list::ensure_state(&list, object, 0x800);
+        let mut f = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut len = 0;
+        unsafe { host.device.GetCopyableFootprints(&packed.GetDesc(), 0, 1, 0, Some(&mut f), None, None, Some(&mut len)) };
+        let (output, data) = list.readback(host, len).unwrap();
+        unsafe {
+            let to = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&output),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f } };
+            let from = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&packed),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+            l.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+        }
+        list.close();
+        host.execute(&[&list]);
+        unsafe { host.device.GetDeviceRemovedReason() }.unwrap();
+
+        // Blend one channel: source nibble `s` and alpha nibble `a`, destination
+        // `d` in 0..=1. Colour takes source alpha, alpha takes one.
+        let mix = |s: u32, d: f64, a: u32, alpha: bool| -> f64 {
+            f64::from(if alpha { 15 } else { s }) * f64::from(a) / 225.0 + d * f64::from(15 - a) / 15.0
+        };
+        let four = |t: f64| (t * 15.0).round() as u32;
+        let eight = |t: f64| (t * 255.0).round() / 255.0;
+        let word = |q: [u32; 4]| (q[2] | q[1] << 4 | q[0] << 8 | q[3] << 12) as u16;
+        let rows = unsafe { std::slice::from_raw_parts(data, len as usize) };
+        let (mut overlap, mut eight_bit_differs) = (0u32, 0u32);
+        for y in 0..h {
+            for x in 0..w {
+                let mut q = bgra4_blend_nibbles(x, y, 0x1234);
+                let mut held8 = q.map(|v| f64::from(v) / 15.0);
+                for (seed, (left, right)) in [(0xbeef, scissors[1]), (0x5a5a, scissors[2])] {
+                    if !(left..right).contains(&x) { continue; }
+                    let s = bgra4_blend_nibbles(x, y, seed);
+                    let before = q;
+                    for c in 0..4 {
+                        let alpha = c == 3;
+                        q[c] = four(mix(s[c], f64::from(before[c]) / 15.0, s[3], alpha));
+                        held8[c] = eight(mix(s[c], held8[c], s[3], alpha));
+                    }
+                }
+                if (right_start..left_end).contains(&x) {
+                    overlap += 1;
+                    eight_bit_differs += u32::from(held8.map(four) != q);
+                }
+                let at = f.Offset as usize + y as usize * f.Footprint.RowPitch as usize + x as usize * 2;
+                let got = u16::from_le_bytes([rows[at], rows[at + 1]]);
+                assert_eq!(got, word(q), "blended packed pixel {x},{y}");
+            }
+        }
+        // The fixture tells the two apart: keeping 8 bits between the draws
+        // would leave other words in part of the overlap.
+        assert!(eight_bit_differs > 0);
+        eprintln!("B4G4R4A4 overlapping blends 2560x1440: {} pixels matched, {overlap} overlapped, {eight_bit_differs} of them would differ with 8-bit intermediates; repack={repack}",
+            w * h);
+    }
+
+    /// Source-authored packed texels, a partial RTV clear, a float SRV and an
+    /// R16_UINT placed view exercise the same allocation end to end. With a
+    /// native B4G4R4A4 render target (WARP) the texture is a render target
+    /// the host owns, never brought up from title memory: a full clear
+    /// stands in for the authored texels there.
+    #[test]
+    fn bgra4_color_target_preserves_alpha_channel_order_and_packed_aliases() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4};
+        let host = crate::host::host().expect("B4G4R4A4 requires a D3D12 adapter");
+        // SAFETY: query the adapter of the exact device used by this fixture.
+        let a = unsafe {
+            let f: IDXGIFactory4 = CreateDXGIFactory1().unwrap();
+            f.EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid()).unwrap().GetDesc1().unwrap()
+        };
+        let end = a.Description.iter().position(|v| *v == 0).unwrap_or(a.Description.len());
+        eprintln!("B4G4R4A4 adapter={} vendor={:04x} device={:04x} luid={:08x}:{:08x} native_rtv={}",
+            String::from_utf16_lossy(&a.Description[..end]), a.VendorId, a.DeviceId,
+            a.AdapterLuid.HighPart, a.AdapterLuid.LowPart, host.native_bgra4_rtv);
+        let (w, h) = (63usize, 57usize);
+        let address = title_memory(1 << 16);
+        let words = |format, flags| texture_words(w as u32, h as u32, format, 0x100, flags);
+        let object = texture_at_address(address, &words(115, 1));
+        let copy = crate::resource::host_copy(object).expect("packed backing");
+        let (memory, desc) = crate::resource::texture_memory(object).unwrap();
+        let layout = crate::resource::texture_layout(&desc).unwrap().planes.remove(0).layout;
+        let pattern = |x: usize, y: usize| [0x014fu16, 0xf285, 0x9273, 0x48fa][(x + 3 * y) % 4];
+        for y in 0..h {
+            for x in 0..w {
+                let at = layout.offset(0, x as u32, y as u32, 0).unwrap() as usize;
+                // SAFETY: offset is within the fixture's owned console-layout storage.
+                unsafe { (memory.cast_mut().add(at) as *mut u16).write_unaligned(pattern(x, y)) };
+            }
+        }
+        let mut desc = [0u32; 10];
+        desc[..6].copy_from_slice(&[115, 4, 0x1688, 0, 0, 1]);
+        let view = View::Shader(object as usize, Some(desc));
+        let table = Slots::new(1);
+        let read = compile_cs(READ);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        let mut rtv_slot = [0u8; 128];
+        let handle = rtv_slot.as_mut_ptr() as u64;
+        crate::descriptor::create_rtv(std::ptr::null(), object, &[115, 4, 0, 0, 0, 0], handle);
+        let (render, desc) = crate::descriptor::rtv_record(handle).unwrap().target().unwrap();
+        // SAFETY: both resources are live; the canonical one must always be 16-bit.
+        assert_eq!(unsafe { copy.texture.GetDesc() }.Format.0, 115);
+        assert_eq!(unsafe { render.GetDesc() }.Format.0, if host.native_bgra4_rtv { 115 } else { 28 });
+        let rect = RECT { left: 3, top: 4, right: 59, bottom: 51 };
+        let native = host.native_bgra4_rtv;
+        let expected = |round, x, y| {
+            if round == 1 && (3..59).contains(&x) && (4..51).contains(&y) { 0xd36a }
+            else if native { 0x014f } else { pattern(x, y) }
+        };
+        for round in 0..2 {
+            table.make(0, &view);
+            let list = host.new_list().unwrap();
+            if round == 1 || native {
+                crate::list::ensure_state(&list, object, 0x4);
+                let rtv = host.rtv(&render, desc.as_ref());
+                // SAFETY: valid live target and an in-bounds rectangle.
+                unsafe {
+                    if round == 0 {
+                        // Word 0x014f: R 1, G 4, B 15, A 0.
+                        list.list.ClearRenderTargetView(rtv, &[1.0 / 15.0, 4.0 / 15.0, 1.0, 0.0], None);
+                    } else {
+                        list.list.ClearRenderTargetView(rtv, &[0.21, 0.42, 0.69, 0.84], Some(&[rect]));
+                    }
+                }
+            }
+            readable(&list, &used(ResourceType::Srv), &view, false);
+            run(&list, &table, &read, 0, Some(&out), (8, 8));
+            list.close(); host.execute(&[&list]);
+            for y in 0..h { for x in 0..w {
+                let word = expected(round, x, y);
+                let pixel = unsafe { data.cast::<[f32; 4]>().add(y * 64 + x).read() };
+                for (c, shift) in [8, 4, 0, 12].into_iter().enumerate() {
+                    let value = f32::from((word >> shift) & 15u16) / 15.0;
+                    assert!((pixel[c] - value).abs() < 0.000001, "round {round} pixel {x},{y} channel {c}: {} vs {value}", pixel[c]);
+                }
+            }}
+        }
+        let raw = placed_view(address, words(57, 0));
+        table.make(0, &raw);
+        let fetch = compile_cs(&READ.replace("Texture2D<float4>", "Texture2D<uint>")
+            .replace("asuint(t.Load(int3(id.xy, 0)))", "uint4(t.Load(int3(id.xy, 0)),0,0,0)"));
+        let list = host.new_list().unwrap();
+        readable(&list, &used(ResourceType::Srv), &raw, false);
+        run(&list, &table, &fetch, 0, Some(&out), (8, 8));
+        list.close(); host.execute(&[&list]);
+        for y in 0..h { for x in 0..w {
+            let pixel = unsafe { data.cast::<[u32; 4]>().add(y * 64 + x).read() };
+            assert_eq!(pixel[0], u32::from(expected(1, x, y)), "R16_UINT alias {x},{y}");
+        }}
+        unsafe { host.device.GetDeviceRemovedReason() }.unwrap();
+        eprintln!("B4G4R4A4 3591 {} texels, 3591 after partial clear, 3591 packed alias words",
+            if native { "cleared" } else { "title-authored" });
+    }
 
     /// A title's null shader view (CreateShaderResourceView with no resource
     /// and a 2D description, which D3D12 defines as reading zeros), made in a

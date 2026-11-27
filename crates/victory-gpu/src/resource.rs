@@ -1320,6 +1320,7 @@ fn shared_texture(
     let map = map.get_or_insert_with(Default::default);
     let live = key.and_then(|k| map.get(&k)?.upgrade());
     if let Some(t) = &live
+        && (!needs_bgra4_twin(&d) || t.twin.get().is_some_and(|v| v.as_ref().is_some_and(|tw| tw.bgra4)))
         && takes(t, &d)
     {
         SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1343,7 +1344,13 @@ fn shared_texture(
         for r in at.get(&address).into_iter().flatten().map(|&r| resource(r as This)) {
             written |= r.desc.flags & USES != 0;
             if memory_key(address, &r.desc) == Some(k) {
-                d.flags |= host_desc(&r.desc).map_or(0, |h| h.flags & USES);
+                if let Some(h) = host_desc(&r.desc) {
+                    // A raw 16-bit alias keeps its own writable format if the
+                    // packed target uses a separate RGBA render surface.
+                    if d.format == h.format || !(needs_bgra4_twin(&d) || needs_bgra4_twin(&h)) {
+                        d.flags |= h.flags & USES;
+                    }
+                }
             }
         }
     }
@@ -1359,7 +1366,18 @@ fn shared_texture(
     // shortcut: title textures of a replaced host texture keep it (placed
     // views move to the new one, `texture_at`); copies (`alias_source`)
     // bridge the two where the shapes allow.
-    let mut t = make_texture(&d, state, clear)?;
+    let mut t = if needs_bgra4_twin(&d) {
+        // Shader reads, display aliases and CPU transfers keep the actual
+        // 16-bit B4G4R4A4 resource. Its writable twin owns the RTV and UAV.
+        d.flags &= !bgra4_missing_uses();
+        let clear = if d.flags & 1 != 0 { clear } else { std::ptr::null() };
+        let packed = make_texture(&d, state, clear)?;
+        let twin = crate::twin::make(crate::twin::BGRA4, &packed.texture)?;
+        packed.twin.set(Some(twin)).ok()?;
+        packed
+    } else {
+        make_texture(&d, state, clear)?
+    };
     t.key = key;
     let t = std::sync::Arc::new(t);
     if let Some(k) = key {
@@ -1376,6 +1394,17 @@ fn shared_texture(
     Some(t)
 }
 
+#[cfg(windows)]
+fn needs_bgra4_twin(d: &ResourceDesc) -> bool {
+    d.format == crate::twin::BGRA4 && d.sample_count == 1 && d.flags & bgra4_missing_uses() != 0
+}
+
+#[cfg(windows)]
+fn bgra4_missing_uses() -> u32 {
+    crate::host::host().map_or(0, |h|
+        u32::from(!h.native_bgra4_rtv) | u32::from(!h.native_bgra4_uav) * UNORDERED)
+}
+
 /// Whether host texture `t` takes a title texture of host description
 /// `d` at its memory: its uses, and a view format of its family or
 /// castable list.
@@ -1383,7 +1412,14 @@ fn shared_texture(
 fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
     // SAFETY: a live resource.
     let td = unsafe { t.texture.GetDesc() };
-    let (flags, own) = (td.Flags.0 as u32, td.Format.0 as u32);
+    let (mut flags, own) = (td.Flags.0 as u32, td.Format.0 as u32);
+    if t.twin.get().is_some_and(|v| v.as_ref().is_some_and(|tw| tw.bgra4)) {
+        if d.format == crate::twin::BGRA4 {
+            flags |= bgra4_missing_uses();
+        } else if d.flags & USES != 0 {
+            return false;
+        }
+    }
     d.flags & USES & !flags == 0
         && (family(d.format) == family(own)
             || t.castable.iter().any(|&c| family(c) == family(d.format)))
@@ -1691,7 +1727,8 @@ fn remade(k: &MemoryKey) {
 /// or resolve wrote it), so a texture made again has them back.
 #[cfg(windows)]
 fn evictable(t: &HostTexture) -> bool {
-    t.key.is_some() && crate::texture::title_written(&t.texture) && !t.host_written.load(std::sync::atomic::Ordering::Relaxed)
+    t.key.is_some() && !t.twin.get().is_some_and(|v| v.as_ref().is_some_and(|tw| tw.bgra4))
+        && crate::texture::title_written(&t.texture) && !t.host_written.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Once per presented frame, before a submission (`Host::execute`, one at a

@@ -2150,6 +2150,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     .map(|twin| Some((twin, None)));
             }
             let mut desc = desc.as_ref().map(uav_desc);
+            let color = copy.twin.get().and_then(Option::as_ref).filter(|t| t.bgra4 && t.write_states & 0x8 != 0);
+            let texture = if let Some(twin) = color {
+                if let Some(d) = desc.as_mut() {
+                    if !matches!(d.Format.0 as u32, 0 | crate::twin::BGRA4) { return None; }
+                    d.Format = DXGI_FORMAT(crate::twin::RGBA8 as i32);
+                }
+                &twin.planes[0].texture
+            } else { texture };
             if desc.is_none() && !default_view(resource) {
                 return None;
             }
