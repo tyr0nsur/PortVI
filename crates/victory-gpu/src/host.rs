@@ -39,6 +39,30 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
 
+/// The CPU handle origin is fixed for the lifetime of the heap. Cache it
+/// at creation, as in Wiktorxd-1's VIctory-NVIDIA#347.
+struct CpuDescriptorRing {
+    _heap: ID3D12DescriptorHeap,
+    start: usize,
+    step: u32,
+    next: AtomicU32,
+}
+
+impl CpuDescriptorRing {
+    fn new(heap: ID3D12DescriptorHeap, step: u32) -> Self {
+        // SAFETY: the ring owns the live descriptor heap.
+        let start = unsafe { heap.GetCPUDescriptorHandleForHeapStart().ptr };
+        Self { _heap: heap, start, step, next: AtomicU32::new(0) }
+    }
+
+    fn next(&self) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        let slot = self.next.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: self.start + slot as usize * self.step as usize,
+        }
+    }
+}
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
@@ -56,21 +80,14 @@ pub(crate) struct Host {
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     event: HANDLE,
-    rtvs: ID3D12DescriptorHeap,
-    rtv_size: u32,
+    rtvs: CpuDescriptorRing,
     /// A ring of depth views, used as `rtvs`.
-    dsvs: ID3D12DescriptorHeap,
-    dsv_size: u32,
-    next_dsv: AtomicU32,
-    /// A ring of CPU-only views, for the CPU handles of unordered access
-    /// clears, used as `rtvs`.
-    cpu_views: ID3D12DescriptorHeap,
-    cpu_view_size: u32,
-    next_cpu_view: AtomicU32,
+    dsvs: CpuDescriptorRing,
+    /// CPU handles for unordered access clears.
+    cpu_views: CpuDescriptorRing,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
-    next_rtv: AtomicU32,
     presenter: Mutex<Presentation>,
 }
 
@@ -285,16 +302,10 @@ fn create() -> windows::core::Result<Host> {
             fence,
             submitted: Mutex::new(0),
             event,
-            rtvs,
-            rtv_size,
-            dsvs,
-            dsv_size,
-            next_dsv: AtomicU32::new(0),
-            cpu_views,
-            cpu_view_size,
-            next_cpu_view: AtomicU32::new(0),
+            rtvs: CpuDescriptorRing::new(rtvs, rtv_size),
+            dsvs: CpuDescriptorRing::new(dsvs, dsv_size),
+            cpu_views: CpuDescriptorRing::new(cpu_views, cpu_view_size),
             messages,
-            next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(Presentation::default()),
         })
     }
@@ -1730,11 +1741,9 @@ impl Host {
         resource: &ID3D12Resource,
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        let handle = self.rtvs.next();
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
-            let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.rtv_size) as usize;
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
             handle
@@ -1743,11 +1752,7 @@ impl Host {
 
     /// A slot of CPU-only views, valid until it is recorded.
     pub(crate) fn cpu_view(&self) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_cpu_view.fetch_add(1, Ordering::Relaxed) % RTV_RING;
-        // SAFETY: a live heap.
-        let mut handle = unsafe { self.cpu_views.GetCPUDescriptorHandleForHeapStart() };
-        handle.ptr += (slot * self.cpu_view_size) as usize;
-        handle
+        self.cpu_views.next()
     }
 
     /// A host depth view of `resource`, valid until it is recorded.
@@ -1756,11 +1761,9 @@ impl Host {
         resource: &ID3D12Resource,
         desc: Option<&D3D12_DEPTH_STENCIL_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
-        let slot = self.next_dsv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        let handle = self.dsvs.next();
         // SAFETY: a slot of our heap and a live resource.
         unsafe {
-            let mut handle = self.dsvs.GetCPUDescriptorHandleForHeapStart();
-            handle.ptr += (slot * self.dsv_size) as usize;
             self.device
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
             handle
