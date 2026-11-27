@@ -1751,6 +1751,9 @@ impl State {
         // reads. Same order as the `is_skipped` check above, for the same
         // reason.
         if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+            if kind == MESH {
+                crate::pipeline::note_pending_mesh(self.pipeline as This);
+            }
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_indirect_pipeline_drop(kind, self.pipeline as This);
             why("no host pipeline");

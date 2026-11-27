@@ -486,6 +486,14 @@ fn pipeline_drop_reason(this: This) -> Option<(&'static str, String)> {
         .or_else(|| make::missing(&p.host))
 }
 
+/// Records discarded indirect mesh work for the next run's prewarm order.
+#[cfg(windows)]
+pub(crate) fn note_pending_mesh(this: This) {
+    if !this.is_null() {
+        make::note_mesh_miss(&pipeline(this).host);
+    }
+}
+
 /// Counts one indirect call that found no host pipeline.
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_indirect_pipeline_drop(kind: u32, this: This) {
