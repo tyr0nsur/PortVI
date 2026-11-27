@@ -163,10 +163,18 @@ pub(crate) fn lower_pruned(
     let mut direct_centers = false;
     let mut wide = wide::Plan::default();
     let mut literal = halves::Literal::default();
+    // In halves, a lowering whose joins read scalars the console wave holds
+    // once: it stands should the attempts that run their regions wave-wide
+    // fail.
+    let mut kept = None;
     loop {
         let mut pass = Lower::new(parts, &bad, keep, &alike, &wide, &literal);
         pass.direct_centers = direct_centers;
-        match pass.run() {
+        let e = match pass.run() {
+            Ok(l) if wide.grow_scalars(parts) => {
+                kept = Some(l);
+                continue;
+            }
             Ok(l) => return Ok(l),
             // In halves, refused for want of a meeting: the regions where
             // one was wanted run wave-wide next time, where values missing
@@ -175,6 +183,7 @@ pub(crate) fn lower_pruned(
             // and reading it there asks for nothing.
             Err(Stop::Fail(ShaderError::Unsupported { what, .. })) if wide.widen(parts, what) => {
                 bad.retain(|_, &mut why| !halves::for_want_of_a_meeting(why));
+                continue;
             }
             // In halves, refused for a value a whole-wave section leaves
             // that the simulation cannot lower: those sections run step by
@@ -182,14 +191,16 @@ pub(crate) fn lower_pruned(
             // join that read such a value is missing in later ones.
             Err(Stop::Fail(ShaderError::Unsupported { what, .. })) if literal.follow(what) => {
                 bad.retain(|_, &mut why| why != SECTION_UNFOLLOWED && why != halves::SUM16_ACROSS);
+                continue;
             }
-            Err(Stop::Retry(v, why)) => {
-                if bad.insert(v, why).is_some() {
-                    return Err(ShaderError::Unsupported {
-                        offset: 0,
-                        what: "a phi that does not settle",
-                    });
-                }
+            // Such a section where not every thread meets: its region runs
+            // wave-wide next time, where the section may run step by step.
+            Err(Stop::Fail(ShaderError::Unsupported { what, .. }))
+                if (what == SECTION_UNFOLLOWED || what == halves::SUM16_ACROSS)
+                    && wide.grow(parts) =>
+            {
+                bad.retain(|_, &mut why| why != SECTION_UNFOLLOWED && why != halves::SUM16_ACROSS);
+                continue;
             }
             // Preserve ordinary interpolation and already proven dead input reads.
             Err(Stop::Fail(ShaderError::Unsupported { what: "barycentrics read directly", .. }))
@@ -197,9 +208,27 @@ pub(crate) fn lower_pruned(
             {
                 direct_centers = true;
                 bad.clear();
+                continue;
             }
-            Err(Stop::Fail(e)) => return Err(e),
+            Err(Stop::Retry(v, why)) => match bad.insert(v, why) {
+                Some(_) => ShaderError::Unsupported {
+                    offset: 0,
+                    what: "a phi that does not settle",
+                },
+                None => continue,
+            },
+            Err(Stop::Fail(e)) => e,
+        };
+        if let Some(l) = kept {
+            return Ok(l);
         }
+        // Halves for first-lane reads alone failed: as before them.
+        if wide.unroute() {
+            bad.clear();
+            literal = halves::Literal::default();
+            continue;
+        }
+        return Err(e);
     }
 }
 
@@ -350,6 +379,12 @@ struct Lower<'a> {
     /// The values whole-wave sections leave without a lowering, with their
     /// section (block, start), for [`Lower::ask_literal`].
     unfollowed: HashMap<Value, (usize, usize)>,
+    /// The sections run step by step in blocks run wave-wide (block, start,
+    /// end), and whether the instruction being lowered is in one: there the
+    /// section's steps run in every lane of the console wave, as on the
+    /// console, and its saved EXEC holds the block's lanes only.
+    literal_wide: Vec<(usize, usize, usize)>,
+    literal_now: bool,
     /// In halves: VGPR values the same in every lane of the console wave
     /// ([`halves::lane_uniform`]), whose first lane either half reads.
     alike: &'a std::cell::OnceCell<HashSet<Value>>,
@@ -823,14 +858,14 @@ impl<'a> Lower<'a> {
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
             let needs_wave = console_lanes || one_wave && s.lds_dwords > 0;
-            halves = Self::halves_wanted(x, needs_wave);
+            halves = Self::halves_wanted(x, needs_wave, plan);
             if halves {
                 // PortVI assigns tickets to tiled waves when a private LDS dword fits.
                 if s.lds_dwords >= 8192 {
                     halves_refused = Self::halves_tiles(cs.threads);
                 }
             }
-            if needs_wave {
+            if needs_wave || halves {
                 s.wave_size = Some(if halves { 32 } else { wave });
             }
         }
@@ -941,6 +976,8 @@ impl<'a> Lower<'a> {
             plan,
             literal,
             unfollowed: HashMap::new(),
+            literal_wide: Vec::new(),
+            literal_now: false,
             alike,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
@@ -1408,6 +1445,7 @@ impl<'a> Lower<'a> {
                     .get(&mask)
                     .ok_or("a wave reduction's untracked mask")?;
                 let on = self.boolean(m, c)?;
+                let on = self.wide_and(self.cur_ir, on, c);
                 let x = self.i32_of(src)?;
                 let id = self.s.m.i32(ident);
                 return Ok(self.s.m.select(c, on, x, id));
@@ -1431,6 +1469,7 @@ impl<'a> Lower<'a> {
                     .get(&mask)
                     .ok_or("a wave reduction's untracked mask")?;
                 let on = self.boolean(m, c)?;
+                let on = self.wide_and(self.cur_ir, on, c);
                 let x = self.i32_of(src)?;
                 let id = self.s.m.i32(ident);
                 let x = self.s.m.select(c, on, x, id);
@@ -1495,7 +1534,10 @@ impl<'a> Lower<'a> {
             .masks
             .get(&mask)
             .ok_or("a wave reduction's untracked mask")?;
+        // Where the block runs wave-wide, every thread runs it (lanes that
+        // left a loop too): the section's lanes are those of the block.
         let on = self.boolean(m, c)?;
+        let on = self.wide_and(self.cur_ir, on, c);
         let x = self.i32_of(src)?;
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
@@ -1635,7 +1677,12 @@ impl<'a> Lower<'a> {
                     self.s
                         .op(at, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
                 }
+                self.literal_now = self
+                    .literal_wide
+                    .iter()
+                    .any(|&(lb, s, e)| lb == b && s < i && i < e);
                 self.inst(b, i)?;
+                self.literal_now = false;
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
@@ -3046,6 +3093,9 @@ impl<'a> Lower<'a> {
             None => None,
             Some(g) => Some(self.boolean(g, self.cur)?),
         };
+        if self.literal_now {
+            return Ok(g);
+        }
         Ok(self.wide_guard(b, g))
     }
 
@@ -7005,7 +7055,12 @@ impl<'a> Lower<'a> {
                             .st
                             .operand_mask(inst, code, self.x.native.wave64)
                             .ok_or("a select on an untracked mask")?;
-                        self.boolean(m, c)?
+                        let on = self.boolean(m, c)?;
+                        if self.literal_now {
+                            self.wide_and(self.cur_ir, on, c)
+                        } else {
+                            on
+                        }
                     }
                     Some(&Operand::Const(k)) => {
                         let x =
@@ -11456,7 +11511,8 @@ impl<'a> Lower<'a> {
                 };
                 incoming.push((x, qb));
             }
-            self.wide_phi(v, b, incoming, &from);
+            self.wide_phi(v, b, incoming, &from, false)
+                .map_err(|why| unsupported(offset, why))?;
         }
         Ok(())
     }
@@ -11486,7 +11542,7 @@ impl<'a> Lower<'a> {
         for &(v, b, i) in data_phis {
             let phi = &p.blocks[b].phis[i];
             let bit = phi.reg == Reg::Scc;
-            let (mut incoming, mut from) = (Vec::new(), Vec::new());
+            let (mut incoming, mut from, mut values) = (Vec::new(), Vec::new(), Vec::new());
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
                 let Some(qb) = self.tail[q] else { continue };
                 from.push(q);
@@ -11546,9 +11602,17 @@ impl<'a> Lower<'a> {
                     _ if bit => self.s.m.bool(false),
                     _ => self.s.m.i32(0),
                 };
+                if read {
+                    values.push((x, q));
+                }
                 incoming.push((x, qb));
             }
-            self.wide_phi(v, b, incoming, &from);
+            let scalar = !values.is_empty() && self.wave_scalar(phi.value, phi.reg);
+            if scalar {
+                self.scalar_join(b, &values);
+            }
+            self.wide_phi(v, b, incoming, &from, scalar)
+                .map_err(|w| unsupported(p.blocks[b].offset, w))?;
         }
         Ok(())
     }

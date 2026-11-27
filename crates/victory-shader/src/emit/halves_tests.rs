@@ -223,7 +223,7 @@ fn refusal(words: &[u32], threads: u32, lds_bytes: u32) -> String {
 /// The hand-encoded words are the instructions their comments name.
 #[test]
 fn the_test_programs_are_what_their_comments_say() {
-    let programs: [(Vec<u32>, &[&str]); 34] = [
+    let programs: [(Vec<u32>, &[&str]); 36] = [
         (
             sum16(),
             &[
@@ -590,6 +590,31 @@ fn the_test_programs_are_what_their_comments_say() {
                 "v_readfirstlane_b32 s12, v2",
                 "v_mov_b32 v3, s12",
                 "buffer_store_dword v1, v16, s[40:43], 0 offen offset:4",
+            ],
+        ),
+        (
+            first_lane_in_a_masked_branch(1 << 40),
+            &[
+                "v_and_b32 v7, 63, v0",
+                "v_lshrrev_b64 v[8:9], v7, s[30:31]",
+                "v_cmp_ne_u32 vcc, 0, v8",
+                "s_and_saveexec_b64 s[20:21], vcc",
+                "v_readfirstlane_b32 s12, v6",
+                "s_mov_b64 exec, s[20:21]",
+                "v_mov_b32 v3, s12",
+            ],
+        ),
+        (
+            lane_read_loop(true),
+            &[
+                "s_add_u32 s20, s20, 1",
+                "v_cmp_eq_u32 vcc, 0, v9",
+                "s_and_saveexec_b64 s[30:31], vcc",
+                "v_readlane_b32 s9, v0, 40",
+                "s_or_b64 exec, exec, s[30:31]",
+                "v_cmp_lt_u32 vcc, v8, v7",
+                "s_mov_b64 exec, s[26:27]",
+                "v_add_nc_u32 v2, s9, v7",
             ],
         ),
     ];
@@ -2735,4 +2760,304 @@ fn a_16_bit_wave_sum_matches_the_console_in_halves_on_every_gpu() {
         failed.extend(differences_in_halves(&sum16(), threads, 2, &want));
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// [`sum_kept_by_lanes`]'s section inside a branch of the console lanes
+/// from 8, which the first-lane read of the thread id there makes run
+/// wave-wide: the branch's lanes store their kept register (`v2`), the sum
+/// (`v4`, read from lane 0, which the branch leaves out: the section ran
+/// there too, EXEC being all lanes) and the first lane's thread id (`v5`).
+/// The lanes below 8 store nothing.
+fn sum_kept_in_a_wide_branch() -> Vec<u32> {
+    use crate::ir::EXEC;
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0001,
+        0x0002_02C1,           // v_mbcnt_hi_u32_b32 v1, -1, v1
+        vop2(8, 0x25, 129, 0), // v_add_nc_u32 v8, 1, v0
+    ]);
+    let mut body = vec![
+        vop1(12, 0x02, 256), // v_readfirstlane_b32 s12, v0
+        vop1(5, 0x01, 12),   // v_mov_b32 v5, s12
+        sop1(2, 0x25, 193),  // s_or_saveexec_b64 s[2:3], -1
+    ];
+    body.extend(vop3(2, 0x101, 128, 256 + 8, 2)); // v_cndmask_b32 v2, 0, v8, s[2:3]
+    for ctrl in [0xB1, 0x4E, 0x141, 0x140] {
+        body.extend([vop2(2, 0x25, 0xFA, 2), dpp16(2, ctrl)]); // v_add_nc_u32 v2, v2, v2 <dpp>
+    }
+    body.extend(vop3(3, 0x378, 256 + 2, 128, 128)); // v_permlanex16_b32 v3, v2, 0, 0
+    body.push(vop2(2, 0x25, 256 + 3, 2)); // v_add_nc_u32 v2, v3, v2
+    body.extend(vop3(4, 0x360, 256 + 2, 128 + 32, 0)); // v_readlane_b32 s4, v2, 32
+    body.push(vop2(2, 0x25, 4, 2)); // v_add_nc_u32 v2, s4, v2
+    body.extend(vop3(6, 0x360, 256 + 2, 128, 0)); // v_readlane_b32 s6, v2, 0
+    body.push(sop1(EXEC, 0x04, 2)); // s_mov_b64 exec, s[2:3]
+    body.extend([
+        0x7C00_0000 | 0xC4 << 17 | 1 << 9 | 148, // v_cmp_gt_u32 vcc, 20, v1
+        0xBE96_246A,                             // s_and_saveexec_b64 s[22:23], vcc
+        vop1(2, 0x01, 128 + 7),                  // v_mov_b32 v2, 7
+        0xBEFE_0416,                             // s_mov_b64 exec, s[22:23]
+        vop1(4, 0x01, 6),                        // v_mov_b32 v4, s6
+    ]);
+    body.extend(store(2, 0));
+    body.extend(store(4, 4));
+    body.extend(store(5, 8));
+    w.extend([
+        0x7C00_0000 | 0xC3 << 17 | 1 << 9 | 136, // v_cmp_le_u32 vcc, 8, v1
+        0xBE94_246A,                             // s_and_saveexec_b64 s[20:21], vcc
+        0xBF88_0000 | body.len() as u32,         // s_cbranch_execz past it
+    ]);
+    w.extend(body);
+    w.push(0xBEFE_0414); // s_mov_b64 exec, s[20:21]
+    w.push(S_ENDPGM);
+    w
+}
+
+/// What the console stores for [`sum_kept_in_a_wide_branch`]'s thread `l`.
+fn sum_kept_in_a_wide_branch_want(l: u32) -> [u32; 3] {
+    let (base, lane) = (l & !63, l & 63);
+    if lane < 8 {
+        return [0; 3];
+    }
+    let total: u32 = (base + 8..base + 64).map(|k| k + 1).sum();
+    let high: u32 = (base + 32..base + 64).map(|k| k + 1).sum();
+    let kept = match lane {
+        8..20 => 7,
+        20..32 => total,
+        _ => 2 * high,
+    };
+    [kept, total, base + 8]
+}
+
+/// In a block run wave-wide, a section run step by step runs in every lane
+/// of the console wave and sums the block's lanes only: on every hardware
+/// adapter in halves, in groups of 64 and 128.
+#[test]
+fn a_whole_wave_sum_kept_by_lanes_in_a_wide_branch_matches_the_console_in_halves_on_every_gpu() {
+    let mut failed = Vec::new();
+    for threads in [64, 128] {
+        let want: Vec<u32> = (0..threads)
+            .flat_map(sum_kept_in_a_wide_branch_want)
+            .collect();
+        failed.extend(differences_in_halves(
+            &sum_kept_in_a_wide_branch(),
+            threads,
+            3,
+            &want,
+        ));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// Lyrnc's masks for their fw64 cases (checked against a gfx1036 running
+/// wave64): the console lanes that take the branch of
+/// [`first_lane_in_a_masked_branch`].
+const MASKS: [(&str, u64); 9] = [
+    ("all", u64::MAX),
+    ("lo32", 0xFFFF_FFFF),
+    ("hi32", 0xFFFF_FFFF_0000_0000),
+    ("alt", 0x5555_5555_5555_5555),
+    ("lane0", 1),
+    ("lane40", 1 << 40),
+    ("lane63", 1 << 63),
+    ("l31_32", 3 << 31),
+    ("none", 0),
+];
+
+/// A first-lane read of data (three times the thread id, plus 5) inside a
+/// branch the console lanes of `mask` take (each lane tests its bit of the
+/// number by the low six bits of its thread id, `v7`): `s12`, 0x5555
+/// before, stored inside the branch (`v2`, 0xdead outside) and by every
+/// lane after the join (`v3`). Nothing else in it reads other lanes.
+fn first_lane_in_a_masked_branch(mask: u64) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085,                // v_lshlrev_b32 v16, 5, v0
+        vop2(7, 0x1B, 128 + 63, 0), // v_and_b32 v7, 63, v0
+        vop2(6, 0x0B, 128 + 3, 0),  // v_mul_u32_u24 v6, 3, v0
+        vop2(6, 0x25, 128 + 5, 6),  // v_add_nc_u32 v6, 5, v6
+        vop1(2, 0x01, 255),
+        0xDEAD, // v_mov_b32 v2, 0xdead
+        sop1(30, 0x03, 255),
+        mask as u32, // s_mov_b32 s30, <low dword>
+        sop1(31, 0x03, 255),
+        (mask >> 32) as u32, // s_mov_b32 s31, <high dword>
+    ]);
+    w.extend(vop3(8, 0x300, 256 + 7, 30, 0)); // v_lshrrev_b64 v[8:9], v7, s[30:31]
+    w.extend([
+        vop2(8, 0x1B, 128 + 1, 8),               // v_and_b32 v8, 1, v8
+        0x7C00_0000 | 0xC5 << 17 | 8 << 9 | 128, // v_cmp_ne_u32 vcc, 0, v8
+        sop1(12, 0x03, 255),
+        0x5555,                  // s_mov_b32 s12, 0x5555
+        0xBE94_246A,             // s_and_saveexec_b64 s[20:21], vcc
+        0xBF88_0002,             // s_cbranch_execz 2
+        vop1(12, 0x02, 256 + 6), // v_readfirstlane_b32 s12, v6
+        vop1(2, 0x01, 12),       // v_mov_b32 v2, s12
+        0xBEFE_0414,             // s_mov_b64 exec, s[20:21]
+        vop1(3, 0x01, 12),       // v_mov_b32 v3, s12
+    ]);
+    w.extend(store(2, 0));
+    w.extend(store(3, 4));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// What the console stores for [`first_lane_in_a_masked_branch`]'s thread
+/// `l` in a group of `threads`: inside the branch, the data of its wave's
+/// first lane in the mask, which after the join every lane of the wave
+/// holds (the wave ran the branch); 0x5555 where no lane of it took it.
+fn first_lane_in_a_masked_branch_want(mask: u64, threads: u32, l: u32) -> [u32; 2] {
+    let (base, lane) = (l & !63, l & 63);
+    let present = match threads - base {
+        n if n >= 64 => u64::MAX,
+        n => (1 << n) - 1,
+    };
+    let taken = mask & present;
+    if taken == 0 {
+        return [0xDEAD, 0x5555];
+    }
+    let first = 3 * (base + taken.trailing_zeros()) + 5;
+    [
+        if taken >> lane & 1 != 0 {
+            first
+        } else {
+            0xDEAD
+        },
+        first,
+    ]
+}
+
+/// [`first_lane_in_a_masked_branch`] for each of [`MASKS`] (the lanes of
+/// one half or the other, both, one lane, none): the program runs in
+/// halves for its first-lane read alone, where each host wave's first lane
+/// is the console's only for a value alike in every lane; and after the
+/// join every lane holds the scalar the console wave's branch left, the
+/// lanes that skipped it too. On every hardware adapter, in groups of 64
+/// and 128. Before, a lane of the upper half read lane 32's data, and the
+/// lanes that skipped the branch kept 0x5555 (as in the console's own form
+/// on a host of 64-lane waves): pickles976 and carlosmegino found both
+/// with Lyrnc's cases.
+#[test]
+fn a_first_lane_read_in_a_branch_is_the_console_waves_after_the_join_in_halves_on_every_gpu() {
+    let mut failed = Vec::new();
+    for (name, mask) in MASKS {
+        let words = first_lane_in_a_masked_branch(mask);
+        let n = native(&words, true, 64, 0);
+        assert_eq!(
+            lowered(&n, true).expect("halves").wave_size,
+            Some(32),
+            "{name}"
+        );
+        for threads in [64, 128] {
+            let want: Vec<u32> = (0..threads)
+                .flat_map(|l| first_lane_in_a_masked_branch_want(mask, threads, l))
+                .collect();
+            let found = differences_in_halves(&words, threads, 2, &want);
+            failed.extend(found.into_iter().map(|d| format!("{name}: {d}")));
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// A loop console lane `t` runs `t` rounds of (lane 0 none: it never
+/// enters), reading lane 40's thread id into `s9` each round and counting
+/// the rounds in `s20`; after the loop, with EXEC whole again, every lane
+/// stores `t + s9` (`v2`) and `s20` (`v3`). With `joined`, the read is in a
+/// branch the even rounds take, whose EXEC is joined again before the way
+/// back. After pickles976's lane-loop consumers (#439's
+/// `lane_read_loop_tests`), in our own encoding.
+fn lane_read_loop(joined: bool) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085,                                   // v_lshlrev_b32 v16, 5, v0
+        vop2(7, 0x1B, 128 + 63, 0),                    // v_and_b32 v7, 63, v0
+        vop1(8, 0x01, 128),                            // v_mov_b32 v8, 0
+        sop1(9, 0x03, 128),                            // s_mov_b32 s9, 0
+        sop1(20, 0x03, 128),                           // s_mov_b32 s20, 0
+        0xBE9A_047E,                                   // s_mov_b64 s[26:27], exec
+        0x7C00_0000 | 0xC1 << 17 | 7 << 9 | (256 + 8), // v_cmp_lt_u32 vcc, v8, v7
+        0x87FE_6A7E,                                   // s_and_b64 exec, exec, vcc
+    ]);
+    let mut body = vec![0x8014_8114]; // s_add_u32 s20, s20, 1
+    let read = vop3(9, 0x360, 256, 128 + 40, 0); // v_readlane_b32 s9, v0, 40
+    if joined {
+        body.extend([
+            vop2(9, 0x1B, 128 + 1, 8),               // v_and_b32 v9, 1, v8
+            0x7C00_0000 | 0xC2 << 17 | 9 << 9 | 128, // v_cmp_eq_u32 vcc, 0, v9
+            0xBE9E_246A,                             // s_and_saveexec_b64 s[30:31], vcc
+            0xBF88_0002,                             // s_cbranch_execz 2
+        ]);
+        body.extend(read);
+        body.push(0x88FE_1E7E); // s_or_b64 exec, exec, s[30:31]
+    } else {
+        body.extend(read);
+    }
+    body.extend([
+        vop2(8, 0x25, 128 + 1, 8),                     // v_add_nc_u32 v8, 1, v8
+        0x7C00_0000 | 0xC1 << 17 | 7 << 9 | (256 + 8), // v_cmp_lt_u32 vcc, v8, v7
+        0x87FE_6A7E,                                   // s_and_b64 exec, exec, vcc
+    ]);
+    w.push(0xBF88_0000 | (body.len() as u32 + 1)); // s_cbranch_execz past the loop
+    w.extend(&body);
+    let back = -(body.len() as i32 + 1);
+    w.push(0xBF89_0000 | (back as u32 & 0xFFFF)); // s_cbranch_execnz back
+    w.extend([
+        0xBEFE_041A,         // s_mov_b64 exec, s[26:27]
+        vop2(2, 0x25, 9, 7), // v_add_nc_u32 v2, s9, v7
+        vop1(3, 0x01, 20),   // v_mov_b32 v3, s20
+    ]);
+    w.extend(store(2, 0));
+    w.extend(store(3, 4));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// [`lane_read_loop`], both forms, on every hardware adapter in halves, in
+/// groups of 48, 64 and 128: after the loop every lane holds the console
+/// wave's scalars, lane 0 too (it never entered): lane 40's thread id and
+/// the wave's count of rounds (its last lane's). Before, the loop kept them
+/// per lane: lane 0 held 0, and each lane its own count.
+#[test]
+fn scalars_a_loop_leaves_are_the_console_waves_in_every_lane_in_halves_on_every_gpu() {
+    let mut failed = Vec::new();
+    for joined in [false, true] {
+        for threads in [48, 64, 128] {
+            let want: Vec<u32> = (0..threads)
+                .flat_map(|l| {
+                    let (base, t) = (l & !63, l & 63);
+                    [base + 40 + t, (threads - base).min(64) - 1]
+                })
+                .collect();
+            let found = differences_in_halves(&lane_read_loop(joined), threads, 2, &want);
+            failed.extend(found.into_iter().map(|d| format!("joined {joined}: {d}")));
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// Lower the scalar-join and masked-reduction fixtures without reserving a GPU.
+#[test]
+fn masked_reductions_and_wave_scalar_joins_translate_in_halves() {
+    let mut validator =
+        validator::Validator::load(validator::Validator::default_path().as_deref()).ok();
+    let mut check = |words: &[u32], threads| {
+        let mut l = lowered(&native(words, true, threads, 0), true).expect("wave64 lowering");
+        assert_eq!(l.wave_size, Some(32));
+        if let Some(v) = &mut validator {
+            v.validate(&mut l.dxil).expect("valid translated DXIL");
+        }
+    };
+    for threads in [64, 128] {
+        check(&sum_kept_in_a_wide_branch(), threads);
+        for (_, mask) in MASKS {
+            check(&first_lane_in_a_masked_branch(mask), threads);
+        }
+    }
+    for threads in [48, 64, 128] {
+        for joined in [false, true] {
+            check(&lane_read_loop(joined), threads);
+        }
+    }
 }

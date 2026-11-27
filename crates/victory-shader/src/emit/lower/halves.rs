@@ -31,7 +31,9 @@
 //!   group gets there together ([`Exchange`]); elsewhere they are refused;
 //! * a value the same in every lane of the console wave ([`lane_uniform`],
 //!   what the compiler reads first lanes for) is its own first lane, so its
-//!   `v_readfirstlane_b32` is the host wave's anywhere;
+//!   `v_readfirstlane_b32` is the host wave's anywhere; a program that reads
+//!   the first lane of any other value runs in halves for it, though
+//!   nothing else in it reads other lanes ([`first_across`]);
 //! * a group of 32 threads or fewer is one host wave, which holds its whole
 //!   console wave: nothing is in the other half, so its ballots' high dwords
 //!   are 0, its reductions and first lanes are the host wave's, and a lane
@@ -112,10 +114,12 @@ impl Lower<'_> {
         self.s.m.select(c, running, r, z)
     }
 
-    /// Whether a wave64 program whose lanes follow the console's runs in
-    /// halves: the host's waves are 32 lanes at most.
-    pub(super) fn halves_wanted(x: &Parts, needs_wave: bool) -> bool {
-        needs_wave && x.native.wave64 && x.host_wave32
+    /// Whether a wave64 program runs in halves: the host's waves are 32
+    /// lanes at most, and its lanes follow the console's (`needs_wave`) or
+    /// it reads first lanes the host wave's may not be ([`first_across`],
+    /// unless attempts in halves failed: [`Plan::first_lanes`]).
+    pub(super) fn halves_wanted(x: &Parts, needs_wave: bool, plan: &Plan) -> bool {
+        x.native.wave64 && x.host_wave32 && (needs_wave || plan.first_lanes(x))
     }
 
     /// An unmodified 1D thread id at program entry has a known first value
@@ -375,6 +379,54 @@ impl Lower<'_> {
         Ok(self.s.m.select(c, upper, hi, lo))
     }
 
+    /// Per lane boolean of `bits`, whether some lane of the lane's console
+    /// wave has it, taken in DXIL block `at`, which every thread of the group
+    /// runs: each host wave's ballot, and in halves both halves', traded
+    /// (packed 32 to a word).
+    pub(super) fn wave_any(&mut self, at: usize, bits: &[V]) -> Result<Vec<V>, Why> {
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let (z, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        self.s.flags |= flags::WAVE_OPS;
+        let mine: Vec<V> = bits
+            .iter()
+            .map(|&b| {
+                let ballot = self
+                    .s
+                    .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[b]);
+                let word = self.s.m.extract(at, ballot, 0);
+                self.s.m.cmp(at, pred::NE, word, z)
+            })
+            .collect();
+        if !self.trades() {
+            return Ok(mine);
+        }
+        let mut out = Vec::with_capacity(mine.len());
+        for chunk in mine.chunks(32 * WORDS as usize) {
+            let mut words = Vec::new();
+            for part in chunk.chunks(32) {
+                let mut word = z;
+                for (k, &b) in part.iter().enumerate() {
+                    let bit = self.s.m.i32(1 << k);
+                    let bit = self.s.m.select(at, b, bit, z);
+                    word = self.s.m.bin(at, Bin::Or, word, bit);
+                }
+                words.push((word, 0));
+            }
+            let traded = self.trade(at, &words)?;
+            for (&(lo, hi), part) in traded.iter().zip(chunk.chunks(32)) {
+                let both = self.s.m.bin(at, Bin::Or, lo, hi);
+                for k in 0..part.len() {
+                    let sh = self.s.m.i32(k as u32);
+                    let bit = self.s.m.bin(at, Bin::LShr, both, sh);
+                    let bit = self.s.m.bin(at, Bin::And, bit, one);
+                    out.push(self.s.m.cmp(at, pred::NE, bit, z));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Each half's `words` (word and identity; each word the same in every
     /// lane of its host wave), traded through group-shared memory in DXIL
     /// block `at` of an IR block where every thread of the group meets
@@ -539,20 +591,43 @@ impl Lower<'_> {
     /// In halves, the whole-wave sections the plan runs instruction by
     /// instruction rather than by the simulation's shapes ([`Literal`]):
     /// they are left out of [`Lower::sections`], so each of their steps is
-    /// lowered on its own. Where every thread of the group does not meet,
-    /// or in a group of a part of a console wave, they keep the simulation
-    /// (and the program its refusal).
+    /// lowered on its own. In a block run wave-wide, every thread runs it,
+    /// lanes not in it too: there the steps run in every lane of the console
+    /// wave, as the console's do once the section sets EXEC to all lanes,
+    /// and the EXEC the section saved holds the block's lanes
+    /// ([`Lower::guard`], `v_cndmask_b32`). Where every thread of the group
+    /// does not meet, they keep the simulation and ask for the block's
+    /// region to run wave-wide; in a group of a part of a console wave they
+    /// keep it (and the program its refusal).
     pub(super) fn literal_sections(&mut self) {
         let whole = |t: [u32; 3]| t.iter().product::<u32>().is_multiple_of(2 * HALF);
         if !self.trades() || !self.s.threads.is_some_and(whole) {
             return;
         }
-        let (literal, meet) = (&self.literal.sections, &self.exchange.meet);
+        let (literal, meet, wide) = (
+            &self.literal.sections,
+            &self.exchange.meet,
+            &self.wide.inside,
+        );
+        let mut stepped = Vec::new();
         for (&b, found) in &mut self.sections {
-            if meet.get(b).copied().unwrap_or(false) {
-                found.retain(|&start, _| !literal.contains(&(b, start)));
+            if !meet.get(b).copied().unwrap_or(false) {
+                // Where it runs wave-wide, its threads meet.
+                if found.keys().any(|&start| literal.contains(&(b, start))) {
+                    self.plan.ask(b);
+                }
+                continue;
             }
+            let in_wide = wide.get(b).copied().unwrap_or(false);
+            found.retain(|&start, sec| {
+                let keep = !literal.contains(&(b, start));
+                if !keep && in_wide {
+                    stepped.push((b, start, sec.end));
+                }
+                keep
+            });
         }
+        self.literal_wide = stepped;
         self.sections.retain(|_, found| !found.is_empty());
     }
 
@@ -1025,6 +1100,39 @@ pub(super) fn for_want_of_a_meeting(what: Why) -> bool {
 
 /// Why LDS stops in halves where it cannot be put in order.
 const MIXED: Why = "LDS a branch only some lanes take both writes and reads (or writes twice), on a host of 32-lane waves";
+
+/// Whether a program reads a first lane the host wave's may not be: a
+/// `v_readfirstlane_b32` of a value not known to be the same in every lane
+/// of the console wave ([`lane_uniform`]), other than a waterfall loop's
+/// (each lane's own). The console reads the first lane in EXEC of its
+/// wave, which on a 32-lane host may be in the other half: such a program
+/// runs in halves ([`Lower::first_lane`]) though nothing else in it needs
+/// the console's lanes (pickles976 found these programs left out, with
+/// Lyrnc's fw64 cases).
+pub(super) fn first_across(x: &Parts) -> bool {
+    let reads = || {
+        x.p.blocks.iter().flat_map(|b| &b.insts).filter(|i| {
+            i.name() == "v_readfirstlane_b32"
+                && !i
+                    .writes
+                    .first()
+                    .is_some_and(|w| x.res.waterfall.reads.contains(&w.1))
+        })
+    };
+    if reads().next().is_none() {
+        return false;
+    }
+    let alike = lane_uniform(x);
+    reads().any(|i| match &i.fields {
+        Fields::Valu(v) => match v.src.first() {
+            Some(&Operand::Vector { reg, .. }) => {
+                !i.read(Reg::V(reg)).is_some_and(|r| alike.contains(&r))
+            }
+            _ => false,
+        },
+        _ => false,
+    })
+}
 
 /// Why a first-lane read stops in halves: the console's first lane may be
 /// in the other half, the value is not known to be the same there, and the

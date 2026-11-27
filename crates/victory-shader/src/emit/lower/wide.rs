@@ -16,7 +16,9 @@
 //!   accessed by those lanes only, and the wave operations that read EXEC
 //!   (ballots, first lanes, DPP source lanes) see only them.
 //! - A phi of a block of the region, or of its join, picks lane by lane the
-//!   value along the edge the lane came by.
+//!   value along the edge the lane came by; a scalar's is the console
+//!   wave's, what the last block of those edges it ran left
+//!   ([`Lower::wide_fold`]).
 //! - Every block of the region is one where every thread meets
 //!   ([`super::halves::Exchange`]): the halves trade there, and LDS is put
 //!   in order there, as anywhere else.
@@ -33,25 +35,28 @@
 //!   then on; after the loop the edge's lanes are all that left along it,
 //!   in any round.
 //! - What a lane holds stays as it left it: VGPR writes are guarded, and
-//!   every other value a block of the loop defines (scalars, compare bits,
-//!   what whole-wave sections leave, ballots) is kept per lane from the last
+//!   every other value a block of the loop defines (compare bits, what
+//!   whole-wave sections leave, ballots) is kept per lane from the last
 //!   round the lane ran the block ([`Lower::wide_keep`]), as each lane holds
-//!   it in the per-lane form.
+//!   it in the per-lane form. A scalar is the console wave's: kept from the
+//!   last round some lane of the wave ran the block, in every lane.
 //!
 //! A region may hold the program's ends (it then has no join): a lane that
 //! gets to an end is in no block after it, and every thread ends together
 //! at the region's last block.
 //!
-//! Scalar code runs in every lane, as it does in the per-lane form, which
-//! keeps each lane's values; a region whose scalar code has effects beyond
-//! its values (stores, atomics, messages) does not run wave-wide, nor one
-//! with a loop entered other than at its header.
+//! Scalar code runs in every lane, as it does in the per-lane form; a
+//! region whose scalar code has effects beyond its values (stores, atomics,
+//! messages) does not run wave-wide, nor one with a loop entered other than
+//! at its header.
 //!
 //! The lowering takes these regions only where an attempt was refused for
-//! want of a meeting ([`Plan`]): a program that needs none is lowered as
+//! want of a meeting ([`Plan`]), or where a join reads a scalar that lanes
+//! which skipped a block need the console wave's value of
+//! ([`Lower::scalar_join`]): a program that needs none is lowered as
 //! before, and one that does pays for its regions only.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use super::*;
 
@@ -65,6 +70,14 @@ pub(super) struct Plan {
     heads: BTreeSet<usize>,
     /// The blocks the attempts since the plan last grew wanted a meeting at.
     asked: RefCell<BTreeSet<usize>>,
+    /// The edges the last attempt wanted their region run wave-wide along
+    /// for a scalar their join reads ([`Lower::scalar_join`]).
+    scalars: RefCell<BTreeSet<(usize, usize)>>,
+    /// Whether the last attempt ran halves for its first-lane reads alone
+    /// ([`super::halves::first_across`]).
+    routed: Cell<bool>,
+    /// Whether attempts so routed failed: the program then runs as before.
+    plain: bool,
 }
 
 impl Plan {
@@ -79,8 +92,15 @@ impl Plan {
     /// attempts after, and reading it there asks for nothing); whether
     /// another attempt is worth making (some region joined).
     pub(super) fn widen(&mut self, x: &Parts, what: Why) -> bool {
+        super::halves::for_want_of_a_meeting(what) && self.grow(x)
+    }
+
+    /// The regions around the blocks asked for join the plan, whatever the
+    /// refusal (a section run step by step asks for its block's region,
+    /// [`Lower::literal_sections`]); whether some region joined.
+    pub(super) fn grow(&mut self, x: &Parts) -> bool {
         let asked = std::mem::take(self.asked.get_mut());
-        if asked.is_empty() || !super::halves::for_want_of_a_meeting(what) {
+        if asked.is_empty() {
             return false;
         }
         let regions = regions(x);
@@ -91,6 +111,57 @@ impl Plan {
             }
         }
         grew
+    }
+
+    /// Notes that a scalar along IR edge `(q, b)` is read at `b`, which
+    /// lanes may reach by other edges ([`Lower::scalar_join`]).
+    pub(super) fn ask_scalar(&self, q: usize, b: usize) {
+        self.scalars.borrow_mut().insert((q, b));
+    }
+
+    /// After an attempt that was lowered: the innermost region each edge it
+    /// asked for scalars leaves or runs in joins the plan; whether some
+    /// region joined. The next attempt is then worth making, and should it
+    /// fail, this one stands ([`super::lower`]).
+    pub(super) fn grow_scalars(&mut self, x: &Parts) -> bool {
+        let asked = std::mem::take(self.scalars.get_mut());
+        if asked.is_empty() {
+            return false;
+        }
+        let regions = regions(x);
+        let mut grew = false;
+        for (q, b) in asked {
+            let inmost = regions
+                .iter()
+                .filter(|r| (r.head == q || r.blocks[q]) && (r.join == Some(b) || r.blocks[b]))
+                .min_by_key(|r| r.blocks.iter().filter(|&&x| x).count());
+            if let Some(r) = inmost {
+                grew |= self.heads.insert(r.head);
+            }
+        }
+        grew
+    }
+
+    /// Whether a program not otherwise in halves runs in them for its
+    /// first-lane reads ([`super::halves::first_across`]): unless attempts
+    /// that did failed.
+    pub(super) fn first_lanes(&self, x: &Parts) -> bool {
+        let routed = !self.plain && super::halves::first_across(x);
+        self.routed.set(routed);
+        routed
+    }
+
+    /// After the attempts failed: whether the last ran halves for its
+    /// first-lane reads alone; the plan then starts over without them.
+    pub(super) fn unroute(&mut self) -> bool {
+        if !self.routed.get() {
+            return false;
+        }
+        *self = Plan {
+            plain: true,
+            ..Plan::default()
+        };
+        true
     }
 }
 
@@ -516,6 +587,14 @@ pub(super) struct Wide {
     /// outside the region read them), and the DXIL values that replaced
     /// them, by the ones replaced (for its phis, which are set last).
     swaps: HashMap<usize, (Vec<Swapped>, HashMap<V, V>)>,
+    /// Per IR block of a region: its place in the region's order.
+    pos: HashMap<usize, usize>,
+    /// Per DXIL block and lanes (i1): whether some lane of each lane's
+    /// console wave is among them there ([`Lower::wave_ran`]).
+    ran: HashMap<(usize, V), V>,
+    /// The values read outside the block that defines them (by another
+    /// block, or a phi), which a loop keeps ([`Lower::wide_keep_block`]).
+    escapes: HashSet<Value>,
     /// The regions' loops, by header.
     loops: HashMap<usize, Loop>,
     /// Per IR block that is the last of loops: their headers, the inmost
@@ -546,6 +625,21 @@ impl Wide {
         if plan.heads.is_empty() {
             return wide;
         }
+        let mut def = HashMap::new();
+        for (b, block) in x.p.blocks.iter().enumerate() {
+            def.extend(block.phis.iter().map(|phi| (phi.value, b)));
+            for inst in &block.insts {
+                def.extend(inst.writes.iter().map(|w| (w.1, b)));
+            }
+        }
+        for (b, block) in x.p.blocks.iter().enumerate() {
+            wide.escapes
+                .extend(block.phis.iter().flat_map(|phi| phi.args.iter().copied()));
+            for inst in &block.insts {
+                let elsewhere = inst.reads.iter().map(|r| r.1).filter(|v| def.get(v) != Some(&b));
+                wide.escapes.extend(elsewhere);
+            }
+        }
         let mut doms: Option<Doms> = None;
         for r in regions(x)
             .into_iter()
@@ -570,7 +664,8 @@ impl Wide {
                 wide.entered.insert(first, e);
             }
             let mut last = r.head;
-            for &b in &r.order {
+            for (k, &b) in r.order.iter().enumerate() {
+                wide.pos.insert(b, k);
                 wide.inside[b] = true;
                 wide.next.insert(last, b);
                 last = b;
@@ -978,7 +1073,16 @@ impl Lower<'_> {
     /// each loop's header carries it round; a lane that never ran it holds
     /// zero, which nothing of its own reads).
     pub(super) fn wide_keep(&mut self, b: usize, x: V, at: usize) -> V {
-        let (Some(&on), Some(around)) = (self.wide.lanes.get(&b), self.wide.around.get(&b)) else {
+        match self.wide.lanes.get(&b).copied() {
+            Some(on) => self.wide_keep_in(b, x, at, on),
+            None => x,
+        }
+    }
+
+    /// [`Lower::wide_keep`] in the lanes `on`: the block's own, or for a
+    /// scalar every lane whose console wave ran the block.
+    fn wide_keep_in(&mut self, b: usize, x: V, at: usize, on: V) -> V {
+        let Some(around) = self.wide.around.get(&b) else {
             return x;
         };
         let around = around.clone();
@@ -1026,13 +1130,18 @@ impl Lower<'_> {
     }
 
     /// At the end of IR block `b` in a loop run wave-wide: the values it
-    /// defines other than guarded VGPR writes (scalars, compare bits, what
-    /// whole-wave sections leave) are held per lane from here on
-    /// ([`Lower::wide_keep`]).
-    fn wide_keep_block(&mut self, b: usize) {
-        if !self.wide.around.contains_key(&b) || !self.wide.lanes.contains_key(&b) {
-            return;
+    /// defines other than guarded VGPR writes (compare bits, what whole-wave
+    /// sections leave) are held per lane from here on
+    /// ([`Lower::wide_keep`]); a scalar, the console wave's, in every lane
+    /// whose wave ran the block this round ([`Lower::wave_scalar`]), where
+    /// anything outside the block reads it (its reads inside come first).
+    fn wide_keep_block(&mut self, b: usize) -> Result<(), Why> {
+        if !self.wide.around.contains_key(&b) {
+            return Ok(());
         }
+        let Some(&on) = self.wide.lanes.get(&b) else {
+            return Ok(());
+        };
         let block = &self.x.p.blocks[b];
         let at = self.cur;
         let sections: HashSet<usize> = self
@@ -1042,38 +1151,79 @@ impl Lower<'_> {
             .flatten()
             .flat_map(|(&start, s)| start + 1..s.end)
             .collect();
-        let mut values: Vec<Value> = block
+        let mut values: Vec<(Value, Reg)> = block
             .phis
             .iter()
             .filter(|phi| !matches!(phi.reg, Reg::V(_)))
-            .map(|phi| phi.value)
+            .map(|phi| (phi.value, phi.reg))
             .collect();
         for (i, inst) in block.insts.iter().enumerate() {
             for &(reg, v) in &inst.writes {
                 if !matches!(reg, Reg::V(_)) || sections.contains(&i) {
-                    values.push(v);
+                    values.push((v, reg));
                 }
             }
         }
-        for v in values {
+        for (v, reg) in values {
+            let on = match self.wave_scalar(v, reg) {
+                true if !self.wide.escapes.contains(&v) => continue,
+                true => self.wave_ran(at, &[on])?[0],
+                false => on,
+            };
             match self.vals.get(&v).copied() {
                 Some(Val::I32(x)) => {
-                    let kept = self.wide_keep(b, x, at);
+                    let kept = self.wide_keep_in(b, x, at, on);
                     self.vals.insert(v, Val::I32(kept));
                 }
                 Some(Val::Bit(x)) => {
-                    let kept = self.wide_keep(b, x, at);
+                    let kept = self.wide_keep_in(b, x, at, on);
                     self.vals.insert(v, Val::Bit(kept));
                 }
                 _ => {}
             }
             if let Some(&bit) = self.lane_bits.get(&v) {
-                let kept = self.wide_keep(b, bit, at);
+                let kept = self.wide_keep_in(b, bit, at, on);
                 self.lane_bits.insert(v, kept);
             }
         }
         // Lane booleans worked out before now read the values as they were.
         self.bools.clear();
+        Ok(())
+    }
+
+    /// A scalar phi of IR block `b`, read along the edges of `values` (each
+    /// a value and the block its edge leaves), where `b` joins no region
+    /// run wave-wide: where those values differ and lanes may come to `b`
+    /// by different edges, the console wave holds one of them in every
+    /// lane, the one the last block it ran left. The per-lane form gives
+    /// each lane its own edge's instead (a lane that skipped a branch holds
+    /// the scalar from before it), so in halves the edges' regions run
+    /// wave-wide next time, where their joins fold the console wave's
+    /// value ([`Lower::wide_fold`]).
+    pub(super) fn scalar_join(&self, b: usize, values: &[(V, usize)]) {
+        if !self.halves
+            || self.one_host_wave()
+            || self.wide.from.contains_key(&b)
+            || self.uniform_join(b)
+            || values.iter().all(|&(x, _)| x == values[0].0)
+        {
+            return;
+        }
+        for &(_, q) in values {
+            self.plan.ask_scalar(q, b);
+        }
+    }
+
+    /// Whether value `v` of register `reg` is a scalar the console wave
+    /// holds once for all its lanes: an SGPR's, but not a lane mask's (a
+    /// lane's bit of it is its own), nor a compare's bits, nor a dword a
+    /// waterfall loop reads (each lane's own there).
+    pub(super) fn wave_scalar(&self, v: Value, reg: Reg) -> bool {
+        matches!(reg, Reg::S(_))
+            && !self.x.st.masks.contains_key(&v)
+            && !self.x.st.highs.contains_key(&v)
+            && !self.lane_bits.contains_key(&v)
+            && !self.x.res.waterfall.reads.contains(&v)
     }
 
     /// The exit of IR block `b` where it heads a region run wave-wide or is
@@ -1086,7 +1236,7 @@ impl Lower<'_> {
         if next.is_none() && !self.wide.last.contains(&b) {
             return Ok(None);
         }
-        self.wide_keep_block(b);
+        self.wide_keep_block(b)?;
         let c = self.cur;
         let on = self.wide.lanes.get(&b).copied();
         let edge = |l: &mut Self, to: usize, e: Option<V>| {
@@ -1222,11 +1372,19 @@ impl Lower<'_> {
     /// into a join around the region (the whole group took it, see
     /// [`regions`]) keeps its own DXIL predecessor. In a region entered
     /// other than from its head, a value replaced along the ways in
-    /// ([`Lower::wide_entries`]) is what replaced it.
-    pub(super) fn wide_phi(&mut self, v: V, b: usize, incoming: Vec<(V, usize)>, from: &[usize]) {
+    /// ([`Lower::wide_entries`]) is what replaced it. A scalar (`scalar`)
+    /// is the console wave's, the same in every lane ([`Lower::wide_fold`]).
+    pub(super) fn wide_phi(
+        &mut self,
+        v: V,
+        b: usize,
+        incoming: Vec<(V, usize)>,
+        from: &[usize],
+        scalar: bool,
+    ) -> Result<(), Why> {
         let Some(&at) = self.wide.from.get(&b) else {
             self.s.m.set_phi(v, incoming);
-            return;
+            return Ok(());
         };
         let around = |q: usize| {
             !self.wide.inside[q]
@@ -1248,22 +1406,103 @@ impl Lower<'_> {
             .map(|((x, _), &q)| (swaps.and_then(|s| s.get(&x)).copied().unwrap_or(x), q))
             .collect();
         let Some((end, back)) = self.wide.rounds.get(&b).and_then(|r| r.end) else {
-            let picked = self.wide_pick(b, &edges, at);
+            let picked = self.wide_value(b, &edges, at, scalar)?;
             let mut incoming: Vec<(V, usize)> = around.into_iter().map(|(x, _)| x).collect();
             incoming.extend(picked.map(|x| (x, at)));
             self.s.m.set_phi(v, incoming);
-            return;
+            return Ok(());
         };
         let body = &self.wide.loops[&b].body;
         let (round_again, entering): (Vec<_>, Vec<_>) = edges.iter().partition(|&&(_, q)| body[q]);
         let mut incoming = Vec::new();
-        if let Some(x) = self.wide_pick(b, &entering, at) {
+        if let Some(x) = self.wide_value(b, &entering, at, scalar)? {
             incoming.push((x, at));
         }
-        if let Some(x) = self.wide_pick(b, &round_again, end) {
+        if let Some(x) = self.wide_value(b, &round_again, end, scalar)? {
             incoming.push((x, back));
         }
         self.s.m.set_phi(v, incoming);
+        Ok(())
+    }
+
+    /// The value along `edges` into `b` in DXIL block `at`: a scalar's as
+    /// the console wave holds it ([`Lower::wide_fold`]), any other's per
+    /// lane ([`Lower::wide_pick`]).
+    fn wide_value(
+        &mut self,
+        b: usize,
+        edges: &[(V, usize)],
+        at: usize,
+        scalar: bool,
+    ) -> Result<Option<V>, Why> {
+        if scalar {
+            self.wide_fold(b, edges, at)
+        } else {
+            Ok(self.wide_pick(b, edges, at))
+        }
+    }
+
+    /// A scalar along `edges` into `b`, in DXIL block `at`, as the console
+    /// wave holds it there: what the last of the blocks the edges leave that
+    /// it ran holds. SGPRs are the wave's, and the wave runs a block of the
+    /// region where some lane of it does (a skip on EXEC passes it
+    /// otherwise), in the order the region is lowered, after the blocks
+    /// outside it (its head, or a way in, picked by the way the group came,
+    /// alike in every lane). So each lane gets that value, also where it
+    /// came another way: a scalar a branch only some lanes take writes is
+    /// the whole wave's after the join, and one a lane-dependent loop writes
+    /// is its last round's ([`Lower::wide_keep_block`]) in every lane, also
+    /// one that left the loop earlier or never entered it.
+    fn wide_fold(&mut self, b: usize, edges: &[(V, usize)], at: usize) -> Result<Option<V>, Why> {
+        let (mut inside, mut outside): (Vec<_>, Vec<_>) = edges
+            .iter()
+            .copied()
+            .partition(|&(_, q)| self.wide.inside[q]);
+        // The head's edge last: the way the group came, where no other way
+        // in was.
+        outside.sort_by_key(|&(_, q)| self.wide.next.contains_key(&q));
+        let mut value = self.wide_pick(b, &outside, at);
+        inside.sort_by_key(|&(_, q)| self.wide.pos.get(&q).copied());
+        // A block's lanes (in a loop, this round's, or after it the last
+        // round's).
+        let mut lanes = Vec::with_capacity(inside.len());
+        for &(_, q) in &inside {
+            let on = match self
+                .wide
+                .lanes
+                .get(&q)
+                .or_else(|| self.wide.edges.get(&(q, b)))
+            {
+                Some(&on) => on,
+                None => self.s.m.bool(false),
+            };
+            lanes.push(on);
+        }
+        let ran = self.wave_ran(at, &lanes)?;
+        for (&(x, _), ran) in inside.iter().zip(ran) {
+            value = Some(match value {
+                None => x,
+                Some(held) => self.s.m.select(at, ran, x, held),
+            });
+        }
+        Ok(value)
+    }
+
+    /// Per lanes of `lanes` (i1 each), in DXIL block `at`, which every
+    /// thread of the group runs: whether some lane of each lane's console
+    /// wave is among them ([`Lower::wave_any`]), asked once per block.
+    fn wave_ran(&mut self, at: usize, lanes: &[V]) -> Result<Vec<V>, Why> {
+        let mut ask: Vec<V> = Vec::new();
+        for &l in lanes {
+            if !self.wide.ran.contains_key(&(at, l)) && !ask.contains(&l) {
+                ask.push(l);
+            }
+        }
+        let any = self.wave_any(at, &ask)?;
+        for (l, any) in ask.into_iter().zip(any) {
+            self.wide.ran.insert((at, l), any);
+        }
+        Ok(lanes.iter().map(|&l| self.wide.ran[&(at, l)]).collect())
     }
 
     /// One value from `edges` (each a value and the IR block its edge to `b`
