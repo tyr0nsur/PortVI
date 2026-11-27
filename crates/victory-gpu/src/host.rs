@@ -1931,6 +1931,11 @@ impl HostList {
         // One host texture for the whole move (`crate::resource::evict` may
         // give it up meanwhile; this list then holds it).
         let copy = crate::resource::host_copy(resource)?;
+        if copy.rgb9e5_target && !copy.host_written.load(Ordering::Relaxed) {
+            // Initialise the writable host texture from the packed backing once,
+            // before the first submission that samples or writes it.
+            crate::texture::upload(self, resource, &copy.texture);
+        }
         let texture = copy.texture.clone();
         if let Some(Some(twin)) = copy.twin.get()
             && crate::twin::route(self, &copy, twin, wanted)

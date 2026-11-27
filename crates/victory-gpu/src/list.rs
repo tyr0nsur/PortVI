@@ -652,6 +652,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            if crate::resource::needs_rgb9_copy(crate::resource::Rgb9Copy::Resource, src, &from, dst, &to) {
+                return;
+            }
             if crate::texture::title_written(&from) {
                 crate::texture::upload(list, src, &from);
             }
@@ -798,9 +801,31 @@ extern "system" fn copy_texture_region(
             let Some((buffer, staging)) = list.upload(host, bytes) else {
                 return;
             };
-            // The list owns this mapped D3D12 upload buffer. Wine can report
-            // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
+            if crate::resource::rgb9e5_stood_in(dst.resource) {
+                if crate::resource::element(src.footprint.format) != Some((4, 1))
+                    || src.footprint.width == 0 || src.footprint.height == 0 || src.footprint.depth == 0
+                    || u64::from(src.footprint.row_pitch) < 4 * u64::from(src.footprint.width)
+                    || !src.footprint.row_pitch.is_multiple_of(256)
+                {
+                    return;
+                }
+                let (dst_data, src_data) = (staging as usize, data as usize);
+                let (len, width, pitch) = (bytes as usize, src.footprint.width, src.footprint.row_pitch as usize);
+                // The producer may write its buffer between recording and submission.
+                list.defer_host(move || {
+                    let mut packed = vec![0; len];
+                    crate::host::copy_mapped(packed.as_mut_ptr(), src_data as *const u8, len, false);
+                    // SAFETY: the list owns the mapped upload allocation until reset.
+                    let upload = unsafe { std::slice::from_raw_parts_mut(dst_data as *mut u8, len) };
+                    let ok = crate::rgb9e5::footprint(&packed, upload, width, pitch);
+                    debug_assert!(ok, "validated RGB9E5 buffer footprint");
+                });
+                from.footprint.format = crate::resource::RGB9E5_STAND_IN;
+            } else {
+                // The list owns this mapped D3D12 upload buffer. Wine can report
+                // its address as MEM_FREE, so use the host-upload path.
+                list.defer_fill(staging, data, bytes as usize);
+            }
             from.resource = buffer.as_raw().cast_const().cast();
             from.footprint.offset = 0;
             #[cfg(feature = "diagnostics")]
@@ -813,6 +838,11 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if crate::resource::needs_rgb9_copy(
+                crate::resource::Rgb9Copy::Region, src.resource, &texture, dst.resource, &to,
+            ) {
+                return;
+            }
             // From a host texture without the title's largest levels: the
             // level it has (the title level's size), or nothing.
             if crate::resource::dropped(src.resource) > 0 {
@@ -931,6 +961,12 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     if desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 {
         refused!("a depth or stencil texture");
     }
+    let pack_rgb9 = crate::resource::rgb9e5_stood_in(src.resource);
+    if pack_rgb9 && (crate::resource::element(dst.footprint.format) != Some((4, 1))
+        || u64::from(dst.footprint.row_pitch) < 4 * u64::from(dst.footprint.width))
+    {
+        refused!("an RGB9E5 readback needs a four-byte texel footprint");
+    }
     // The host copies into a footprint only within a buffer that holds all
     // of it, so readback memory spans the footprint, not just the region.
     let (Some(rows), Some(len)) = (dst.footprint.rows(at, size), dst.footprint.bytes()) else {
@@ -946,6 +982,9 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     let (mut to, mut from) = (*dst, *src);
     to.resource = buffer.as_raw().cast_const().cast();
     to.footprint.offset = 0;
+    if pack_rgb9 {
+        to.footprint.format = crate::resource::RGB9E5_STAND_IN;
+    }
     from.resource = texture.as_raw().cast_const().cast();
     from.footprint.offset = u64::from(index);
     #[cfg(feature = "diagnostics")]
@@ -987,10 +1026,21 @@ fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u32; 3], src
     };
     let (data, title) = (data as usize, title as usize);
     list.defer_after(move || {
+        let mut packed = Vec::new();
         for &(at, n) in &rows {
             let (at, n) = (at as usize, n as usize);
+            let readback = (data + at) as *const u8;
+            let source = if pack_rgb9 {
+                packed.resize(n, 0);
+                // SAFETY: the completed copy wrote this row inside the list's readback buffer.
+                let row = unsafe { std::slice::from_raw_parts(readback, n) };
+                crate::rgb9e5::row(row, &mut packed, crate::rgb9e5::to_title);
+                packed.as_ptr()
+            } else {
+                readback
+            };
             let _writing = crate::watch::writing(title + at, n);
-            crate::host::write_mapped((title + at) as *mut u8, (data + at) as *const u8, n);
+            crate::host::write_mapped((title + at) as *mut u8, source, n);
         }
     });
 }
@@ -1032,6 +1082,10 @@ extern "system" fn resolve(
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
+        if crate::resource::needs_rgb9_copy(crate::resource::Rgb9Copy::Resolve, src, &from, dst, &to) {
+            return;
+        }
+        let format = crate::resource::stand_in_view(dst, format);
         // Subresources of a host texture without the title's largest
         // levels are numbered otherwise: a resolve into one is not made.
         if crate::resource::dropped(dst) > 0 {

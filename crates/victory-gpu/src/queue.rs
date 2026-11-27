@@ -569,7 +569,7 @@ extern "system" fn present(
                     texture: &copy.texture,
                     state: *state,
                     title: crate::resource::title_format(*resource)
-                        .map(|f| DXGI_FORMAT(crate::resource::pc_format(f) as i32)),
+                        .map(|f| DXGI_FORMAT(copy.view_format(crate::resource::pc_format(f)) as i32)),
                     castable: &copy.castable,
                 })
                 .collect();

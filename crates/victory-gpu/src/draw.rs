@@ -3046,6 +3046,104 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    /// An RGB9E5 texture the title renders to and writes through an
+    /// unordered view (an upscaler's output, flags render target and
+    /// unordered): the host refuses to make one in RGB9E5, so without a
+    /// stand-in every view of it was null, its writes dropped and its reads
+    /// zero (a composite reading it lost the whole scene). Written as
+    /// RGB9E5 and read as RGB9E5, through the title's own resource and a
+    /// placed view of its memory, it holds what was written, alpha one.
+    #[test]
+    fn an_rgb9e5_target_written_through_an_unordered_view_reads_back() {
+        let host = crate::host::host().expect("RGB9E5 readback requires a D3D12 adapter");
+        let slots = Slots::new(4);
+        let read = compile_cs(READ);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        let address = title_memory(1 << 20);
+        // Render target and unordered access, as the title makes it.
+        let object = texture_at_address(address, &texture_words(64, 64, 67, 0x105, 5));
+        let host_texture = crate::resource::host_resource(object).expect("a host texture for an RGB9E5 target");
+        // SAFETY: a live resource.
+        let made = unsafe { host_texture.GetDesc() }.Format.0 as u32;
+        assert_eq!(made, crate::resource::RGB9E5_STAND_IN);
+        let unordered = View::Unordered(object as usize, 0, Some([67, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
+        let mut desc = [0u32; 10];
+        desc[..6].copy_from_slice(&[67, 4, 0x1688, 0, 0, 1]);
+        let own = View::Shader(object as usize, Some(desc));
+        let placed = placed_view(address, texture_words(64, 64, 67, 0x105, 0));
+        let write = compile_cs(
+            "#define RS \"DescriptorTable(UAV(u0))\"\nRWTexture2D<float4> o : register(u0);\n[RootSignature(RS)]\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) { o[id.xy] = float4(4.0, 0.5, 0.25, 0.0); }",
+        );
+        // Values all three encodings hold exactly; alpha is not stored.
+        let want = [4.0, 0.5, 0.25, 1.0];
+        for (round, view) in [own, placed].iter().enumerate() {
+            slots.make(0, &unordered);
+            slots.make(1, view);
+            let list = host.new_list().unwrap();
+            readable(&list, &used(ResourceType::Uav), &unordered, false);
+            run(&list, &slots, &write, 0, None, (8, 8));
+            readable(&list, &used(ResourceType::Srv), view, false);
+            run(&list, &slots, &read, 1, Some(&out), (8, 8));
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: a plain device query.
+            assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok(), "the device survives");
+            for i in [0usize, 7, 64 * 9 + 33, 64 * 64 - 1] {
+                // SAFETY: inside the mapped output.
+                let got = unsafe { (data.add(i * 16) as *const [f32; 4]).read() };
+                assert_eq!(got, want, "round {round} texel {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn rgb9e5_read_only_resource_and_placed_views_sample_packed_words() {
+        sample_rgb9e5_words(0, crate::resource::RGB9E5);
+    }
+
+    #[test]
+    fn rgb9e5_writable_resource_and_placed_views_sample_initial_packed_words() {
+        sample_rgb9e5_words(5, crate::resource::RGB9E5_STAND_IN);
+    }
+
+    fn sample_rgb9e5_words(flags: u32, host_format: u32) {
+        let host = crate::host::host().expect("RGB9E5 readback requires a D3D12 adapter");
+        let slots = Slots::new(2);
+        let read = compile_cs(READ);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        let address = title_memory(1 << 16);
+        let words = texture_words(64, 64, 67, 0x100, flags);
+        let object = texture_at_address(address, &words);
+        let copy = crate::resource::host_copy(object).unwrap();
+        // SAFETY: the resource remains live throughout the test.
+        assert_eq!(unsafe { copy.texture.GetDesc() }.Format.0 as u32, host_format);
+        let mut srv = [0u32; 10];
+        srv[..6].copy_from_slice(&[67, 4, 0x1688, 0, 0, 1]);
+        let views = [
+            View::Shader(object as usize, Some(srv)),
+            placed_view(address, texture_words(64, 64, 67, 0x100, 0)),
+        ];
+        let colours = crate::rgb9e5::TEST_COLOURS;
+        // SAFETY: the owned linear plane has 64 words per 256-byte row.
+        let words = unsafe { std::slice::from_raw_parts_mut(address as *mut u32, 64 * 64) };
+        for (i, word) in words.iter_mut().enumerate() {
+            *word = colours[i % colours.len()].0;
+        }
+        for view in &views {
+            slots.make(0, view);
+            let list = host.new_list().unwrap();
+            readable(&list, &used(ResourceType::Srv), view, false);
+            run(&list, &slots, &read, 0, Some(&out), (8, 8));
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: the queue finished writing all 4096 float4s to our buffer.
+            let pixels = unsafe { std::slice::from_raw_parts(data.cast::<[f32; 4]>(), 64 * 64) };
+            for (i, pixel) in pixels.iter().enumerate() {
+                assert_eq!(*pixel, colours[i % colours.len()].1, "host format {host_format}, pixel {i}");
+            }
+        }
+    }
+
     /// A texture the title wrote, read through tables by two lists of one
     /// submission, is uploaded once; the next submission uploads it again
     /// only after the title writes it (run perf7 uploaded the same textures

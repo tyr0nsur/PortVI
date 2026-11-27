@@ -51,6 +51,8 @@ pub(crate) struct Staging {
     /// texture leaves out (`crate::resource::drop_levels`).
     first_mip: u32,
     memory: *const u8,
+    /// Convert title RGB9E5 words when preparing a substituted writable texture.
+    rgb9_upload: bool,
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, hashed instead).
     tracked: Option<crate::watch::Tracked>,
@@ -263,6 +265,9 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
     ) else {
         return;
     };
+    if crate::resource::needs_rgb9_copy(crate::resource::Rgb9Copy::Alias, from, &a, to, &b) {
+        return;
+    }
     // An odd key: textures' own first uses are keyed by the host texture.
     if !list.first_use(to as usize | 1) {
         return;
@@ -398,6 +403,10 @@ pub(crate) fn record_upload(
     }
     copies(list, &copy.texture, staging, (buffer, *at), subresources, String::new);
     list.keep(buffer);
+    if copy.rgb9e5_target {
+        // Its initial packed words are on the GPU. Later submissions keep shader writes.
+        copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     staging.copied.fetch_add(subresources.len() as u64, std::sync::atomic::Ordering::Relaxed);
     list.move_texture(copy, SHADER_RESOURCE)
@@ -701,6 +710,7 @@ impl Staging {
                 tracing::debug!(memory = ?self.memory, desc = ?self.layout.desc, "a sampled texture detiled");
             }
         }
+        let mut packed = Vec::new();
         for &i in subresources {
             let (footprint, rows) = (&self.footprints[i as usize], self.rows[i as usize]);
             let (mip, slice) = (i % self.mips, i / self.mips);
@@ -710,12 +720,22 @@ impl Staging {
             // SAFETY: `subresource_len` clamps `len` to `self.size - footprint.Offset`,
             // keeping the slice strictly inside the mapped staging buffer even when
             // GetCopyableFootprints does not pad the final row of the last subresource.
-            let linear = unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len) };
+            let upload = unsafe { std::slice::from_raw_parts_mut(data.add(footprint.Offset as usize), len) };
+            let linear = if self.rgb9_upload {
+                packed.resize(len, 0);
+                packed.as_mut_slice()
+            } else {
+                &mut *upload
+            };
             if let Err(e) =
                 self.layout
                     .detile(tiled, mip + self.first_mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
+                return Err(UploadError::Layout);
+            }
+            if self.rgb9_upload && !crate::rgb9e5::footprint(&packed, upload, f.Width, pitch) {
+                tracing::warn!(mip, slice, "incomplete RGB9E5 upload footprint");
                 return Err(UploadError::Layout);
             }
         }
@@ -852,6 +872,7 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         mips: u32::from(d.MipLevels),
         first_mip,
         memory,
+        rgb9_upload: copy.rgb9e5_target,
         tracked: crate::watch::track(memory as usize, layout_size, true),
         spans,
         last: Mutex::default(),
@@ -923,6 +944,7 @@ mod tests {
             size: len as u64,
             footprints: vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default()],
             rows: vec![32], layout, mips: 1, first_mip: 0, memory: memory.0 as *const _,
+            rgb9_upload: false,
             tracked: track(memory.0, len, true), spans: vec![(0, len)],
             last: Mutex::default(), uploads: Default::default(), copied: Default::default(),
         };
