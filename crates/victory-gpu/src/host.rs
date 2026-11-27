@@ -42,6 +42,8 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
+    /// Single backing format for writable RGB9E5 resources and their graphics PSOs.
+    pub(crate) rgb9e5_write_format: u32,
     /// The device's view heaps are smaller than `HEAP_VIEWS_MAX` (1,000,000
     /// on NVIDIA and resource binding tiers 1-2) and title view-heap slots
     /// are remapped onto them: shaders read the slots they take from the
@@ -204,6 +206,7 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let rgb9e5_write_format = crate::resource::rgb9e5_device_format(&device);
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
         let depth_bounds_supported = device
             .CheckFeatureSupport(
@@ -280,6 +283,7 @@ fn create() -> windows::core::Result<Host> {
         Ok(Host {
             device,
             depth_bounds_supported,
+            rgb9e5_write_format,
             view_remap,
             queue,
             fence,
@@ -1931,7 +1935,7 @@ impl HostList {
         // One host texture for the whole move (`crate::resource::evict` may
         // give it up meanwhile; this list then holds it).
         let copy = crate::resource::host_copy(resource)?;
-        if copy.rgb9e5_target && !copy.host_written.load(Ordering::Relaxed) {
+        if copy.rgb9e5_writable && !copy.host_written.load(Ordering::Relaxed) {
             // Initialise the writable host texture from the packed backing once,
             // before the first submission that samples or writes it.
             crate::texture::upload(self, resource, &copy.texture);

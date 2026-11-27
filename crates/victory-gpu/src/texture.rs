@@ -403,7 +403,7 @@ pub(crate) fn record_upload(
     }
     copies(list, &copy.texture, staging, (buffer, *at), subresources, String::new);
     list.keep(buffer);
-    if copy.rgb9e5_target {
+    if copy.rgb9e5_writable {
         // Its initial packed words are on the GPU. Later submissions keep shader writes.
         copy.host_written.store(true, std::sync::atomic::Ordering::Relaxed);
     }

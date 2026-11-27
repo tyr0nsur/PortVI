@@ -294,12 +294,10 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     (format != own).then_some(own)
 }
 
-/// `R9G9B9E5_SHAREDEXP`: the console renders to it and writes it through
-/// unordered views (an upscaler's output, read by a later composite, for
-/// one); the host allows neither.
+/// Shared-exponent HDR format used by render targets and unordered views.
 pub(crate) const RGB9E5: u32 = 67;
-/// `R11G11B10_FLOAT`, what an RGB9E5 texture the title renders to or
-/// writes is made in on the host: the same element (4 bytes), unsigned
+/// `R11G11B10_FLOAT`, the fallback when native RGB9E5 lacks required writes:
+/// the same element (4 bytes), unsigned
 /// floats of the same range (to 65 024 against 65 408), alpha read as one
 /// as RGB9E5's is; a host render target and typed unordered store format.
 /// R/G retain six mantissa bits and B retains five. CPU uploads and readbacks
@@ -307,11 +305,41 @@ pub(crate) const RGB9E5: u32 = 67;
 /// still observe the stand-in's bit layout.
 pub(crate) const RGB9E5_STAND_IN: u32 = 26;
 
-/// The render target format a host pipeline declares for a title's
-/// `format`: an RGB9E5 target is only ever its stand-in on the host (the
-/// host refuses pipelines declaring RGB9E5, which it cannot render to).
+/// Use one physical format for RGB9E5 render targets and typed stores so a
+/// later placed alias can add a use without invalidating the graphics PSO.
+#[cfg(windows)]
+fn rgb9e5_supported_write_format(support: Option<(i32, i32)>) -> u32 {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FORMAT_SUPPORT1_RENDER_TARGET, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+        D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE,
+    };
+    let views = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+    if support.is_some_and(|(s1, s2)| s1 & views == views && s2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 != 0) {
+        RGB9E5
+    } else {
+        RGB9E5_STAND_IN
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn rgb9e5_device_format(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device) -> u32 {
+    use windows::Win32::Graphics::Direct3D12::{D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+    let mut info = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: DXGI_FORMAT_R9G9B9E5_SHAREDEXP, ..Default::default() };
+    // SAFETY: the device receives the matching feature struct and its size.
+    let result = unsafe {
+        device.CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, (&raw mut info).cast(), size_of_val(&info) as u32)
+    };
+    let format = rgb9e5_supported_write_format(result.ok().map(|()| (info.Support1.0, info.Support2.0)));
+    tracing::debug!(format, support1 = info.Support1.0, support2 = info.Support2.0, "RGB9E5 writable backing selected");
+    format
+}
+
+/// The same device choice used to create resources and views is used in the graphics PSO.
+#[cfg(windows)]
 pub(crate) fn target_format(format: u32) -> u32 {
-    if format == RGB9E5 { RGB9E5_STAND_IN } else { format }
+    if format != RGB9E5 { return format; }
+    crate::host::host().map_or(RGB9E5_STAND_IN, |h| h.rgb9e5_write_format)
 }
 
 /// The format a view in `view` takes of a host texture in `host`: an
@@ -1001,6 +1029,8 @@ pub(crate) struct HostTexture {
     /// A writable shared-exponent resource uses R11G11B10_FLOAT storage.
     /// Native R11G11B10 resources may still have genuine packed RGB9E5 aliases.
     pub(crate) rgb9e5_target: bool,
+    /// The title writes this RGB9E5 backing, whether native or substituted.
+    pub(crate) rgb9e5_writable: bool,
     /// Its uploads from title memory (`crate::texture`), made on first use.
     pub(crate) staging: std::sync::Mutex<Option<std::sync::Arc<crate::texture::Staging>>>,
     /// A depth texture's writable twin (`crate::twin`), made with its first
@@ -1046,6 +1076,7 @@ impl HostTexture {
             castable,
             host_written: false.into(),
             rgb9e5_target: false,
+            rgb9e5_writable: false,
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
             bytes,
@@ -1302,7 +1333,7 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 /// The host description of a title texture: the same, without the
 /// console's layout and flags, in a format the host takes for its use.
 #[cfg(windows)]
-fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
+fn host_desc(desc: &ResourceDesc, rgb9e5_write_format: u32) -> Option<ResourceDesc> {
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
         return None;
@@ -1319,7 +1350,9 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
         d.flags &= !UNORDERED;
     }
     d.format = pc_format(d.format);
-    stand_in_rgb9e5(&mut d);
+    if writable_rgb9e5(&d) {
+        d.format = rgb9e5_write_format;
+    }
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -1332,16 +1365,6 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
         d.format = family(d.format);
     }
     Some(d)
-}
-
-/// The host makes no RGB9E5 render target or unordered texture (the
-/// creation fails and every view of it is null): a host description in
-/// RGB9E5 with either use is made in [`RGB9E5_STAND_IN`].
-#[cfg(windows)]
-fn stand_in_rgb9e5(d: &mut ResourceDesc) {
-    if writable_rgb9e5(d) {
-        d.format = RGB9E5_STAND_IN;
-    }
 }
 
 #[cfg(windows)]
@@ -1430,14 +1453,15 @@ fn shared_texture(
     state: u32,
     clear: *const c_void,
 ) -> Option<std::sync::Arc<HostTexture>> {
-    let d = host_desc(desc)?;
+    let rgb9e5_write_format = crate::host::host()?.rgb9e5_write_format;
+    let d = host_desc(desc, rgb9e5_write_format)?;
     let key = memory_key(address, desc);
     let mut map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(Default::default);
     let live = key.and_then(|k| map.get(&k)?.upgrade());
-    let mut rgb9e5_target = writable_rgb9e5(desc);
+    let mut rgb9e5_writable = writable_rgb9e5(desc);
     if let Some(t) = &live
-        && (!rgb9e5_target || t.rgb9e5_target)
+        && (!rgb9e5_writable || t.rgb9e5_writable)
         && takes(t, &d)
     {
         SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1461,9 +1485,9 @@ fn shared_texture(
         let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         for r in at.get(&address).into_iter().flatten().map(|&r| resource(r as This)) {
             written |= r.desc.flags & USES != 0;
-            if memory_key(address, &r.desc) == Some(k) && let Some(h) = host_desc(&r.desc) {
+            if memory_key(address, &r.desc) == Some(k) && let Some(h) = host_desc(&r.desc, rgb9e5_write_format) {
                 d.flags |= h.flags & USES;
-                rgb9e5_target |= writable_rgb9e5(&r.desc);
+                rgb9e5_writable |= writable_rgb9e5(&r.desc);
                 if h.flags & USES != 0 {
                     alias_writer.get_or_insert(h.format);
                 }
@@ -1472,8 +1496,9 @@ fn shared_texture(
     }
     // A placed read-only alias can be the first object to realize the backing.
     // A native R32_UINT writer retains its packed RGB9E5 shader view.
-    if rgb9e5_target {
-        d.format = RGB9E5_STAND_IN;
+    let rgb9e5_target = rgb9e5_writable && rgb9e5_write_format == RGB9E5_STAND_IN;
+    if rgb9e5_writable {
+        d.format = rgb9e5_write_format;
     } else if d.format == RGB9E5 && let Some(format) = alias_writer {
         d.format = format;
     }
@@ -1492,6 +1517,7 @@ fn shared_texture(
     let mut t = make_texture(&d, state, clear, rgb9e5_target)?;
     t.key = key;
     t.rgb9e5_target = rgb9e5_target;
+    t.rgb9e5_writable = rgb9e5_writable;
     let t = std::sync::Arc::new(t);
     if let Some(k) = key {
         remade(&k);
@@ -1516,9 +1542,14 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
     let td = unsafe { t.texture.GetDesc() };
     let (flags, own) = (td.Flags.0 as u32, td.Format.0 as u32);
     let view = t.view_format(d.format);
-    d.flags & USES & !flags == 0
-        && (family(view) == family(own)
-            || t.castable.iter().any(|&c| family(c) == family(view)))
+    d.flags & USES & !flags == 0 && compatible_host_view(own, view, &t.castable)
+}
+
+/// A typed view outside the resource's own family must be present in
+/// the exact format list that D3D12 accepted at resource creation.
+#[cfg(windows)]
+fn compatible_host_view(own: u32, view: u32, castable: &[u32]) -> bool {
+    family(own) == family(view) || castable.contains(&view)
 }
 
 /// Whether `this`'s host texture is still its memory's (not replaced by one
@@ -2008,7 +2039,7 @@ fn hand_out_resource(
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
-    } else if host_desc(&desc).is_some() {
+    } else {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(resource.data() as u64).or_default().push(at);
@@ -2745,20 +2776,42 @@ mod tests {
     fn rgb9e5_targets_stand_in_r11g11b10_and_their_views_follow() {
         let target = ResourceDesc { flags: 5, ..texture(1920, 1080, RGB9E5, 1) };
         let read = ResourceDesc { flags: 0, ..target };
-        for (flags, want) in [(5, RGB9E5_STAND_IN), (4, RGB9E5_STAND_IN), (1, RGB9E5_STAND_IN), (0, RGB9E5)] {
-            let d = host_desc(&ResourceDesc { flags, ..target }).unwrap();
-            assert_eq!((d.format, d.flags), (want, flags), "flags {flags:#x}");
+        for write_format in [RGB9E5_STAND_IN, RGB9E5] {
+            for flags in [5, 4, 1, 0] {
+                let d = host_desc(&ResourceDesc { flags, ..target }, write_format).unwrap();
+                let want = if flags == 0 { RGB9E5 } else { write_format };
+                assert_eq!((d.format, d.flags), (want, flags), "backing {write_format}, flags {flags:#x}");
+            }
         }
         // A placed view of the memory names its layout, as the target's.
         let (target, read) = (ResourceDesc { layout: 0x105, ..target }, ResourceDesc { layout: 0x105, ..read });
         assert_eq!(memory_key(0x1_0000, &target), memory_key(0x1_0000, &read));
         let other = ResourceDesc { flags: 5, ..texture(64, 64, 28, 1) };
-        assert_eq!(host_desc(&other).unwrap().format, 28);
+        assert_eq!(host_desc(&other, RGB9E5).unwrap().format, 28);
         assert_eq!(host_view_format(RGB9E5, true), RGB9E5_STAND_IN);
         assert_eq!(host_view_format(RGB9E5, false), RGB9E5, "a native resource retains its shared-exponent view");
         assert_eq!(host_view_format(42, true), 42);
-        assert_eq!(target_format(RGB9E5), RGB9E5_STAND_IN, "a pipeline renders to the stand-in");
         assert_eq!(target_format(28), 28);
+        assert!(compatible_host_view(42, RGB9E5, &[RGB9E5]), "R32_UINT has the packed read view");
+        assert!(!compatible_host_view(RGB9E5, 42, &[41]), "R32_FLOAT does not authorize R32_UINT");
+        assert!(compatible_host_view(RGB9E5, 42, &[42]), "explicit integer alias");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rgb9e5_native_write_requires_rtv_and_typed_uav_stores() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FORMAT_SUPPORT1_RENDER_TARGET, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+            D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE,
+        };
+        assert_eq!(rgb9e5_supported_write_format(None), RGB9E5_STAND_IN, "feature query failed");
+        for mask in 0..8 {
+            let rt = if mask & 1 != 0 { D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 } else { 0 };
+            let uav = if mask & 2 != 0 { D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 } else { 0 };
+            let store = if mask & 4 != 0 { D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 } else { 0 };
+            let want = if mask == 7 { RGB9E5 } else { RGB9E5_STAND_IN };
+            assert_eq!(rgb9e5_supported_write_format(Some((rt | uav, store))), want, "capability mask {mask}");
+        }
     }
 
     /// Views of a host texture without its largest level keep their texels:
@@ -3406,15 +3459,17 @@ mod tests {
         let end = adapter.Description.iter().position(|&c| c == 0).unwrap_or(adapter.Description.len());
         let name = String::from_utf16_lossy(&adapter.Description[..end]);
         eprintln!(
-            "RGB9E5 adapter={name} vendor={:04x} device={:04x} luid={:08x}:{:08x} software={}",
+            "RGB9E5 adapter={name} vendor={:04x} device={:04x} luid={:08x}:{:08x} software={} write_format={}",
             adapter.VendorId, adapter.DeviceId, adapter.AdapterLuid.HighPart, adapter.AdapterLuid.LowPart,
-            adapter.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
+            adapter.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0, host.rgb9e5_write_format,
         );
         let colours = crate::rgb9e5::TEST_COLOURS;
         copy_buffer_region_roundtrip(RGB9E5, 5, |x, y| match (x + 2 * y) % 4 {
-            // A fourth input loses a mantissa bit in R11. Two plain byte copies
-            // would silently round-trip it unchanged and must fail this case.
-            3 => ((18 << 27) | 257, (18 << 27) | 256),
+            // Only the R11 fallback loses this bit. A native RGB9E5 target keeps it.
+            3 => {
+                let mantissa = if host.rgb9e5_write_format == RGB9E5 { 257 } else { 256 };
+                ((18 << 27) | 257, (18 << 27) | mantissa)
+            }
             i => (colours[i].0, colours[i].0),
         });
     }
@@ -3543,12 +3598,22 @@ mod tests {
         let counts = || std::array::from_fn::<_, 4, _>(|i| MIXED_RGB9_COPIES[i].load(std::sync::atomic::Ordering::Relaxed));
         let before = counts();
         let region = [1u32, 1, 0, 3, 3, 1];
-        for (from, to) in [(images[0], images[1]), (images[1], images[0])] {
-            whole(list, to, from);
-            copy(list, &image_at(to), 0, 0, 0, &image_at(from), region.as_ptr().cast());
+        let native = host.rgb9e5_write_format == RGB9E5;
+        for (a, b) in [(0, 1), (1, 0)] {
+            whole(list, images[b], images[a]);
+            copy(list, &image_at(images[b]), 0, 0, 0, &image_at(images[a]), region.as_ptr().cast());
+            if native {
+                // Both resources are 67. The whole copy and the offset box must succeed.
+                expected.copy_within(a * 1024..(a + 1) * 1024, b * 1024);
+                for y in 0..2 {
+                    let start = a * 1024 + (y + 1) * 256 + 4;
+                    expected.copy_within(start..start + 8, b * 1024 + y * 256);
+                }
+            }
         }
         for (a, b) in before.into_iter().zip(counts()) {
-            assert!(b > a, "each direction of each operation was intercepted");
+            if native { assert_eq!(a, b, "native copies need no conversion"); }
+            else { assert!(b > a, "both mixed directions were intercepted"); }
         }
         for (i, &resource) in images.iter().enumerate() {
             copy(list, &linear(output, (i * 1024) as u64), 0, 0, 0, &image_at(resource), std::ptr::null());
