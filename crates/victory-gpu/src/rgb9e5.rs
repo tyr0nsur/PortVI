@@ -96,6 +96,39 @@ pub(crate) fn footprint(source: &[u8], destination: &mut [u8], width: u32, pitch
     true
 }
 
+/// Whether a GPU copy from host format `source` into `destination` must
+/// convert, and which way: `Some(true)` packs stand-in R11G11B10 into
+/// RGB9E5 ([`to_title`]), `Some(false)` unpacks ([`to_host`]). Equal formats
+/// (both native where the adapter writes RGB9E5) copy bits as they are.
+pub(crate) fn converts(source: u32, destination: u32) -> Option<bool> {
+    use crate::resource::{RGB9E5, RGB9E5_STAND_IN};
+    match (source, destination) {
+        (RGB9E5_STAND_IN, RGB9E5) => Some(true),
+        (RGB9E5, RGB9E5_STAND_IN) => Some(false),
+        _ => None,
+    }
+}
+
+/// A region of a converted copy: the source box (`area`, left, top, front,
+/// right, bottom, back; the whole `source` subresource if `None`) and the
+/// row pitch of its rows in the buffer, which D3D12 aligns to 256 bytes (the
+/// rest of each row is padding nothing reads). `None` for an empty box or
+/// one outside the `source` extent, or one that, placed at `at`, leaves the
+/// `room` extent of the destination subresource: D3D12 would not copy it.
+fn plan(area: Option<[u32; 6]>, at: [u32; 3], source: [u32; 3], room: [u32; 3]) -> Option<([u32; 6], u32)> {
+    let [w, h, d] = source;
+    let area = area.unwrap_or([0, 0, 0, w, h, d]);
+    let [left, top, front, right, bottom, back] = area;
+    if right <= left || bottom <= top || back <= front || right > w || bottom > h || back > d {
+        return None;
+    }
+    let size = [right - left, bottom - top, back - front];
+    if (0..3).any(|i| u64::from(at[i]) + u64::from(size[i]) > u64::from(room[i])) {
+        return None;
+    }
+    Some((area, (size[0] * 4).next_multiple_of(256)))
+}
+
 /// Numeric GPU copies between a native RGB9E5 host texture and an
 /// R11G11B10 stand-in (`crate::resource::RGB9E5_STAND_IN`). The two formats
 /// are in different copy-compatibility groups, so D3D12 cannot copy one into
@@ -119,7 +152,6 @@ mod gpu {
     use windows::core::s;
 
     use crate::host::{HostList, host, transition};
-    use crate::resource::{RGB9E5, RGB9E5_STAND_IN};
 
     /// The integer conversions of the CPU path in 32-bit words: a value of
     /// either format is `sig << sh` units of 2^-24, `sig` below 2^10.
@@ -304,28 +336,20 @@ void main(uint3 id : SV_DispatchThreadID) {
         let Some(c) = converter() else { return false };
         // SAFETY: live resources.
         let (a, b) = unsafe { (from.GetDesc(), to.GetDesc()) };
-        let to_title = match (a.Format.0 as u32, b.Format.0 as u32) {
-            (RGB9E5, RGB9E5_STAND_IN) => 0,
-            (RGB9E5_STAND_IN, RGB9E5) => 1,
-            _ => return false,
-        };
+        let Some(to_title) = super::converts(a.Format.0 as u32, b.Format.0 as u32) else { return false };
+        let to_title = u32::from(to_title);
         let mut planned = Vec::with_capacity(regions.len());
         let mut total = 0u64;
         for r in regions {
             if r.from >= subresources(&a) || r.to >= subresources(&b) {
                 continue;
             }
-            let [w, h, d] = extent(&a, r.from);
-            let [left, top, front, right, bottom, back] = r.area.unwrap_or([0, 0, 0, w, h, d]);
-            if right <= left || bottom <= top || back <= front || right > w || bottom > h || back > d {
+            let Some(([left, top, front, right, bottom, back], pitch)) =
+                super::plan(r.area, r.at, extent(&a, r.from), extent(&b, r.to))
+            else {
                 continue;
-            }
+            };
             let size = [right - left, bottom - top, back - front];
-            let room = extent(&b, r.to);
-            if (0..3).any(|i| u64::from(r.at[i]) + u64::from(size[i]) > u64::from(room[i])) {
-                continue;
-            }
-            let pitch = (size[0] * 4).next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
             total = total.next_multiple_of(u64::from(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT));
             let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                 Offset: total,
@@ -448,6 +472,37 @@ mod tests {
         assert_eq!(to_title(1), 16);
         // 257/64 quantizes to 4 in R11; the canonical packed result records that loss.
         assert_eq!(to_title(to_host((18 << 27) | 257)), (18 << 27) | 256);
+    }
+
+    /// Converted copies take the boxes D3D12 copies: whole subresources,
+    /// sub-rectangles to an offset (rows padded to 256 bytes), and nothing
+    /// for empty boxes or ones leaving either subresource.
+    #[test]
+    fn rgb9e5_copy_regions_keep_their_box_offset_and_padded_rows() {
+        let level = [8, 8, 1];
+        assert_eq!(plan(None, [0; 3], level, level), Some(([0, 0, 0, 8, 8, 1], 256)));
+        assert_eq!(plan(None, [0; 3], [65, 3, 1], [65, 3, 1]), Some(([0, 0, 0, 65, 3, 1], 512)));
+        assert_eq!(plan(None, [0; 3], [64, 1, 1], [64, 1, 1]).unwrap().1, 256, "64 texels fill a row");
+        let corner = [2, 4, 0, 5, 8, 1];
+        assert_eq!(plan(Some(corner), [5, 3, 0], level, level), Some((corner, 256)), "3x4 into the far corner");
+        assert_eq!(plan(Some(corner), [6, 3, 0], level, level), None, "one column past the destination");
+        assert_eq!(plan(Some(corner), [5, 5, 0], level, level), None, "one row past the destination");
+        assert_eq!(plan(Some([0, 0, 0, 9, 1, 1]), [0; 3], level, [16, 16, 1]), None, "past the source");
+        assert_eq!(plan(Some([3, 0, 0, 3, 1, 1]), [0; 3], level, level), None, "empty");
+        assert_eq!(plan(Some([0, 0, 1, 1, 1, 2]), [0, 0, 3], [4, 4, 4], [4, 4, 4]).unwrap().0[2], 1, "last slice");
+        assert_eq!(plan(Some([0, 0, 1, 1, 1, 2]), [0, 0, 4], [4, 4, 4], [4, 4, 4]), None, "past a 3D destination");
+        assert_eq!(plan(Some([0, 0, 1, 1, 1, 3]), [0, 0, 2], [4, 4, 4], [4, 4, 4]), Some(([0, 0, 1, 1, 1, 3], 256)));
+        assert_eq!(plan(None, [u32::MAX, 0, 0], level, level), None, "offsets do not wrap");
+    }
+
+    #[test]
+    fn rgb9e5_copies_convert_only_between_the_two_packed_formats() {
+        use crate::resource::{RGB9E5, RGB9E5_STAND_IN};
+        assert_eq!(converts(RGB9E5_STAND_IN, RGB9E5), Some(true));
+        assert_eq!(converts(RGB9E5, RGB9E5_STAND_IN), Some(false));
+        for (a, b) in [(RGB9E5, RGB9E5), (RGB9E5_STAND_IN, RGB9E5_STAND_IN), (42, RGB9E5), (RGB9E5_STAND_IN, 41)] {
+            assert_eq!(converts(a, b), None, "{a} into {b}");
+        }
     }
 
     /// The GPU pass of [`copy`] word for word against the CPU oracle, in

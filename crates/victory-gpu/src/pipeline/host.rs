@@ -966,6 +966,22 @@ fn root_signature(
 mod tests {
     use super::*;
 
+    #[test]
+    fn rgb9e5_graphics_stream_declares_the_devices_writable_format() {
+        let host = crate::host::host().expect("RGB9E5 pipeline formats require a D3D12 adapter");
+        let mut stream = [0u32; 10];
+        stream[0] = 15; // RTV formats subobject
+        stream[1] = crate::resource::RGB9E5;
+        stream[2] = DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32;
+        stream[9] = 2;
+        let mut graphics = GraphicsState::default();
+        // SAFETY: type plus eight DXGI_FORMATs and the active count.
+        unsafe { graphics.read(15, stream.as_ptr().cast()) };
+        assert_eq!(graphics.targets.NumRenderTargets, 2);
+        assert_eq!(graphics.targets.RTFormats[0].0 as u32, host.rgb9e5_write_format);
+        assert_eq!(graphics.targets.RTFormats[1], DXGI_FORMAT_R8G8B8A8_UNORM);
+    }
+
     fn targets(formats: &[DXGI_FORMAT]) -> D3D12_RT_FORMAT_ARRAY {
         let mut t = D3D12_RT_FORMAT_ARRAY {
             NumRenderTargets: formats.len() as u32,

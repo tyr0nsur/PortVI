@@ -155,7 +155,7 @@ fn seen(view: &View) -> Option<Seen> {
     let view = placed.as_ref().unwrap_or(view);
     if let View::Shader(resource, _) | View::Unordered(resource, _, _) = view
         && let Some(texture) = crate::resource::made_copy(*resource as This)
-        && (texture.rgb9e5_target
+        && (texture.rgb9e5_writable
             || (matches!(view, View::Shader(..)) && crate::texture::title_written(&texture.texture)))
     {
         return Some(Seen::Texture(*resource));
