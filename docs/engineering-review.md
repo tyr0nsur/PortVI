@@ -6,6 +6,14 @@ PortVI preserves both words of a wide node pointer when a compute shader traces 
 
 The instruction decoder also uses the fixed four-register result and four-register resource descriptor for BVH intersections. An open compute fixture with the optional image modifier bits clear returned the expected child ID on the desktop RTX 4060. These checks cover traversal and decoding. Scene lighting and reflection coverage require a separate image comparison. [Decoder work](https://github.com/Marvisak/VIctory/pull/3316) · [PortVI implementation and fixtures](../patches/0038-ray-intersection-addresses-and-operands.patch)
 
+## Root constants in compute and graphics workloads
+
+PortVI reads word four of a root constants parameter as application data. The binder previously interpreted the same word as a descriptor offset and discarded the draw or dispatch. The correction comes from Calvix2k. denkencar-sketch independently identified the same condition. [VIctory issue 2699](https://github.com/Marvisak/VIctory/issues/2699) · [VIctory PR 2703](https://github.com/Marvisak/VIctory/pull/2703) · [VIctory PR 2295](https://github.com/Marvisak/VIctory/pull/2295)
+
+The synthetic compute fixture supplies its output address as a byte offset in the fifth root constant. In a run on the desktop RTX 4060, PortVI discarded the dispatch during binding. With the fix, the GPU wrote the expected depth value at byte offset `0x10010` in the output buffer. [PortVI implementation and GPU fixture](../patches/0040-bind-fifth-root-constant.patch)
+
+With this binding fix and high-index descriptor mapping both enabled, an experimental scene run lost the D3D12 device during loading. The trace identifies a submission containing two command lists. It does not identify which command failed.
+
 ## Texture copy order and shader masks on 27 November 2026
 
 The texture upload at the start of a submission now sees CPU memory copies recorded before the first GPU use. A copy recorded after a draw takes effect on the next texture upload. The distinction also applies across command lists in the same submission. AvatarManz's texture upload changes prompted this check. The PortVI regression exercises both orders with a BC4 texture and reads back the texels from the GPU. [AvatarManz change](https://github.com/avatarmanz/VIctory-7900XTX/commit/5d6bd84) · [PortVI implementation and readback test](../patches/0033-stage-leading-texture-copies.patch)
