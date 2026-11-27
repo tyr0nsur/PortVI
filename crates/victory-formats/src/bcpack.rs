@@ -131,7 +131,7 @@ impl Tables {
         let path = match std::env::var_os("VICTORY_BCPACK_TABLES") {
             Some(path) => PathBuf::from(path),
             None => std::env::current_exe()
-                .map_err(|_| Error("cannot locate the executable; set VICTORY_BCPACK_TABLES"))?
+                .map_err(|_| Error("cannot locate the executable. Set VICTORY_BCPACK_TABLES"))?
                 .with_file_name("bcpack-tables.bin"),
         };
         Self::from_file(&path)
@@ -141,7 +141,7 @@ impl Tables {
     /// covers the dictionaries, whose entries would otherwise parse as numbers.
     pub fn from_file(path: &Path) -> Result<Tables, Error> {
         let file = std::fs::File::open(path).map_err(|_| {
-            Error("cannot open the local format tables; set VICTORY_BCPACK_TABLES or place bcpack-tables.bin beside the executable")
+            Error("cannot open the local format tables. Set VICTORY_BCPACK_TABLES or place bcpack-tables.bin beside the executable")
         })?;
         let mut bytes = Vec::with_capacity(TABLES_SIZE);
         file.take(TABLES_SIZE as u64 + 1)
@@ -1253,8 +1253,9 @@ mod tests {
     /// unrelated dictionary and rank bytes come from our own fixture.
     fn entropy_models() -> Tables {
         let mut bytes = tables();
-        for (dest, &freq) in bytes.chunks_exact_mut(2).zip(test_models::FREQUENCIES.iter().flatten()) {
-            dest.copy_from_slice(&freq.to_le_bytes());
+        let (words, _) = bytes.as_chunks_mut::<2>();
+        for (word, &freq) in words.iter_mut().zip(test_models::FREQUENCIES.iter().flatten()) {
+            *word = freq.to_le_bytes();
         }
         Tables::parse(&bytes).unwrap()
     }
@@ -1828,7 +1829,7 @@ mod tests {
         assert!(n > 0);
     }
 
-    /// The first entry has both sets of 16 indices; later entries repeat
+    /// The first entry has both sets of 16 indices. Later entries repeat
     /// the widths before their 31 stored indices (the last index is zero).
     #[test]
     fn bc7_dictionary_index_records_stay_aligned() {
