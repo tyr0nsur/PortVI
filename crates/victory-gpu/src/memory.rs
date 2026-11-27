@@ -243,7 +243,7 @@ pub(crate) fn has_table(key: usize) -> bool {
 
 /// Runs `f` on the host heap behind view heap `key` while it cannot go
 /// away; None if it is gone or has no host heap.
-fn with_heap<R>(key: usize, f: impl FnOnce(&HostHeap) -> R) -> Option<R> {
+pub(crate) fn with_heap<R>(key: usize, f: impl FnOnce(&HostHeap) -> R) -> Option<R> {
     if key == OURS {
         return heap().map(f);
     }
