@@ -1,0 +1,513 @@
+diff --git a/crates/victory-shader/src/emit/bvh_tests.rs b/crates/victory-shader/src/emit/bvh_tests.rs
+index 1b32df7..f950df2 100644
+--- a/crates/victory-shader/src/emit/bvh_tests.rs
++++ b/crates/victory-shader/src/emit/bvh_tests.rs
+@@ -712,8 +712,9 @@ fn case(rng: &mut Rng) -> (Vec<u32>, u32, Ray) {
+     (w, ty, ray)
+ }
+ 
+-fn run_cases(wide: bool, batches: usize, memory: bool) {
++fn run_cases(wide: bool, batches: usize, memory: bool, high: bool) {
+     let shader = build(wide, memory);
++    assert!(!high || !memory, "the 64-bit offset is the root descriptor path");
+     // A program with the BVH instruction reads its root SRV as title
+     // memory too.
+     assert!(shader.memory);
+@@ -744,25 +745,35 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
+         }
+         let (mut hits, mut tris) = (0, 0);
+         for cases in &batches {
+-            // Rays, then the nodes, 128 bytes each.
++            // Rays, then the nodes, 128 bytes each. With `high`, a second
++            // copy of the nodes `HIGH` bytes further into the host buffer,
++            // mapped 4 GiB above TITLE for a narrow pointer or 32 GiB
++            // above TITLE for a wide pointer whose high word is one.
+             let nodes = (LANES * 64) as u32;
+-            let mut data = vec![0u32; LANES * 16 + LANES * 32];
++            let high_at = if high { HIGH as u32 / 4 } else { 0 };
++            let mut data = vec![0u32; LANES * 16 + LANES * 32 + high_at as usize];
+             for (n, (w, ty, ray)) in cases.iter().enumerate() {
+-                let ptr = (nodes + 128 * n as u32) >> 3 | ty;
++                let ptr = (nodes + 128 * n as u32) >> 3 | ty | if high && !wide { 1 << 29 } else { 0 };
+                 let r = &mut data[16 * n..16 * n + 12];
+                 r[0] = ptr;
++                r[11] = u32::from(high && wide);
+                 r[1] = ray.extent.to_bits();
+                 for k in 0..3 {
+                     r[2 + k] = ray.origin[k].to_bits();
+                     r[5 + k] = ray.dir[k].to_bits();
+                     r[8 + k] = ray.inv[k].to_bits();
+                 }
+-                let at = LANES * 16 + 32 * n;
++                let at = if high {
++                    (high_at + nodes / 4 + 32 * n as u32) as usize
++                } else {
++                    LANES * 16 + 32 * n
++                };
+                 data[at..at + 28].copy_from_slice(w);
+             }
++            let table = if high { page_table_high(1, 3, if wide { 32 } else { 4 }) } else { page_table(1, 3) };
+             let roots = vec![
+                 (0, Root::Constants(ud.clone())),
+-                (1, Root::View { srv: true, data: page_table(1, 3) }),
++                (1, Root::View { srv: true, data: table }),
+                 (2, Root::Uav(2 * 4096 / 32)),
+             ];
+             let views = [
+@@ -803,12 +814,12 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
+ 
+ #[test]
+ fn intersections_on_the_gpu_equal_the_reference() {
+-    run_cases(false, 16, false);
++    run_cases(false, 16, false, false);
+ }
+ 
+ #[test]
+ fn intersections_with_64_bit_pointers_on_the_gpu_equal_the_reference() {
+-    run_cases(true, 8, false);
++    run_cases(true, 8, false, false);
+ }
+ 
+ /// The title address of the rays and nodes in the title-memory runs.
+@@ -829,10 +840,45 @@ fn page_table(view: u32, null: u32) -> Vec<u32> {
+     t
+ }
+ 
++/// Physical offset for the high virtual page's nodes in the test buffer.
++const HIGH: usize = 64 << 10;
++
++/// Map a distant virtual page onto the test data at [`HIGH`].
++fn page_table_high(view: u32, null: u32, distance_gib: usize) -> Vec<u32> {
++    let (hi, lo) = ((TITLE >> 32) as u32, TITLE as u32);
++    let mut t = page_table(view, null);
++    // Level 1 has 4096 entries, then blocks of 4096 two-dword entries.
++    t.resize(4096 + 3 * 8192, 0);
++    // Each level-1 entry spans 256 MiB.
++    let l1 = ((hi << 4) | (lo >> 28)) as usize;
++    t[l1 + 4 * distance_gib] = 2;
++    let page = (lo >> 16 & 0xFFF) as usize;
++    let at = 4096 + 2 * 8192 + 2 * page;
++    t[at..at + 2].copy_from_slice(&[view, lo.wrapping_sub(HIGH as u32)]);
++    t
++}
++
+ /// The BVH at a pointer the program has in root constants: nodes (and
+ /// rays) read through title memory.
+ #[test]
+ fn intersections_on_nodes_in_title_memory_equal_the_reference() {
+-    run_cases(false, 4, true);
+-    run_cases(true, 4, true);
++    run_cases(false, 4, true, false);
++    run_cases(true, 4, true, false);
++}
++
++/// A node pointer with bit 29 set (a node more than 2 GiB into the BVH)
++/// reads where it points: the page table maps the page 4 GiB higher to a
++/// second copy of the nodes, while the page below is zeros. A 32-bit shift
++/// wraps back to the zeros (#2368).
++#[test]
++fn a_node_pointer_above_two_gib_reads_where_it_points() {
++    run_cases(false, 2, false, true);
++}
++
++/// With a 64-bit node pointer, bit 32 selects a node 32 GiB above the
++/// root. The lower alias contains zeroes so truncating the high word
++/// yields a different intersection.
++#[test]
++fn a_wide_node_keeps_its_high_word_above_the_root() {
++    run_cases(true, 2, false, true);
+ }
+diff --git a/crates/victory-shader/src/emit/lower/bvh.rs b/crates/victory-shader/src/emit/lower/bvh.rs
+index 9f6e7b0..a2e7bd3 100644
+--- a/crates/victory-shader/src/emit/lower/bvh.rs
++++ b/crates/victory-shader/src/emit/lower/bvh.rs
+@@ -127,23 +127,37 @@ impl Lower<'_> {
+                 // shortcut: the root address is taken to be 256-byte aligned
+                 // (the descriptor drops its low byte, not known here).
+                 let (k, dynamic) = self.built_offset(src)?;
+-                let three = self.s.m.i32(3);
+-                let mut at = self.s.m.bin(c, Bin::Shl, lo, three);
+-                let k = self.s.m.i32(k);
+-                at = self.s.m.bin(c, Bin::Add, at, k);
+-                if let Some(d) = dynamic {
+-                    at = self.s.m.bin(c, Bin::Add, at, d);
+-                }
+-                // A root view is title memory there (bounds-checked).
++                // A root view is title memory there (bounds-checked); a BVH
++                // larger than 2 GiB has node offsets a 32-bit shift cannot
++                // hold, so the shift and the adds happen in 64 bits, as the
++                // explicit-descriptor path below does.
+                 match self.root_address(src) {
+                     Some((root_lo, root_hi)) => {
+                         self.s.flags |= super::flags::INT64;
+                         let base = wide64(self, root_lo, root_hi);
+                         let zero = self.s.m.i32(0);
+-                        let at = wide64(self, at, zero);
++                        let at = wide64(self, lo, node_hi.unwrap_or(zero));
++                        let three = self.s.m.int_const(i64t, 3);
++                        let mut at = self.s.m.bin(c, Bin::Shl, at, three);
++                        let k = self.s.m.int_const(i64t, i64::from(k));
++                        at = self.s.m.bin(c, Bin::Add, at, k);
++                        if let Some(d) = dynamic {
++                            let d = self.s.m.cast(c, Cast::ZExt, d, i64t);
++                            at = self.s.m.bin(c, Bin::Add, at, d);
++                        }
+                         Nodes::Raw(self.s.m.bin(c, Bin::Add, base, at))
+                     }
+-                    None => Nodes::Buffer(self.handle((b, i), src, false, (11, 0))?, at),
++                    None => {
++                        // A buffer view's offset is what D3D12 takes: 32 bits.
++                        let three = self.s.m.i32(3);
++                        let mut at = self.s.m.bin(c, Bin::Shl, lo, three);
++                        let k = self.s.m.i32(k);
++                        at = self.s.m.bin(c, Bin::Add, at, k);
++                        if let Some(d) = dynamic {
++                            at = self.s.m.bin(c, Bin::Add, at, d);
++                        }
++                        Nodes::Buffer(self.handle((b, i), src, false, (11, 0))?, at)
++                    }
+                 }
+             }
+             Some(_) => return Err("a BVH descriptor"),
+diff --git a/crates/victory-shader/src/gfx10/fields.rs b/crates/victory-shader/src/gfx10/fields.rs
+index a31dab4..a8d034e 100644
+--- a/crates/victory-shader/src/gfx10/fields.rs
++++ b/crates/victory-shader/src/gfx10/fields.rs
+@@ -353,12 +353,13 @@ impl Instruction {
+                     bit(w1, 31),
+                 );
+                 let (r128, tfe, lwe) = (bit(w0, 15), bit(w0, 16), bit(w0, 17));
+-                let mut data = if name.starts_with("image_gather4") {
++                let bvh = name.starts_with("image_bvh");
++                let mut data = if bvh || name.starts_with("image_gather4") {
+                     4
+                 } else {
+                     dmask.count_ones().max(1) as u8
+                 };
+-                if d16 {
++                if d16 && !bvh {
+                     data = data.div_ceil(2);
+                 }
+                 let count = image_addr_dwords(name, dim, a16);
+@@ -378,9 +379,9 @@ impl Instruction {
+                     .iter()
+                     .any(|p| name.starts_with(p));
+                 Fields::Image {
+-                    data: vector(w1 >> 8 & 0xFF, data + u8::from(tfe || lwe)),
++                    data: vector(w1 >> 8 & 0xFF, data + u8::from(!bvh && (tfe || lwe))),
+                     addr,
+-                    rsrc: scalar(((w1 >> 16 & 0x1F) << 2) as u8, if r128 { 4 } else { 8 }),
++                    rsrc: scalar(((w1 >> 16 & 0x1F) << 2) as u8, if bvh || r128 { 4 } else { 8 }),
+                     sampler: sampled.then(|| scalar(((w1 >> 21 & 0x1F) << 2) as u8, 4)),
+                     dmask,
+                     dim,
+diff --git a/crates/victory-shader/src/gfx10/sp3.rs b/crates/victory-shader/src/gfx10/sp3.rs
+index 6f0795f..d1bf011 100644
+--- a/crates/victory-shader/src/gfx10/sp3.rs
++++ b/crates/victory-shader/src/gfx10/sp3.rs
+@@ -266,31 +266,38 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
+                     .into_iter()
+                     .chain(sampler.map(|s| s.to_string())),
+             );
+-            if *dmask != 1 {
+-                let _ = write!(out, " dmask:0x{dmask:x}");
+-            }
+-            let dims = [
+-                "1D",
+-                "2D",
+-                "3D",
+-                "CUBE",
+-                "1D_ARRAY",
+-                "2D_ARRAY",
+-                "2D_MSAA",
+-                "2D_MSAA_ARRAY",
+-            ];
+-            let _ = write!(out, " dim:SQ_RSRC_IMG_{}", dims[usize::from(*dim & 7)]);
+-            for (on, text) in [(*r128, "r128"), (*unorm, "unorm")] {
+-                if on {
+-                    out.push(' ');
+-                    out.push_str(text);
++            if name.starts_with("image_bvh") {
++                flags(&mut out, cache, true);
++                if *a16 {
++                    out.push_str(" a16");
+                 }
+-            }
+-            flags(&mut out, cache, true);
+-            for (on, text) in [(*a16, "a16"), (*d16, "d16"), (*tfe, "tfe"), (*lwe, "lwe")] {
+-                if on {
+-                    out.push(' ');
+-                    out.push_str(text);
++            } else {
++                if *dmask != 1 {
++                    let _ = write!(out, " dmask:0x{dmask:x}");
++                }
++                let dims = [
++                    "1D",
++                    "2D",
++                    "3D",
++                    "CUBE",
++                    "1D_ARRAY",
++                    "2D_ARRAY",
++                    "2D_MSAA",
++                    "2D_MSAA_ARRAY",
++                ];
++                let _ = write!(out, " dim:SQ_RSRC_IMG_{}", dims[usize::from(*dim & 7)]);
++                for (on, text) in [(*r128, "r128"), (*unorm, "unorm")] {
++                    if on {
++                        out.push(' ');
++                        out.push_str(text);
++                    }
++                }
++                flags(&mut out, cache, true);
++                for (on, text) in [(*a16, "a16"), (*d16, "d16"), (*tfe, "tfe"), (*lwe, "lwe")] {
++                    if on {
++                        out.push(' ');
++                        out.push_str(text);
++                    }
+                 }
+             }
+         }
+@@ -927,4 +934,242 @@ mod tests {
+         assert_eq!(data, Operand::Vector { reg: 8, dwords: 2 });
+         assert_eq!(addr.len(), 2);
+     }
++
++    #[test]
++    fn bvh_intersect_ray_uses_fixed_operands_and_omits_image_modifiers() {
++        // RDNA2 MIMG_IntersectRay always writes 4 VGPRs and reads a 4-SGPR
++        // (128-bit) BVH descriptor, and SP3 omits dmask/dim/r128/unorm/d16/tfe/lwe.
++        assert_eq!(
++            one(&[0xF198_9F01, 0x0003_1402], true),
++            "image_bvh_intersect_ray v[20:23], v[2:12], s[12:15]"
++        );
++        assert_eq!(
++            one(&[0xF198_2081, 0xC003_1402], true),
++            "image_bvh_intersect_ray v[20:23], v[2:9], s[12:15] dlc glc a16"
++        );
++        assert_eq!(
++            one(
++                &[
++                    0xF19C_9F07,
++                    0x0003_1402,
++                    0x0504_030D,
++                    0x0908_0706,
++                    0x000C_0B0A,
++                ],
++                true
++            ),
++            "image_bvh64_intersect_ray v[20:23], [v2,v13,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12], s[12:15]"
++        );
++
++        // Even with dmask=0, r128=0, tfe=1, lwe=1, and d16=1 in raw encoding bits,
++        // `Fields::Image` keeps 4-VGPR `data` and 4-SGPR `rsrc`.
++        let raw: [u32; 3] = [0xF198_0001 | (3 << 16), 0x8003_1402, 0xBF81_0000];
++        let code: Vec<u8> = raw.iter().flat_map(|w| w.to_le_bytes()).collect();
++        let Fields::Image {
++            data,
++            rsrc,
++            sampler,
++            ..
++        } = decode(&code).unwrap()[0].fields(true)
++        else {
++            panic!("not an image instruction");
++        };
++        assert_eq!(data, Operand::Vector { reg: 20, dwords: 4 });
++        assert_eq!(rsrc, Operand::Scalar { code: 12, dwords: 4 });
++        assert_eq!(sampler, None);
++    }
++
++    #[cfg(all(windows, feature = "host", test))]
++    #[test]
++    fn bvh_intersect_ray_without_r128_or_dmask_bits_executes_on_gpu() {
++        use crate::dxbc::Container;
++        use crate::emit::host::{Dispatch, Host, Root, View};
++        use crate::native::{
++            ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo,
++            UsedResource,
++        };
++        use crate::{emit, io, ir, resource, structure};
++
++        let global_load_x4 =
++            |vdst: u32, offset: u32| [0x37 << 26 | 0x0E << 18 | 2 << 14 | offset, 1 | vdst << 24];
++        let s_mov =
++            |dst: u8, src: u8| 0xBE80_0000 | u32::from(dst) << 16 | 0x03 << 8 | u32::from(src);
++        let sop2 = |op: u32, dst: u8, s0: u8, s1: u8| {
++            0x8000_0000
++                | op << 23
++                | u32::from(dst) << 16
++                | u32::from(s1) << 8
++                | u32::from(s0)
++        };
++        let mut words: Vec<u32> = vec![
++            s_mov(3, 0x80),
++            0x3D << 26 | 0x02 << 18 | 8 << 6 | 2 >> 1,
++            125 << 25,
++            0x1A << 25 | 1 << 17 | 256 << 9 | (128 + 6),
++        ];
++        for (k, v) in [2, 6, 10].into_iter().enumerate() {
++            words.extend(global_load_x4(v, 16 * k as u32));
++        }
++        words.extend([
++            sop2(0x21, 12, 0, 128 + 8),
++            sop2(0x10, 13, 13, 255),
++            0x8000_0000,
++            s_mov(14, 193),
++            s_mov(15, 255),
++            8 << 28 | 1 << 24 | 1 << 27 | 0x3FF,
++            // Clobber s16..s19 so an 8-SGPR srsrc read would break descriptor tracking.
++            s_mov(16, 255),
++            0xDEAD_BEEF,
++            // `image_bvh_intersect_ray v[20:23], v[2:12], s[12:15]` with dmask=0, r128=0!
++            0xF198_0001,
++            20 << 8 | (12 >> 2) << 16 | 2,
++            0x1A << 25 | 1 << 17 | 256 << 9 | (128 + 4),
++            0x38 << 26 | 0x1E << 18 | 1 << 12,
++            0x80 << 24 | (8 >> 2) << 16 | 20 << 8 | 1,
++            0xBF81_0000,
++        ]);
++
++        let native = NativeProgram {
++            stage: HwStage::Cs,
++            wave64: false,
++            vgprs: 32,
++            layout: vec![
++                RootParam {
++                    root: RootType::Descriptor,
++                    table_offset_dwords: 0,
++                    sgprs: 2,
++                    base_register: 0,
++                    user_data: 0,
++                    slot: 0,
++                },
++                RootParam {
++                    root: RootType::Table,
++                    table_offset_dwords: 0,
++                    sgprs: 1,
++                    base_register: 0,
++                    user_data: 2,
++                    slot: 1,
++                },
++            ],
++            used: vec![
++                UsedResource {
++                    kind: ResourceType::Srv,
++                    root: RootType::Descriptor,
++                    table_offset_dwords: 0,
++                    lower_bound: 0,
++                    stride: 0,
++                    dwords: 4,
++                    user_data: 0,
++                    slot: 0,
++                },
++                UsedResource {
++                    kind: ResourceType::Uav,
++                    root: RootType::Table,
++                    table_offset_dwords: 0,
++                    lower_bound: 0,
++                    stride: 0,
++                    dwords: 4,
++                    user_data: 2,
++                    slot: 1,
++                },
++            ],
++            io: StageIo::Cs(ComputeIo {
++                rsrc2: 3 << 1,
++                threads: [1, 1, 1],
++            }),
++            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
++        };
++        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
++        let st = structure::structure(&p).expect("structure");
++        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
++        let io = io::raise(&p, &native).expect("io");
++        let c = Container {
++            digest: [0; 16],
++            version: (1, 0),
++            parts: Vec::new(),
++        };
++        let shader = emit::emit(&c, &native, &p, &st, &io, &res).expect("emit");
++        assert!(shader.memory);
++        if let Ok(mut v) =
++            emit::validator::Validator::load(emit::validator::Validator::default_path().as_deref())
++        {
++            v.validate(&mut shader.dxil.clone()).expect("DXIL validation");
++        }
++
++        const TITLE: u64 = 0x12_3450_0000;
++        let (hi, lo) = ((TITLE >> 32) as u32, TITLE as u32);
++        let mut pt = vec![0u32; 4096];
++        pt[(hi << 4 | lo >> 28) as usize] = 1;
++        for _ in 0..2 * 4096 {
++            pt.extend([3, 0]);
++        }
++        let entry = 4096 + 2 * (4096 + (lo >> 16 & 0xFFF) as usize);
++        pt[entry..entry + 2].copy_from_slice(&[1, lo]);
++
++        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
++        for u in &shader.user_data {
++            ud[u.index as usize] = match (u.root, u.slot) {
++                (RootType::Table, 1) => 0,
++                (RootType::Descriptor, 0) => (TITLE >> (32 * u.dword)) as u32,
++                _ => panic!("{u:?}"),
++            };
++        }
++
++        // Ray at bytes 0..64 pointing at a 16-dword float32 box node at byte 128 (`ptr = (128 >> 3) | 5 = 21`).
++        let mut srv = vec![0u32; 64];
++        let f = f32::to_bits;
++        srv[0..11].copy_from_slice(&[
++            (128 >> 3) | 5,
++            f(100.0),
++            f(0.0),
++            f(0.0),
++            f(0.0),
++            f(1.0),
++            f(0.0),
++            f(0.0),
++            f(1.0),
++            f(f32::INFINITY),
++            f(f32::INFINITY),
++        ]);
++        // Box 0 at [2, -1, -1]..[4, 1, 1] (child id 0x42), boxes 1..3 empty (`min > max`).
++        let node = &mut srv[32..64];
++        node[0..4].copy_from_slice(&[0x42, u32::MAX, u32::MAX, u32::MAX]);
++        node[4..10].copy_from_slice(&[f(2.0), f(-1.0), f(-1.0), f(4.0), f(1.0), f(1.0)]);
++        for b in 1..4 {
++            let at = 4 + 6 * b;
++            node[at..at + 6].copy_from_slice(&[f(1.0), f(1.0), f(1.0), f(-1.0), f(-1.0), f(-1.0)]);
++        }
++
++        let mut ran = 0;
++        for warp in [false, true] {
++            let Ok(host) = Host::new(warp) else { continue };
++            let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
++            let views = [
++                View::RawUav(4),
++                View::Memory(&srv),
++                View::Pair,
++                View::NullPair,
++                View::Pair,
++            ];
++            let out = host
++                .dispatch(
++                    &root,
++                    &pso,
++                    &Dispatch {
++                        roots: vec![
++                            (0, Root::Constants(ud.clone())),
++                            (1, Root::View { srv: true, data: pt.clone() }),
++                            (2, Root::Uav(2 * 4096 / 32)),
++                        ],
++                        views: &views,
++                        samplers: &[],
++                        groups: [1, 1, 1],
++                    },
++                )
++                .expect("dispatch");
++            assert_eq!(out[0], [0x42, u32::MAX, u32::MAX, u32::MAX], "warp {warp}");
++            ran += 1;
++        }
++        assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
++    }
+ }
