@@ -1,5 +1,11 @@
 # Native runtime engineering review
 
+## Ray intersections on 27 November 2026
+
+PortVI preserves both words of a wide node pointer when a compute shader traces a ray using a root descriptor. A small test buffer maps nodes 4 GiB and 32 GiB above the virtual base. With the high word discarded, the 32 GiB case read the lower alias and returned a different intersection on the RTX 4060. With the fix, all 16 traversal tests passed. Hardware and WARP matched the CPU reference for box and triangle hits. [64-bit offsets](https://github.com/Marvisak/VIctory/pull/2501) · [High pointer word](https://github.com/Marvisak/VIctory/pull/2467)
+
+The instruction decoder also uses the fixed four-register result and four-register resource descriptor for BVH intersections. An open compute fixture with the optional image modifier bits clear returned the expected child ID on the desktop RTX 4060. These checks cover traversal and decoding. Scene lighting and reflection coverage require a separate image comparison. [Decoder work](https://github.com/Marvisak/VIctory/pull/3316) · [PortVI implementation and fixtures](../patches/0038-ray-intersection-addresses-and-operands.patch)
+
 ## Texture copy order and shader masks on 27 November 2026
 
 The texture upload at the start of a submission now sees CPU memory copies recorded before the first GPU use. A copy recorded after a draw takes effect on the next texture upload. The distinction also applies across command lists in the same submission. AvatarManz's texture upload changes prompted this check. The PortVI regression exercises both orders with a BC4 texture and reads back the texels from the GPU. [AvatarManz change](https://github.com/avatarmanz/VIctory-7900XTX/commit/5d6bd84) · [PortVI implementation and readback test](../patches/0033-stage-leading-texture-copies.patch)
