@@ -85,7 +85,10 @@ This builds `target\release\portvi.exe`, compiles the [open x64 probe](probes/ru
 | `python portvi.py test` | Full Rust workspace, including native CLI integration, shader, GPU, loader and storage tests, plus the frame-time analyzer. |
 | `python portvi.py gpu` | Executes the median shader on the physical adapter and checks its outputs. |
 | `python portvi.py texture` | Streams and samples the BC4 fixture on the physical GPU, then verifies the stale-content control. |
+| `python portvi.py barycentrics` | Draws a projective triangle on the physical GPU and checks both forms of pixel-center interpolation across 120 interior and 120 exterior pixels. Requires Direct3D 12 barycentrics support and the Windows SDK shader compiler (`dxc.exe`). |
 | `python portvi.py build` | Builds the release executable using the pinned engine and Cargo dependencies. |
+
+To try direct barycentric reads in a separate runtime, run `python portvi.py smoke --experimental-barycentrics`. It builds `target\release\experimental-barycentrics\portvi.exe` and runs the native probe. The translation assumes Direct3D primitive vertex order. Console hardware can rotate that order, so scene comparisons still require a reference image.
 
 <details>
 <summary><strong>Inspect and run your own executable</strong></summary>

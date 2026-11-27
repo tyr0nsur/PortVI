@@ -187,8 +187,12 @@ def smoke(executable, rustc, version, env):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("prepare", "build", "test", "smoke", "gpu", "texture"))
+    parser.add_argument("action", choices=("prepare", "build", "test", "smoke", "gpu", "texture", "barycentrics"))
+    parser.add_argument("--experimental-barycentrics", action="store_true",
+                        help="build a separate runtime with direct pixel-center barycentric reads")
     args = parser.parse_args()
+    if args.experimental_barycentrics and args.action not in {"build", "smoke"}:
+        parser.error("--experimental-barycentrics applies to build and smoke")
     source = native_tree()
     if args.action == "prepare":
         print(source)
@@ -196,29 +200,36 @@ def main():
     cargo, rustc, version, env = toolchain(source)
     with build_cache(ROOT, source.name) as cache:
         env["CARGO_TARGET_DIR"] = str(cache)
-        run_action(args.action, source, cargo, rustc, version, env)
+        run_action(args.action, source, cargo, rustc, version, env, args.experimental_barycentrics)
 
 
-def run_action(action, source, cargo, rustc, version, env):
-    if action in {"gpu", "texture"}:
+def run_action(action, source, cargo, rustc, version, env, experimental_barycentrics=False):
+    if action in {"gpu", "texture", "barycentrics"}:
         env.pop("VICTORY_WARP", None)
         env.pop("VICTORY_D3D12_WARP", None)
+        options = []
         if action == "gpu":
             case = "emit::valu_tests::v_med3_f32_on_physical_adapter"
             package = ["-p", "victory-shader", "--features", "host"]
             options = ["--ignored"]
             evidence = ["physical adapter: "]
-        else:
+        elif action == "texture":
             case = "modules::dstorage::tests::streamed_bc4_texels_survive_a_real_gpu_upload"
             package = ["-p", "victory-hle"]
-            options = []
             env["PORTVI_BC4_REQUIRE_HARDWARE"] = "1"
             evidence = ["BC4 adapter: ", "software=false", "32/32 expected texels", "32/32 stale texels detected"]
-        result = subprocess.run([
-            cargo, version, "test", "--locked", *package, "--lib", case,
-            "--", "--exact", *options, "--nocapture",
-        ], cwd=source, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-           text=True, errors="replace")
+        else:
+            case = "pipeline::host::tests::direct_barycentrics_match_a_projective_triangle"
+            package = ["-p", "victory-gpu", "--features", "experimental-barycentrics"]
+            evidence = ["direct barycentric readback on ", "software=false", "120 interior and 120 exterior pixels matched"]
+        with tempfile.TemporaryDirectory(prefix="gpu-probe-", dir=WORK) as staging:
+            folder = Path(staging)
+            env.update(VICTORY_CACHE_DIR=str(folder / "cache"), VICTORY_DATA_DIR=str(folder / "data"))
+            result = subprocess.run([
+                cargo, version, "test", "--locked", *package, "--lib", case,
+                "--", "--exact", *options, "--nocapture",
+            ], cwd=source, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+               text=True, errors="replace")
         print(result.stdout, end="")
         result.check_returncode()
         for marker in [f"test {case} ... ok", *evidence]:
@@ -231,20 +242,21 @@ def run_action(action, source, cargo, rustc, version, env):
         subprocess.run([cargo, version, "test", "--workspace", "--locked", "--", "--test-threads=1"],
                        cwd=source, env=env, check=True)
         return
-    subprocess.run([cargo, version, "build", "--release", "--locked", "-p", "victory", "--bin", "portvi"],
+    features = ["--features", "victory-gpu/experimental-barycentrics"] if experimental_barycentrics else []
+    destination = EXE.parent / "experimental-barycentrics" / EXE.name if experimental_barycentrics else EXE
+    subprocess.run([cargo, version, "build", "--release", "--locked", "-p", "victory", "--bin", "portvi", *features],
                    cwd=source, env=env, check=True)
     executable = Path(env["CARGO_TARGET_DIR"]) / "release" / EXE.name
-    EXE.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="publish-", dir=EXE.parent) as staging:
+    if action == "smoke":
+        smoke(executable, rustc, version, env)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="publish-", dir=destination.parent) as staging:
         for artifact in (executable.with_suffix(".pdb"), executable):
             if artifact.is_file():
                 staged = Path(staging) / artifact.name
                 shutil.copy2(artifact, staged)
-                staged.replace(EXE.parent / artifact.name)
-    if action == "smoke":
-        smoke(executable, rustc, version, env)
-    else:
-        print(EXE)
+                staged.replace(destination.parent / artifact.name)
+    print(destination)
 
 
 if __name__ == "__main__":
