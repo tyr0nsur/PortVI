@@ -232,6 +232,8 @@ mod flow_tests;
 mod g16_tests;
 #[cfg(all(test, windows))]
 mod halves_tests;
+#[cfg(all(test, windows))]
+mod halves_random_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 #[cfg(all(test, windows))]

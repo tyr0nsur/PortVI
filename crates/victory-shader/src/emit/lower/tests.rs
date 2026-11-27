@@ -328,16 +328,11 @@ fn vop3_conversion_modifiers_affect_the_lowering() {
         (0x0B, 1 << 8, 0, "abs"),
         (0x0B, 0, 1 << 29, "neg"),
     ] {
-        let vop1 = lower_valu(&[0x7E00_0000 | op << 9 | 0x101])
-            .unwrap()
-            .dxil;
+        let vop1 = lower_valu(&[0x7E00_0000 | op << 9 | 0x101]).unwrap().dxil;
         let vop3 = |first: u32, second: u32| {
-            lower_valu(&[
-                0xD400_0000 | (0x180 + op) << 16 | first,
-                0x101 | second,
-            ])
-            .unwrap()
-            .dxil
+            lower_valu(&[0xD400_0000 | (0x180 + op) << 16 | first, 0x101 | second])
+                .unwrap()
+                .dxil
         };
         assert_eq!(vop1, vop3(0, 0), "VOP1/VOP3 control for op {op:#x}");
         assert_ne!(
@@ -372,8 +367,14 @@ fn sums_of_absolute_differences_lower() {
 fn buffer_cache_invalidations_lower_as_no_ops() {
     // MUBUF opcode 0x071/0x072 with no data operand: the title asks the
     // host to invalidate its cached view of a buffer.
-    assert!(lowers(&[0xE1C4_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl0_inv");
-    assert!(lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(), "buffer_gl1_inv");
+    assert!(
+        lowers(&[0xE1C4_0000, 0, S_ENDPGM], 0).is_ok(),
+        "buffer_gl0_inv"
+    );
+    assert!(
+        lowers(&[0xE1C8_0000, 0, S_ENDPGM], 0).is_ok(),
+        "buffer_gl1_inv"
+    );
 }
 
 #[test]
@@ -417,11 +418,11 @@ fn v_cndmask_accepts_uniform_and_constant_masks() {
         0xBF06_8000u32, // s_cmp_eq_u32 s0, 0
         0x8500_80C1,    // s_cselect_b32 s0, -1, 0
         0xD501_0001,
-        0x0001_0080,    // v_cndmask_b32 v1, 0, 1, s0
+        0x0001_0080, // v_cndmask_b32 v1, 0, 1, s0
         0xD501_0002,
-        0x0201_02C1,    // v_cndmask_b32 v2, 1, v1, -1
+        0x0201_02C1, // v_cndmask_b32 v2, 1, v1, -1
         0xD834_0000,
-        0x0000_0200,    // ds_write_b32 v0, v2
+        0x0000_0200, // ds_write_b32 v0, v2
         S_ENDPGM,
     ];
     lowers(&words, 0x8001).unwrap();
@@ -1115,7 +1116,7 @@ fn guarded_or_modified_v_mov_b32_is_not_folded_as_constant() {
     // matching the compare after the join so s6 is live.
     let mut negated = [
         0xF490_0180,
-        0,           // s_memtime s[6:7]
+        0, // s_memtime s[6:7]
         0xD581_0001,
         0x2000_00F2, // v_mov_b32_e64 v1, -(1.0)
         0xBF06_8000, // s_cmp_eq_u32 s0, 0

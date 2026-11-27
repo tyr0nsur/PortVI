@@ -1,5 +1,11 @@
 # Native runtime engineering review
 
+## Ray-builder shaders on the desktop RTX 4060
+
+PortVI updated its native Wave64 translation to the split-wave implementation in VIctory PR #2633. It preserves PortVI’s root bindings, memory tracking and descriptor remapping. The GPU exchanges values across two 32-lane waves in the supported branches and loops. Group-shared memory ordering also covers the tested larger thread groups. Castyan’s paired-wave implementation provided an independent comparison. [chippy01’s implementation](https://github.com/chippy01/VIctory/commit/b32cef72554981f89fad00fecc8358699518da8a) · [Castyan’s comparison](https://github.com/DexNom/VIctory/pull/64)
+
+On a desktop RTX 4060 with driver 621.14, all nine compute programs previously refused by the acceleration-structure builder passed Microsoft’s DXIL validator and D3D12 pipeline creation with descriptor remapping enabled and disabled. Three source-authored GPU tests checked lane exchange, shared memory and divergent loops against their expected values. In the shared-memory test all lanes matched for groups of 64, 128, 256 and 512 threads. Scene fidelity is tracked against visible geometry, materials, textures and lighting at a matching camera position. [Rendering milestone](https://github.com/tyr0nsur/PortVI/issues/26)
+
 ## Direct resource indexing on capped descriptor heaps
 
 Some D3D12 adapters cap shader-visible resource heaps at one million descriptors. A program with a larger logical heap can use `VICTORY_VIEW_REMAP=1` to map its active high indices into available physical descriptors. PortVI preserves the ranges reserved for dynamic tables and paired views. All shader stages read the same map through one root SRV. [Upstream descriptor remapping](https://github.com/Marvisak/VIctory/pull/3518)
