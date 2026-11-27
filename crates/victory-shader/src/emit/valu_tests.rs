@@ -2454,3 +2454,109 @@ fn f64_conversion_reports_directed_and_dynamic_rounding() {
         assert!(error.to_string().contains("64-bit to 32-bit conversion needs known nearest-even rounding"), "{error}");
     }
 }
+
+#[test]
+fn f64_add_cpu_accepts_register_pairs_and_rejects_unmodelled_modes() {
+    let add = vop3(0x164, 0, vgpr(1), vgpr(3), 128);
+    for high in [false, true] {
+        let mut body = add.to_vec();
+        if high {
+            body.push(vop1(1, 0, vgpr(1)));
+        }
+        let shader = try_build_valu_cs(&body).expect("a binary64 addition");
+        let container = crate::Container::parse(&shader.dxil).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
+        assert_ne!(u64::from_le_bytes(features.data.try_into().unwrap()) & 1, 0);
+    }
+
+    // The default is round-to-nearest-even with binary64 denormals preserved.
+    for (mut body, reason) in [
+        (vec![0xBA80_0881, 3], "nearest-even rounding"), // MODE[3:2] toward zero
+        (vec![0xB980_0881], "nearest-even rounding"), // MODE[3:2] from s0
+        (vec![0xBA80_0981, 0], "special-value mode"), // MODE[7:6] flush
+        (vec![0xBFA5_0000], "special-value mode"), // s_denorm_mode
+    ] {
+        body.extend(add);
+        let error = try_build_valu_cs(&body).expect_err("unmodelled mode");
+        assert!(error.to_string().contains(reason), "{error}");
+    }
+    let mut clamp = add;
+    clamp[0] |= 1 << 15;
+    let error = try_build_valu_cs(&clamp).expect_err("unmodelled clamp");
+    assert!(error.to_string().contains("output modifiers"), "{error}");
+}
+
+/// `v_add_f64 v[0:1], v[1:2], v[3:4]` on the GPU against IEEE binary64
+/// addition (round to nearest even, denormals kept, the console's default
+/// MODE): both result dwords for cancellation, ties, signed zeros,
+/// denormals, overflow and infinities.
+#[test]
+fn f64_add_matches_ieee_binary64_on_the_gpu() {
+    check_add_f64(&[("hardware", false), ("warp", true)]);
+}
+
+#[test]
+#[ignore = "requires a physical D3D12 adapter with Shader Model 6.6"]
+fn f64_add_on_physical_adapter() {
+    assert!(
+        !std::env::var("VICTORY_WARP").is_ok_and(|value| value == "1"),
+        "the physical adapter check requires VICTORY_WARP to be disabled"
+    );
+    check_add_f64(&[("hardware", false)]);
+}
+
+fn check_add_f64(devices: &[(&str, bool)]) {
+    let add = vop3(0x164, 0, vgpr(1), vgpr(3), 128);
+    let low = build_valu_cs(&add);
+    let mut high = add.to_vec();
+    high.push(vop1(1, 0, vgpr(1))); // v_mov_b32 v0, v1: the high dword
+    let high = build_valu_cs(&high);
+    let tiny = f64::from_bits(1); // the smallest denormal
+    let cases: Vec<(f64, f64)> = vec![
+        (1.0, 2.0),
+        (0.1, 0.2),
+        (1.0e16, -1.0e16),                          // exact cancellation: +0
+        (1.0e16 + 2.0, -1.0e16),                    // cancellation leaving 2
+        (-0.0, -0.0),                               // -0
+        (0.0, -0.0),                                // +0
+        (1.0, f64::EPSILON / 2.0),                  // tie, even below: 1
+        (1.0 + f64::EPSILON, f64::EPSILON / 2.0),   // tie, even above
+        (-1.0, -f64::EPSILON / 2.0),
+        (tiny, tiny),                               // denormal sum
+        (f64::MIN_POSITIVE, -tiny),                 // normal minus denormal: denormal
+        (tiny, -tiny),                              // +0
+        (f64::MIN_POSITIVE / 2.0, f64::MIN_POSITIVE / 2.0), // denormals to the smallest normal
+        (f64::MAX, f64::MAX),                       // overflow: +inf
+        (f64::INFINITY, 1.0),
+        (f64::NEG_INFINITY, f64::INFINITY),         // NaN
+        (f64::NAN, 1.0),
+        (123456789.0e-300, -9.87654321e-301),
+    ];
+    let inputs: Vec<[u32; 4]> = cases
+        .iter()
+        .map(|&(a, b)| {
+            let (a, b) = (a.to_bits(), b.to_bits());
+            [a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32]
+        })
+        .collect();
+    let mut words: std::collections::HashMap<(String, usize), [Option<u32>; 2]> = Default::default();
+    for (half, shader) in [&low, &high].into_iter().enumerate() {
+        run_cases_on(shader, &inputs, devices, |backend, i, _, got| {
+            words.entry((backend.to_string(), i)).or_default()[half] = Some(got);
+        });
+    }
+    assert!(!words.is_empty(), "no case ran");
+    for ((backend, i), [lo, hi]) in &words {
+        let (a, b) = cases[*i];
+        let got = f64::from_bits(u64::from(lo.expect("low dword")) | u64::from(hi.expect("high dword")) << 32);
+        let want = a + b;
+        if want.is_nan() {
+            assert!(got.is_nan(), "{backend}: {a:e} + {b:e} = {got:e}, want NaN");
+        } else {
+            assert_eq!(got.to_bits(), want.to_bits(), "{backend}: {a:e} + {b:e} = {got:e} ({:#018x}), want {want:e} ({:#018x})",
+                got.to_bits(), want.to_bits());
+        }
+    }
+    eprintln!("v_add_f64: {} sums matched IEEE binary64 bit for bit on {:?}", words.len(),
+        words.keys().map(|k| k.0.as_str()).collect::<std::collections::BTreeSet<_>>());
+}

@@ -353,6 +353,8 @@ struct Lower<'a> {
     cur_ir: usize,
     /// Blocks reached with all host lanes, computed once if a permlane needs inactive sources.
     full_wave_blocks: std::cell::OnceCell<Option<Vec<bool>>>,
+    /// Programs using binary64 addition must retain the entry mode for special values.
+    f64_defaults: std::cell::OnceCell<bool>,
     /// Whole-wave sections by block and start index.
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
@@ -926,6 +928,7 @@ impl<'a> Lower<'a> {
                 .collect(),
             cur_ir: 0,
             full_wave_blocks: std::cell::OnceCell::new(),
+            f64_defaults: std::cell::OnceCell::new(),
             sections: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
@@ -6759,6 +6762,49 @@ impl<'a> Lower<'a> {
                     r = self.s.m.select(c, nan, sat, r);
                 }
                 int(self, r)
+            }
+            "v_add_f64" => {
+                // Replay each guest add in its original position in the reduction tree.
+                // A plain DXIL fadd without fast-math flags preserves that order.
+                if self.mode16 != Some(0) {
+                    return Err("64-bit addition needs known nearest-even rounding");
+                }
+                if v.clamp || v.omod != 0 || v.opsel != 0 {
+                    return Err("64-bit addition output modifiers");
+                }
+                // DXIL preserves binary64 denormals. Until MODE changes for special
+                // values are tracked, only accept programs that leave them alone.
+                let defaults = self.f64_defaults.get_or_init(|| {
+                    self.x.p.blocks.iter().flat_map(|b| &b.insts).all(|i| {
+                        match (i.name(), &i.fields) {
+                            ("s_denorm_mode" | "s_swappc_b64", _) => false,
+                            ("s_setreg_imm32_b32" | "s_setreg_b32", Fields::Sop { imm: Some(h), .. }) => {
+                                let (hwreg, first, count) = (h & 63, h >> 6 & 31, (h >> 11) + 1);
+                                // MODE[7:6] is FP64/16 denormals, [8] DX10_CLAMP, [9] IEEE.
+                                hwreg != 1 || first >= 10 || first + count <= 6
+                            }
+                            _ => true,
+                        }
+                    })
+                });
+                if !defaults {
+                    return Err("64-bit addition with a change to its special-value mode");
+                }
+                let Some(Operand::Vector { reg, dwords: 2 }) = v.dst else {
+                    return Err("a 64-bit addition result");
+                };
+                let (a, b) = (self.src64(inst, 0)?, self.src64(inst, 1)?);
+                let double = self.s.m.double();
+                let a = self.s.m.cast(c, Cast::Bitcast, a, double);
+                let b = self.s.m.cast(c, Cast::Bitcast, b, double);
+                let sum = self.s.m.bin(c, Bin::Add, a, b);
+                let i64t = self.s.m.int(64);
+                let sum = self.s.m.cast(c, Cast::Bitcast, sum, i64t);
+                let (lo, hi) = self.split64(sum);
+                self.s.flags |= flags::FLOAT64;
+                self.write(inst, Reg::V(reg), lo, guard);
+                self.write(inst, Reg::V(reg + 1), hi, guard);
+                Ok(())
             }
             "v_cvt_f32_f64" => {
                 // DXIL fptrunc rounds to nearest even. This instruction uses
