@@ -13,7 +13,6 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parent
-WORK = ROOT / ".work"
 TARGET = ROOT / "target"
 EXE = TARGET / "release" / "portvi.exe"
 _CACHE_NAME = re.compile(r"portvi-([a-f0-9]{20})-[a-z0-9_]{8}")
@@ -92,7 +91,6 @@ def build_cache(repo, revision):
 
 
 def native_tree():
-    WORK.mkdir(exist_ok=True)
     return ROOT
 
 
@@ -135,7 +133,7 @@ def toolchain(source):
 
 
 def smoke(executable, rustc, version, env):
-    with tempfile.TemporaryDirectory(prefix="probe-", dir=WORK) as staging:
+    with tempfile.TemporaryDirectory(prefix="portvi-probe-") as staging:
         folder = Path(staging)
         probe = folder / "portvi_probe.exe"
         subprocess.run([
@@ -198,7 +196,7 @@ def run_action(action, source, cargo, rustc, version, env, experimental_barycent
             case = "pipeline::host::tests::direct_barycentrics_match_a_projective_triangle"
             package = ["-p", "victory-gpu", "--features", "experimental-barycentrics"]
             evidence = ["direct barycentric readback on ", "software=false", "120 interior and 120 exterior pixels matched"]
-        with tempfile.TemporaryDirectory(prefix="gpu-probe-", dir=WORK) as staging:
+        with tempfile.TemporaryDirectory(prefix="portvi-gpu-probe-") as staging:
             folder = Path(staging)
             env.update(VICTORY_CACHE_DIR=str(folder / "cache"), VICTORY_DATA_DIR=str(folder / "data"))
             result = subprocess.run([
