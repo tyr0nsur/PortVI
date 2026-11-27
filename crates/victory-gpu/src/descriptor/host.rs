@@ -1934,10 +1934,16 @@ fn shift_view_levels(drop: u32, desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC) {
 /// format of its family takes the texture's format unless it is castable.
 /// shortcut: such a view (sRGB of UNORM, say, on a texture the host made
 /// without castable formats) reads without its conversion.
-fn fits(texture: &ID3D12Resource, castable: &[u32], mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
-    use crate::resource::{DEPTH_FORMATS, family};
+fn fits(texture: &ID3D12Resource, castable: &[u32], format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    fits_desc(&d, castable, format, unordered)
+}
+
+/// Applies the host resource's view-casting rules, including explicitly
+/// supported casts for placed resources which share the same storage.
+pub(crate) fn fits_desc(d: &D3D12_RESOURCE_DESC, castable: &[u32], mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
+    use crate::resource::{DEPTH_FORMATS, family};
     let allowed = if unordered {
         d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
     } else {

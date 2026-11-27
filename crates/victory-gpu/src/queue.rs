@@ -535,13 +535,13 @@ extern "system" fn present(
         && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
-        use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
         use windows::core::Interface;
 
         const COPY_SOURCE: u32 = 0x800;
         // SAFETY: the title passes the plane descriptions.
         let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
-        let mut resources: Vec<(This, ID3D12Resource, u32, bool)> =
+        let mut resources: Vec<(This, std::sync::Arc<crate::resource::HostTexture>, u32, bool)> =
             Vec::with_capacity(slice.len());
         for plane in slice {
             if plane.count == 0 || plane.resources.is_null() {
@@ -549,11 +549,11 @@ extern "system" fn present(
             }
             // SAFETY: the plane lists `count` resources.
             let resource = unsafe { *plane.resources };
-            if let Some(texture) = crate::resource::host_resource(resource) {
+            if let Some(texture) = crate::resource::host_copy(resource) {
                 // Distinct title resources may refer to one host texture.
                 // Keep its original state for every plane and restore it once.
                 let prior = resources.iter().find_map(|(_, earlier, state, _)| {
-                    (earlier.as_raw() == texture.as_raw()).then_some(*state)
+                    (earlier.texture.as_raw() == texture.texture.as_raw()).then_some(*state)
                 });
                 let state = prior.unwrap_or_else(|| {
                     crate::resource::host_transition(resource, COPY_SOURCE)
@@ -563,9 +563,15 @@ extern "system" fn present(
             }
         }
         if !resources.is_empty() {
-            let sources: Vec<(&_, u32)> = resources
+            let sources: Vec<_> = resources
                 .iter()
-                .map(|(_, tex, state, _)| (tex, *state))
+                .map(|(resource, copy, state, _)| crate::host::DisplayPlane {
+                    texture: &copy.texture,
+                    state: *state,
+                    title: crate::resource::title_format(*resource)
+                        .map(|f| DXGI_FORMAT(crate::resource::pc_format(f) as i32)),
+                    castable: &copy.castable,
+                })
                 .collect();
             let shown = host.present(&sources, frame);
             for &(resource, _, state, first) in &resources {
