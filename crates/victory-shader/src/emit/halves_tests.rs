@@ -281,7 +281,7 @@ fn the_test_programs_are_what_their_comments_say() {
             ],
         ),
         (
-            permlanes(),
+            permlanes(true),
             &[
                 "v_mul_u32_u24 v2, 3, v0",
                 "s_mov_b32 s10, lit(0x89abcdef)",
@@ -1001,7 +1001,7 @@ fn differences_with_lds(
     per_lane: usize,
     want: &[u32],
 ) -> Vec<String> {
-    compared(words, threads, lds_bytes, per_lane, want, true)
+    compared(words, threads, lds_bytes, per_lane, want, BOTH_FORMS)
 }
 
 /// [`differences`] in halves only: for what the console's own form gets
@@ -1012,24 +1012,46 @@ fn differences_in_halves(
     per_lane: usize,
     want: &[u32],
 ) -> Vec<String> {
-    compared(words, threads, 0, per_lane, want, false)
+    compared(words, threads, 0, per_lane, want, &[WaveForm::Halves])
 }
 
-/// [`differences_with_lds`], with the console's own form (one wave64) only
-/// where `wave64`.
+#[derive(Clone, Copy)]
+enum WaveForm {
+    Halves,
+    Native64,
+}
+
+const BOTH_FORMS: &[WaveForm] = &[WaveForm::Halves, WaveForm::Native64];
+
+/// Compare the console reference with each supported translation of the fixture.
 fn compared(
     words: &[u32],
     threads: u32,
     lds_bytes: u32,
     per_lane: usize,
     want: &[u32],
-    wave64: bool,
+    requested: &[WaveForm],
 ) -> Vec<String> {
     let n = native(words, true, threads, lds_bytes);
-    let mut forms = vec![("halves", shader(lowered(&n, true).expect("halves")))];
-    if wave64 {
-        forms.push(("wave64", shader(lowered(&n, false).expect("one wave64"))));
-    }
+    let warp = std::env::var("VICTORY_WARP").as_deref() == Ok("1");
+    let mut validator = warp.then(|| {
+        validator::Validator::load(validator::Validator::default_path().as_deref())
+            .expect("DXIL validator for WARP comparisons")
+    });
+    let forms: Vec<_> = requested
+        .iter()
+        .map(|form| {
+            let (label, host_wave32) = match form {
+                WaveForm::Halves => ("halves", true),
+                WaveForm::Native64 => ("wave64", false),
+            };
+            let mut lowered = lowered(&n, host_wave32).expect(label);
+            if let Some(v) = &mut validator {
+                v.validate(&mut lowered.dxil).expect(label);
+            }
+            (label, lowered.wave_size, shader(lowered))
+        })
+        .collect();
     let views = [
         View::Texture(1, 1, &[[0.0; 4]]),
         View::Buffer {
@@ -1041,15 +1063,27 @@ fn compared(
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let hosts = Host::each_hardware();
+    let (hosts, warp_lanes) = if warp {
+        let host = Host::new(true).expect("requested WARP adapter");
+        let (min, max) = host.wave_lanes().expect("WARP wave capabilities");
+        (vec![("WARP".into(), host)], Some(min..=max))
+    } else {
+        (Host::each_hardware(), None)
+    };
     if hosts.is_empty() {
         eprintln!("no SM 6.6 hardware device; skipped");
     }
     let mut failed = Vec::new();
     for (adapter, host) in &hosts {
         let wave32 = host.wave32().unwrap_or(false);
-        for (form, shader) in &forms {
+        for (form, required_lanes, shader) in &forms {
             let label = format!("{adapter} ({form})");
+            if let (Some(required), Some(supported)) = (required_lanes, &warp_lanes)
+                && !supported.contains(required)
+            {
+                eprintln!("{label}: DXIL validated; readback requires {required} lanes, WARP supports {supported:?}");
+                continue;
+            }
             let Ok((root, pso)) = host.compute_pipeline(shader) else {
                 // Only the console's own form may be refused, and only
                 // where the host's waves are 32 lanes.
@@ -2629,9 +2663,9 @@ fn a_whole_wave_sum_kept_by_lanes_matches_the_console_in_halves_on_every_gpu() {
 /// thread id plus one), each lane reading lane 15 - i of its row of 16 (of
 /// the other row of its 32 with x16): with every lane (`v3`, `v4`), then
 /// with the even lanes only, the odd ones they read left out: as it is
-/// (`v5`), with bound_ctrl (`v6`) and with fi (`v7`). Each register holds
-/// 0x3333.. 0x7777 before.
-fn permlanes() -> Vec<u32> {
+/// (`v5`), with bound_ctrl (`v6`) and with optional fetch-inactive (`v7`).
+/// Each register holds 0x3333.. 0x7777 before.
+fn permlanes(fetch_inactive: bool) -> Vec<u32> {
     let mut w = PROLOGUE.to_vec();
     w.extend([
         0x3420_0085, // v_lshlrev_b32 v16, 5, v0
@@ -2656,7 +2690,7 @@ fn permlanes() -> Vec<u32> {
         0x7C00_0000 | 0xC2 << 17 | 9 << 9 | 128, // v_cmp_eq_u32 vcc, 0, v9
         0xBE94_246A,                             // s_and_saveexec_b64 s[20:21], vcc
     ]);
-    for (d, op_sel) in [(5u8, 0u32), (6, 2), (7, 1)] {
+    for (d, op_sel) in [(5u8, 0u32), (6, 2), (7, u32::from(fetch_inactive))] {
         let [a, b] = vop3(d, 0x377, 256 + 2, 10, 11); // v_permlane16_b32 vd, v2, s10, s11
         w.extend([a | op_sel << 11, b]);
     }
@@ -2670,7 +2704,7 @@ fn permlanes() -> Vec<u32> {
 
 /// What the console stores for [`permlanes`]'s thread `l` in a group of
 /// `threads`.
-fn permlanes_want(threads: u32, l: u32) -> [u32; 5] {
+fn permlanes_want(threads: u32, l: u32, fetch_inactive: bool) -> [u32; 5] {
     let base = l & !63;
     let lane = l - base;
     let (row, pos) = (lane & !15, lane & 15);
@@ -2689,20 +2723,43 @@ fn permlanes_want(threads: u32, l: u32) -> [u32; 5] {
         read(other, 0x4444),
         0x5555,
         if even { 0 } else { 0x6666 },
-        if even { read(own, 0x7777) } else { 0x7777 },
+        if even && fetch_inactive {
+            read(own, 0x7777)
+        } else {
+            0x7777
+        },
     ]
 }
 
-/// [`permlanes`] on every hardware adapter, in halves and as one wave64
-/// where the adapter runs those, in groups of 48, 64 and 128.
+/// In a group of 48, the last row of 16 is complete, but the last host
+/// wave of 32 is partial. Only the native Wave64 form supports FI there.
 #[test]
 fn permlanes_match_the_console_on_every_gpu() {
+    assert!(matches!(
+        lowered(&native(&permlanes(true), true, 48, 0), true),
+        Err(crate::ShaderError::Unsupported {
+            what: "a permlane fetch from a partial 32-lane half (wave64 on a 32-lane host)",
+            ..
+        })
+    ));
     let mut failed = Vec::new();
-    for threads in [48, 64, 128] {
+    for (threads, fetch_inactive, forms) in [
+        (48, false, BOTH_FORMS),
+        (48, true, &[WaveForm::Native64][..]),
+        (64, true, BOTH_FORMS),
+        (128, true, BOTH_FORMS),
+    ] {
         let want: Vec<u32> = (0..threads)
-            .flat_map(|l| permlanes_want(threads, l))
+            .flat_map(|l| permlanes_want(threads, l, fetch_inactive))
             .collect();
-        failed.extend(differences(&permlanes(), threads, 5, &want));
+        failed.extend(compared(
+            &permlanes(fetch_inactive),
+            threads,
+            0,
+            5,
+            &want,
+            forms,
+        ));
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
