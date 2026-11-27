@@ -1,0 +1,180 @@
+From: The VIctory-NVIDIA and PortVI contributors
+Subject: Order unpredicated straight-line Wave64 LDS reads and writes on Wave32 hardware
+Upstream: https://github.com/trustno1-coder/VIctory-NVIDIA/blob/2dc3df1c72275a1086330ad3b7cba7f9494fe874/crates/victory-shader/src/emit/lower.rs
+
+Adapt the split-wave group barrier to a single console wave following one
+unguarded block. Groups with multiple console waves and predicated accesses
+retain the previous refusal. An unused LDS allocation requires no barrier.
+
+diff --git a/crates/victory-shader/src/emit/halves_tests.rs b/crates/victory-shader/src/emit/halves_tests.rs
+index 91ca09482f97a76f56a2cd2922821cdf05322045..f63411076877e853e4972cc0bf3defb66656d491 100644
+--- a/crates/victory-shader/src/emit/halves_tests.rs
++++ b/crates/victory-shader/src/emit/halves_tests.rs
+@@ -411,10 +411,43 @@ fn lds_spanning_host_waves_needs_proven_ordering() {
+     ]
+     .concat();
+     assert_eq!(refusal(&lds, 32, 256), "translated");
+-    for (threads, bytes) in [(33, 256), (64, 256), (128, 512)] {
+-        assert!(refusal(&lds, threads, bytes).contains("LDS ordering across 32-lane halves"));
+-        assert!(lowered(&native(&lds, true, threads, bytes), false).is_ok());
++    for threads in [33, 64] {
++        assert_eq!(refusal(&lds, threads, 256), "translated");
+     }
++    assert!(refusal(&lds, 128, 512).contains("LDS ordering across 32-lane halves"));
++    assert!(lowered(&native(&lds, true, 128, 512), false).is_ok());
++
++    let write = lds.iter().position(|&word| word == 0xD834_0000).unwrap();
++    let mut masked = lds.to_vec();
++    masked.insert(write + 2, 0xBEFE_0414); // s_mov_b64 exec, s[20:21]
++    masked.splice(write..write, [
++        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
++        0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
++    ]);
++    assert!(refusal(&masked, 64, 256).contains("LDS ordering across 32-lane halves"));
++}
++
++/// Each lane reads the dword written by the opposite half of its console
++/// wave. A passing dispatch requires ordering between the two host waves.
++#[test]
++fn straight_line_lds_exchanges_data_across_two_host_waves() {
++    let mut words = PROLOGUE.to_vec();
++    words.extend([
++        0x3420_0085, // v_lshlrev_b32 v16, 5, v0: output byte index
++        0x3404_0082, // v_lshlrev_b32 v2, 2, v0: LDS byte index
++        0xD765_0001, 0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
++        0xD834_0000, 0x0000_0002, // ds_write_b32 v2, v0
++        S_WAITCNT_LGKM,
++        0x3A08_00A0, // v_xor_b32 v4, 32, v0
++        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
++        0xD8D8_0000, 0x0300_0004, // ds_read_b32 v3, v4
++        S_WAITCNT_LGKM,
++    ]);
++    words.extend(store(3, 0));
++    words.push(S_ENDPGM);
++    let want: Vec<_> = (0..64).map(|lane| lane ^ 32).collect();
++    let wrong = differences_with_lds(&words, 64, 1, &want, 512);
++    assert!(wrong.is_empty(), "{wrong:?}");
+ }
+ 
+ /// Runs `words`, one group of `threads` of a wave64 program whose lanes store
+@@ -422,7 +455,11 @@ fn lds_spanning_host_waves_needs_proven_ordering() {
+ /// as one wave64 where the adapter runs 64-lane waves. A line per lane whose
+ /// dwords differ from `want` (the console's, `per_lane` per lane).
+ fn differences(words: &[u32], threads: u32, per_lane: usize, want: &[u32]) -> Vec<String> {
+-    let n = native(words, true, threads, 0);
++    differences_with_lds(words, threads, per_lane, want, 0)
++}
++
++fn differences_with_lds(words: &[u32], threads: u32, per_lane: usize, want: &[u32], lds: u32) -> Vec<String> {
++    let n = native(words, true, threads, lds);
+     let forms = [
+         ("halves", shader(lowered(&n, true).expect("halves"))),
+         ("wave64", shader(lowered(&n, false).expect("one wave64"))),
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index e8cf7adfc5849e70fe476d3e8f2f2a6e38ee9acb..059bdf40541e9f68bbed71f8f78970419573ced6 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -309,6 +309,8 @@ struct Lower<'a> {
+     halves: bool,
+     /// Why such a program cannot run in halves.
+     halves_refused: Option<Why>,
++    /// A straight-line console wave shares LDS between two host waves.
++    sync_halves_lds: bool,
+     /// [`Lower::relabelled_flat`], once made.
+     relabelled: Option<V>,
+     /// In halves: VGPR values the same in every lane of the console wave
+@@ -688,7 +690,7 @@ impl<'a> Lower<'a> {
+         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
+             || insts().any(|i| i.name().starts_with("image_bvh"));
+         let mut console_lanes = false;
+-        let (mut halves, mut halves_refused) = (false, None);
++        let (mut halves, mut halves_refused, mut sync_halves_lds) = (false, None, false);
+         if let StageIo::Cs(cs) = x.native.io {
+             s.threads = Some(cs.threads);
+             s.lds_dwords = cs.lds_bytes() / 4;
+@@ -778,7 +780,10 @@ impl<'a> Lower<'a> {
+             let needs_wave = console_lanes || one_wave && s.lds_dwords > 0;
+             halves = Self::halves_wanted(x, needs_wave);
+             if halves {
+-                halves_refused = Self::halves_lds(group, s.lds_dwords);
++                match Self::halves_lds(x, group, s.lds_dwords) {
++                    Ok(sync) => sync_halves_lds = sync,
++                    Err(why) => halves_refused = Some(why),
++                }
+             }
+             if needs_wave {
+                 s.wave_size = Some(if halves { 32 } else { wave });
+@@ -884,6 +889,7 @@ impl<'a> Lower<'a> {
+             console_lanes,
+             halves,
+             halves_refused,
++            sync_halves_lds,
+             relabelled: None,
+             alike,
+             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
+@@ -3484,6 +3490,11 @@ impl<'a> Lower<'a> {
+         if self.s.lds_dwords == 0 {
+             return Err("LDS the program does not allocate");
+         }
++        if self.sync_halves_lds {
++            // The admission check proves both host waves reach this access.
++            let mode = self.s.m.i32(1 | 8); // thread group + group-shared memory
++            self.s.op(self.cur, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
++        }
+         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
+         // shortcut: LDS addresses are taken as aligned to what they access.
+         // The address is `addr + offset` in 32 bits (it wraps: LLVM folds a
+diff --git a/crates/victory-shader/src/emit/lower/halves.rs b/crates/victory-shader/src/emit/lower/halves.rs
+index a67a1e5b4635a77024313532c77211d92b6b7e47..89fe869a53f5f0a28c73a023bfb52b41f130f2f9 100644
+--- a/crates/victory-shader/src/emit/lower/halves.rs
++++ b/crates/victory-shader/src/emit/lower/halves.rs
+@@ -35,10 +35,9 @@
+ //! lowering retries with that value missing), so a program is refused only
+ //! when it really reads across halves.
+ //!
+-//! A group spanning more than one host wave can exchange LDS between the
+-//! two halves of a console wave. Group size alone does not prove that a
+-//! barrier separates the producer and consumer, even for groups of 128.
+-//! Until this is established from the program, keep its native wave width.
++//! When one console wave runs on two host waves, its straight-line LDS
++//! reads and writes can synchronize at each access. Other exchanges need
++//! a proof that all participating lanes reach the same synchronization.
+ //!
+ //! Approach after DexNom's fork (DexNom/Victory 5f4c3df, `set_host_max_wave`
+ //! and the thread relabelling into halves) and upstream PR #2176
+@@ -100,10 +99,31 @@ impl Lower<'_> {
+         needs_wave && x.native.wave64 && x.host_wave32
+     }
+ 
+-    /// Splitting a console wave changes the ordering of its LDS accesses.
+-    pub(super) fn halves_lds(group: u32, lds_dwords: u32) -> Option<Why> {
+-        (lds_dwords > 0 && group > HALF)
+-            .then_some("LDS ordering across 32-lane halves has not been proved")
++    /// Adapted from VIctory-NVIDIA's group synchronization for split waves.
++    /// Only one console wave is involved, every lane follows the same block,
++    /// and none of its memory accesses is predicated. Unused reserved LDS
++    /// requires no synchronization, even in a group with several waves.
++    pub(super) fn halves_lds(x: &Parts, group: u32, lds_dwords: u32) -> Result<bool, Why> {
++        if lds_dwords == 0 || group <= HALF {
++            return Ok(false);
++        }
++        let mut accesses = x.p.blocks.iter().enumerate().flat_map(|(b, block)| {
++            block.insts.iter().enumerate().filter_map(move |(i, inst)| {
++                let name = inst.name();
++                (matches!(inst.fields, Fields::Ds { .. }) && !name.starts_with("ds_swizzle")
++                    && !name.contains("permute")).then_some((b, i, name))
++            })
++        }).peekable();
++        if accesses.peek().is_none() {
++            return Ok(false);
++        }
++        if group <= 64 && matches!(x.st.exits.as_slice(), [LaneExit::End])
++            && accesses.all(|(b, i, name)| x.st.guards[b][i].is_none()
++                && (name.starts_with("ds_read") || name.starts_with("ds_write")))
++        {
++            return Ok(true);
++        }
++        Err("LDS ordering across 32-lane halves has not been proved")
+     }
+ 
+     /// An unmodified 1D thread id at program entry has a known first value
