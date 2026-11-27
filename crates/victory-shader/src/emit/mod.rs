@@ -316,6 +316,8 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
+    /// Table views whose index the runtime can evaluate when binding a draw.
+    pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
     pub stage: HwStage,
     /// The DXIL container, hashed as D3D12 expects.
     pub dxil: Vec<u8>,
@@ -819,6 +821,7 @@ fn emit_pruned(
         root_uavs: l.root_uavs,
         memory: l.memory,
         memory_writes: l.memory_writes,
+        root_indexed_views: l.root_indexed_views,
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,
@@ -1761,6 +1764,7 @@ mod tests {
             root_uavs: Vec::new(),
             memory: false,
             memory_writes: false,
+            root_indexed_views: Vec::new(),
             view_addresses: false,
             heap: false,
             heap_writes: false,
@@ -1778,6 +1782,7 @@ mod tests {
                 root_uavs: Vec::new(),
                 memory: false,
                 memory_writes: false,
+                root_indexed_views: Vec::new(),
                 view_addresses: false,
                 heap: false,
                 heap_writes: false,

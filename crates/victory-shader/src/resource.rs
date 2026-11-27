@@ -119,12 +119,31 @@ pub struct Descriptor {
     pub source: Source,
 }
 
+/// Shader-uniform table access that the host can resolve from a root constant.
+/// The arithmetic matches the shader's 32-bit byte address (VIctory-NVIDIA / DexNom).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RootIndexedView {
+    pub table_slot: u8,
+    pub constant_slot: u8,
+    pub constant_dword: u32,
+    pub byte_offset: u32,
+    pub shift: u8,
+}
+
+impl RootIndexedView {
+    /// Relative descriptor index for a 32-byte resource view.
+    pub fn descriptor(self, constant: u32) -> u32 {
+        self.byte_offset.wrapping_add(constant.wrapping_shl(u32::from(self.shift))) / 32
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Resources {
     /// Every scalar memory access by address (`s_load_*`, `s_store_*`), and
     /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,
     pub descriptors: Vec<Descriptor>,
+    pub root_indexed_views: Vec<RootIndexedView>,
     /// User SGPRs holding root parameters: value on entry (or loaded from
     /// the root signature's memory, [`USER_DATA`]), layout index, dword
     /// within the parameter.
@@ -297,6 +316,11 @@ pub fn track(
             out.waterfall.loads.extend(loads);
         }
     }
+    out.root_indexed_views = out.descriptors.iter()
+        .filter_map(|desc| t.root_indexed_view(desc, &out.scalar))
+        .collect();
+    out.root_indexed_views.sort_unstable();
+    out.root_indexed_views.dedup();
     Ok(out)
 }
 
@@ -652,6 +676,33 @@ impl<'a> Tracer<'a> {
                 self.term(inst, src.get(1)?)?,
             ],
         ))
+    }
+
+    fn root_indexed_view(&self, descriptor: &Descriptor, scalar: &[(Site, Address)]) -> Option<RootIndexedView> {
+        if descriptor.role != Role::Resource {
+            return None;
+        }
+        let Source::Loaded { load, first } = descriptor.source else { return None };
+        let at = scalar.binary_search_by_key(&load, |(site, _)| *site).ok()?;
+        let address = scalar[at].1;
+        let table = self.layout.get(address.param)?;
+        if table.root != RootType::Table {
+            return None;
+        }
+        let dynamic = address.dynamic?;
+        let (input, shift) = match self.sop2(dynamic, &["s_lshl_b32"]) {
+            Some((_, [Term::Value(input), Term::Const(shift)])) => (input, (shift & 31) as u8),
+            _ => (dynamic, 0),
+        };
+        let (param, dword) = self.param_value(input)?;
+        let constant = self.layout.get(param)?;
+        (constant.root == RootType::Constants).then_some(RootIndexedView {
+            table_slot: table.slot,
+            constant_slot: constant.slot,
+            constant_dword: dword,
+            byte_offset: address.offset.wrapping_add(u32::from(first) * 4),
+            shift,
+        })
     }
 
     fn sum(&self, t: Term) -> Sum {
@@ -2359,6 +2410,30 @@ pub(crate) mod tests {
                 first: 0
             }
         );
+    }
+
+    #[test]
+    fn indexed_image_load_selects_a_table_entry_from_the_second_root_dword() {
+        let code = [
+            0x8F08_850F, // s_lshl_b32 s8, s15, 5
+            0xBE93_0380, // s_mov_b32 s19, 0
+            0xF40C_0309, 0x1000_0020, // s_load_dwordx8 s[12:19], s[18:19], s8 + 32
+            0xF000_1F08, 0x0003_0200, // image_load v[2:5], v[0:1], s[12:19]
+            S_ENDPGM,
+        ];
+        let constants = RootParam { slot: 2, ..param(Constants, 6, 2) };
+        let table = RootParam { slot: 7, ..param(Table, 10, 1) };
+        let r = track_words(&code, &[constants, table], HwStage::Ms);
+        let access = RootIndexedView {
+            table_slot: 7, constant_slot: 2, constant_dword: 1, byte_offset: 32, shift: 5,
+        };
+        assert_eq!(r.root_indexed_views, [access]);
+        assert_eq!(access.descriptor(3), 4);
+        assert_eq!(access.descriptor(u32::MAX), 0);
+        let heap = RootParam { root: ResourceHeap, ..table };
+        assert!(track_words(&code, &[constants, heap], HwStage::Ms).root_indexed_views.is_empty());
+        let other_table = RootParam { root: Table, ..constants };
+        assert!(track_words(&code, &[other_table, table], HwStage::Ms).root_indexed_views.is_empty());
     }
 
     #[test]

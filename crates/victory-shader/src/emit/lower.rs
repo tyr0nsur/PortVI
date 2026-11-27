@@ -36,6 +36,7 @@ enum Val {
 }
 
 pub(crate) struct Lowered {
+    pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
     pub dxil: Vec<u8>,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
@@ -1604,6 +1605,7 @@ impl<'a> Lower<'a> {
         let view_addresses = self.s.view_addresses.is_some();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
+            root_indexed_views: self.x.res.root_indexed_views.clone(),
             cmp_samplers,
             root_cbvs,
             root_srvs,

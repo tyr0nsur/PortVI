@@ -115,6 +115,7 @@ fn lowered_for_host(native: &NativeProgram, host_wave32: bool) -> Result<HostSha
         root_uavs: result.root_uavs,
         memory: result.memory,
         memory_writes: result.memory_writes,
+        root_indexed_views: result.root_indexed_views,
         view_addresses: result.view_addresses,
         heap: result.heap,
         heap_writes: result.heap_writes,

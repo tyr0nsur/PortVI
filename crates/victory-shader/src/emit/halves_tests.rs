@@ -158,6 +158,7 @@ fn shader(l: lower::Lowered) -> super::HostShader {
         root_uavs: l.root_uavs,
         memory: l.memory,
         memory_writes: l.memory_writes,
+        root_indexed_views: l.root_indexed_views,
         view_addresses: l.view_addresses,
         heap: l.heap,
         heap_writes: l.heap_writes,

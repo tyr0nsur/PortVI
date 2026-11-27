@@ -813,6 +813,47 @@ fn bytes(data: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
 pub mod fixture {
     use super::*;
 
+    /// Four threads copy four 2D texels from a table SRV to a table UAV.
+    /// The static variant reads entry zero. The indexed variant reads
+    /// entry 1 + the second constant of slot 2.
+    pub fn root_indexed_texture(indexed: bool) -> NativeProgram {
+        let table = RootParam {
+            root: RootType::Table, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data: 4, slot: 7,
+        };
+        let output = RootParam { user_data: 8, slot: 3, ..table };
+        let constants = RootParam { root: RootType::Constants, sgprs: 2, user_data: 6, slot: 2, ..table };
+        let srv = UsedResource {
+            kind: ResourceType::Srv, root: RootType::Table, table_offset_dwords: 0,
+            lower_bound: 0, stride: 0, dwords: 8, user_data: table.user_data, slot: table.slot,
+        };
+        let uav = UsedResource { kind: ResourceType::Uav, user_data: output.user_data, slot: output.slot, ..srv };
+        let mut words = vec![
+            0xBE89_0380u32,              // s_mov_b32 s9, 0
+            0xF40C_0504, 0xFA00_0000,    // s_load_dwordx8 s[20:27], s[8:9], 0
+            0xBE85_0380,                 // s_mov_b32 s5, 0
+        ];
+        if indexed {
+            words.extend([
+                0x8F0A_8507,                 // s_lshl_b32 s10, s7, 5
+                0xF40C_0302, 0x1400_0020,     // s_load_dwordx8 s[12:19], s[4:5], s10 + 32
+            ]);
+        } else {
+            words.extend([0xF40C_0302, 0xFA00_0000]); // same table, static offset zero
+        }
+        words.extend([
+            0x7E02_0280,                 // v1 = 0; v0 is the local X thread ID
+            0xF000_1F08, 0x0003_0200,     // image_load v[2:5], v[0:1], s[12:19]
+            0xBF8C_3F70,                 // s_waitcnt vmcnt(0)
+            0xF020_1F08, 0x0005_0200,     // image_store v[2:5], v[0:1], s[20:27]
+            0xBF81_0000,
+        ]);
+        NativeProgram {
+            stage: HwStage::Cs, wave64: false, vgprs: 8, layout: vec![table, constants, output], used: vec![srv, uav],
+            io: StageIo::Cs(ComputeIo { rsrc2: 10 << 1, threads: [4, 1, 1] }),
+            code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        }
+    }
+
     /// One 32-bit float row of an `ISG1`/`OSG1`/`PSG1` part.
     #[derive(Debug, Clone, Copy)]
     pub struct Row {
