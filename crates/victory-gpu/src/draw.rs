@@ -73,24 +73,24 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, what it holds) â†’ first
-    /// dynamic slot minus its first used table offset.
-    fresh_tables: std::collections::HashMap<(u64, u64), u32>,
-    /// The dynamic slots the list holds: title heap, first, count; given
-    /// back when the list is reset or released.
-    dynamic: Vec<(usize, u32, u32)>,
+    /// Maps the host heap id, table and contents to its first dynamic slot
+    /// minus the first used table offset.
+    fresh_tables: std::collections::HashMap<(u64, u64, u64), u32>,
+    /// The title heap, host heap id, first slot and count for each allocation
+    /// returned when the list is reset or released.
+    dynamic: Vec<(usize, u64, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
     /// The title-memory page table made for this list (`crate::memory`)
     /// and its view heap.
     memory: Option<(usize, crate::memory::Map)>,
     /// Views made for root SRVs and UAVs in this list ([`State::root_view`]):
-    /// (view heap, host copy, unordered access) â†’ dynamic slot.
-    root_slots: std::collections::HashMap<(usize, usize, bool), u32>,
-    /// The run of dynamic slots root views take from (view heap, next
+    /// The host heap id, host copy and access type identify the dynamic slot.
+    root_slots: std::collections::HashMap<(u64, usize, bool), u32>,
+    /// The run of dynamic slots root views take from (host heap id, next
     /// slot, end): taken [`ROOT_VIEW_RUN`] at a time, so that single slots
     /// do not break up the runs fresh tables need.
-    root_run: (usize, u32, u32),
+    root_run: (u64, u32, u32),
     /// What was set straight onto the host list, for the next segment of
     /// the list ([`State::cut`]).
     fixed: Fixed,
@@ -110,11 +110,8 @@ struct Fixed {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            match (heap, crate::memory::heap()) {
-                (MEMORY_HEAP, Some(ours)) => ours.release(first, n),
-                _ => crate::descriptor::release_dynamic(heap, first, n),
-            }
+        for &(heap, owner, first, count) in &self.dynamic {
+            let _ = crate::memory::with_heap(heap, |host| host.release_if_owner(owner, first, count));
         }
     }
 }
@@ -966,18 +963,18 @@ impl State {
             return None;
         };
         let copy = std::sync::Arc::as_ptr(&shadow) as usize;
-        if let Some(&index) = self.root_slots.get(&(key, copy, uav)) {
+        if let Some(&index) = self.root_slots.get(&(host.id, copy, uav)) {
             return Some((index, offset));
         }
         let (run_heap, next, end) = self.root_run;
-        if run_heap != key || next >= end {
+        if run_heap != host.id || next >= end {
             let Some(first) = host.dynamic(ROOT_VIEW_RUN) else {
                 once!("no dynamic slots for root views: dropped");
                 not_run("no dynamic slots for root views");
                 return None;
             };
-            self.dynamic.push((key, first, ROOT_VIEW_RUN));
-            self.root_run = (key, first, first + ROOT_VIEW_RUN);
+            self.dynamic.push((key, host.id, first, ROOT_VIEW_RUN));
+            self.root_run = (host.id, first, first + ROOT_VIEW_RUN);
         }
         let index = self.root_run.1;
         self.root_run.1 += 1;
@@ -986,7 +983,7 @@ impl State {
         if uav {
             host.set_mark(index, shadow.mark_entry(shadow.range().0));
         }
-        self.root_slots.insert((key, copy, uav), index);
+        self.root_slots.insert((host.id, copy, uav), index);
         Some((index, offset))
     }
 
@@ -1067,7 +1064,7 @@ impl State {
             return;
         };
         self.dynamic
-            .push((std::ptr::from_ref(heap) as usize, slot, 1));
+            .push((std::ptr::from_ref(heap) as usize, visible.id, slot, 1));
         visible.make_at(slot, &view);
         let at = host.cpu_view();
         let Some(resource) = crate::descriptor::host::make_view(&view, at) else {
@@ -1328,7 +1325,7 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
-                (table, h.finish())
+                (host.id, table, h.finish())
             };
             if let Some(&base) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
@@ -1355,7 +1352,7 @@ impl State {
             let base = first - start;
             self.fresh_tables.insert(key, base);
             self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+                .push((std::ptr::from_ref(heap) as usize, host.id, first, n));
             // The whole range from the first used entry: a shader may index
             // past the entries its used-resource list names (descriptor
             // arrays).

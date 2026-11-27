@@ -286,19 +286,6 @@ pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
     }
 }
 
-/// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
-#[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.release(first, n);
-    }
-}
-
 /// Runs `f` on the host heap behind the title heap at `heap` while that
 /// heap cannot be released; None if it is gone or has no host heap.
 #[cfg(windows)]

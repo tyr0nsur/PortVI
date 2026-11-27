@@ -97,7 +97,11 @@ fn overflow_slots(title: u32) -> u32 {
     n.min(title / 2)
 }
 
+static NEXT_HEAP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub(crate) struct HostHeap {
+    /// A command list can outlive the title heap at its original address.
+    pub(crate) id: u64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
@@ -381,6 +385,7 @@ impl HostHeap {
         // Title slots past the direct ones, up to `base` (the remap's).
         let overflow = if remap && title_count > count { base.saturating_sub(count) } else { 0 };
         let h = HostHeap {
+            id: NEXT_HEAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             heap,
             cpu,
             step,
@@ -594,7 +599,7 @@ impl HostHeap {
     /// returned).
     ///
     /// [`dynamic`]: HostHeap::dynamic
-    pub(crate) fn release(&self, first: u32, n: u32) {
+    pub(super) fn release(&self, first: u32, n: u32) {
         let Some(at) = first.checked_sub(self.base) else {
             return;
         };
@@ -602,6 +607,13 @@ impl HostHeap {
         let end = (at + n).min(self.dynamic) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
             slots.fill(false);
+        }
+    }
+
+    /// Returns a command list's allocation while its original heap still owns it.
+    pub(crate) fn release_if_owner(&self, owner: u64, first: u32, count: u32) {
+        if self.id == owner {
+            self.release(first, count);
         }
     }
 
@@ -3291,6 +3303,27 @@ mod tests {
         assert_eq!(fits.pairs_end, HEAP_VIEWS_PORTABLE - 3);
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn resetting_an_older_list_preserves_the_replacement_heaps_slots() {
+        if host().is_none() {
+            return;
+        }
+        // Both heaps have identical slot numbers. The earlier command list
+        // can be reset after the title has already replaced the first heap.
+        let original = HostHeap::sized(false, 4, 4096).unwrap();
+        let previous_owner = original.id;
+        let first = original.dynamic(1).unwrap();
+        drop(original);
+
+        let replacement = HostHeap::sized(false, 4, 4096).unwrap();
+        assert_ne!(previous_owner, replacement.id);
+        assert_eq!(replacement.dynamic(replacement.dynamic), Some(first));
+        replacement.release_if_owner(previous_owner, first, 1);
+        assert_eq!(replacement.dynamic(1), None);
+        replacement.release_if_owner(replacement.id, first, 1);
+        assert_eq!(replacement.dynamic(1), Some(first));
     }
 
     #[test]
