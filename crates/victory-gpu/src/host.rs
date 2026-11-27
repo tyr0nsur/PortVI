@@ -3243,6 +3243,116 @@ impl Compositor {
             })
         }
     }
+    /// Draws the sampled display planes into a destination in COMMON/PRESENT.
+    /// Leaves it in RENDER_TARGET and returns barriers restoring the sources.
+    fn record(
+        &self,
+        device: &ID3D12Device,
+        list: &ID3D12GraphicsCommandList,
+        destination: &ID3D12Resource,
+        size: (u32, u32),
+        planes: &[(&ID3D12Resource, u32, Option<DXGI_FORMAT>)],
+    ) -> Vec<D3D12_RESOURCE_BARRIER> {
+        let (width, height) = size;
+        // SAFETY: the open list and live textures are held through submission.
+        unsafe {
+            let rtv = self.rtv_heap.GetCPUDescriptorHandleForHeapStart();
+            device.CreateRenderTargetView(
+                destination,
+                Some(&D3D12_RENDER_TARGET_VIEW_DESC {
+                    Format: self.format,
+                    ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                    Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                        Texture2D: D3D12_TEX2D_RTV {
+                            MipSlice: 0,
+                            PlaneSlice: 0,
+                        },
+                    },
+                }),
+                rtv,
+            );
+            let srv_cpu_base = self.srv_heap.GetCPUDescriptorHandleForHeapStart();
+            let srv_gpu_base = self.srv_heap.GetGPUDescriptorHandleForHeapStart();
+            let count = planes.len().min(MAX_PLANES as usize);
+            let mut before = Vec::with_capacity(count + 1);
+            let mut after = Vec::with_capacity(count);
+            for (i, &(tex, state, source)) in planes[..count].iter().enumerate() {
+                let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: srv_cpu_base.ptr + i * self.srv_stride as usize,
+                };
+                device.CreateShaderResourceView(
+                    tex,
+                    Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: source.expect("a sampled display plane has a source view"),
+                        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Texture2D: D3D12_TEX2D_SRV {
+                                MostDetailedMip: 0,
+                                MipLevels: 1,
+                                PlaneSlice: 0,
+                                ResourceMinLODClamp: 0.0,
+                            },
+                        },
+                    }),
+                    handle,
+                );
+                let state = D3D12_RESOURCE_STATES(state as i32);
+                if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                    && planes[..i]
+                        .iter()
+                        .all(|(earlier, _, _)| earlier.as_raw() != tex.as_raw())
+                {
+                    before.push(transition(
+                        tex,
+                        state,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                    ));
+                    after.push(transition(
+                        tex,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                        state,
+                    ));
+                }
+            }
+            before.push(transition(
+                destination,
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+            ));
+            list.ResourceBarrier(&before);
+            list.SetDescriptorHeaps(&[Some(self.srv_heap.clone())]);
+            list.SetGraphicsRootSignature(&self.root);
+            list.RSSetViewports(&[D3D12_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: width as f32,
+                Height: height as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            }]);
+            list.RSSetScissorRects(&[RECT {
+                left: 0,
+                top: 0,
+                right: width as i32,
+                bottom: height as i32,
+            }]);
+            list.OMSetRenderTargets(1, Some(&rtv), false, None);
+            list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            for i in 0..count {
+                list.SetPipelineState(if i == 0 { &self.opaque } else { &self.overlay });
+                list.SetGraphicsRootDescriptorTable(
+                    0,
+                    D3D12_GPU_DESCRIPTOR_HANDLE {
+                        ptr: srv_gpu_base.ptr + (i as u64) * u64::from(self.srv_stride),
+                    },
+                );
+                list.DrawInstanced(3, 1, 0, 0);
+            }
+            after
+        }
+    }
+
 }
 
 #[derive(Default)]
@@ -3632,99 +3742,7 @@ impl Host {
                 (capture, probe)
             } else {
                 let comp = p.compositor.as_ref().expect("compositor prepared for this frame");
-                let rtv = comp.rtv_heap.GetCPUDescriptorHandleForHeapStart();
-                self.device.CreateRenderTargetView(
-                    &back,
-                    Some(&D3D12_RENDER_TARGET_VIEW_DESC {
-                        Format: target_format,
-                        ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
-                        Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
-                            Texture2D: D3D12_TEX2D_RTV {
-                                MipSlice: 0,
-                                PlaneSlice: 0,
-                            },
-                        },
-                    }),
-                    rtv,
-                );
-                let srv_cpu_base = comp.srv_heap.GetCPUDescriptorHandleForHeapStart();
-                let srv_gpu_base = comp.srv_heap.GetGPUDescriptorHandleForHeapStart();
-                let count = planes.len().min(MAX_PLANES as usize);
-                let mut before = Vec::with_capacity(count + 1);
-                let mut after = Vec::with_capacity(count);
-                for (i, &(tex, state, source)) in planes[..count].iter().enumerate() {
-                    let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
-                        ptr: srv_cpu_base.ptr + i * comp.srv_stride as usize,
-                    };
-                    self.device.CreateShaderResourceView(
-                        tex,
-                        Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
-                            Format: source.expect("a sampled display plane has a source view"),
-                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                                Texture2D: D3D12_TEX2D_SRV {
-                                    MostDetailedMip: 0,
-                                    MipLevels: 1,
-                                    PlaneSlice: 0,
-                                    ResourceMinLODClamp: 0.0,
-                                },
-                            },
-                        }),
-                        handle,
-                    );
-                    let state = D3D12_RESOURCE_STATES(state as i32);
-                    if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-                        && planes[..i]
-                            .iter()
-                            .all(|(earlier, _, _)| earlier.as_raw() != tex.as_raw())
-                    {
-                        before.push(transition(
-                            tex,
-                            state,
-                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                        ));
-                        after.push(transition(
-                            tex,
-                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                            state,
-                        ));
-                    }
-                }
-                before.push(transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_RENDER_TARGET,
-                ));
-                list.ResourceBarrier(&before);
-                list.SetDescriptorHeaps(&[Some(comp.srv_heap.clone())]);
-                list.SetGraphicsRootSignature(&comp.root);
-                list.RSSetViewports(&[D3D12_VIEWPORT {
-                    TopLeftX: 0.0,
-                    TopLeftY: 0.0,
-                    Width: width as f32,
-                    Height: height as f32,
-                    MinDepth: 0.0,
-                    MaxDepth: 1.0,
-                }]);
-                list.RSSetScissorRects(&[RECT {
-                    left: 0,
-                    top: 0,
-                    right: width as i32,
-                    bottom: height as i32,
-                }]);
-                list.OMSetRenderTargets(1, Some(&rtv), false, None);
-                list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                for i in 0..count {
-                    list.SetPipelineState(if i == 0 { &comp.opaque } else { &comp.overlay });
-                    list.SetGraphicsRootDescriptorTable(
-                        0,
-                        D3D12_GPU_DESCRIPTOR_HANDLE {
-                            ptr: srv_gpu_base.ptr + (i as u64) * u64::from(comp.srv_stride),
-                        },
-                    );
-                    list.DrawInstanced(3, 1, 0, 0);
-                }
+                let after = comp.record(&self.device, list, &back, (width, height), planes);
                 #[cfg(feature = "diagnostics")]
                 let (capture, probe) = {
                     list.ResourceBarrier(&[transition(
@@ -4492,6 +4510,9 @@ mod withholding {
         }
     }
 }
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod offscreen_plane_tests;
 
 #[cfg(all(test, feature = "diagnostics"))]
 mod present_plane_tests {
