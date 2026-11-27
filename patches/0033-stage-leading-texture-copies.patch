@@ -1,0 +1,420 @@
+diff --git a/crates/victory-gpu/src/bindless.rs b/crates/victory-gpu/src/bindless.rs
+index 6588d83..6dc3357 100644
+--- a/crates/victory-gpu/src/bindless.rs
++++ b/crates/victory-gpu/src/bindless.rs
+@@ -193,8 +193,8 @@ fn left_kind(view: &View) -> (usize, u64, u64) {
+ /// host textures by a list of ours, which the submission runs first (and
+ /// leaves them readable by shaders): each at most once.
+ ///
+-/// shortcut: a title copy into texture memory recorded in the same
+-/// submission shows from the next one on.
++/// Leading title memory copies are visible here. Copies after GPU recording
++/// or another kind of deferred step are visible on the next submission.
+ pub(crate) fn uploads(
+     heaps: &[Arc<Viewed>],
+     textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 1caaad5..209637f 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -510,14 +510,14 @@ impl State {
+ 
+     pub(crate) fn set_depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
+         self.depth_bounds = Some((min, max));
+-        if list.depth_bounds.is_none() {
++        if list.depth_bounds().is_none() {
+             crate::host::warn_depth_bounds();
+         }
+         self.apply_depth_bounds(list);
+     }
+ 
+     fn apply_depth_bounds(&self, list: &HostList) {
+-        if let (Some(list), Some((min, max))) = (&list.depth_bounds, self.depth_bounds) {
++        if let (Some(list), Some((min, max))) = (list.depth_bounds(), self.depth_bounds) {
+             // SAFETY: the host supports depth bounds and the list is open.
+             unsafe { list.OMSetDepthBounds(min, max) };
+         }
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 54907a4..bfb486b 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -795,11 +795,35 @@ pub(crate) mod tests {
+     }
+ }
+ 
++/// Access to the command recorder closes the CPU-only prefix, including raw
++/// callbacks and commands such as clears and copies which have no deferred step.
++pub(crate) struct RecordingList {
++    raw: ID3D12GraphicsCommandList,
++    accessed: std::sync::atomic::AtomicBool,
++}
++
++impl RecordingList {
++    fn note_access(&self) {
++        if !self.accessed.load(Ordering::Relaxed) {
++            self.accessed.store(true, Ordering::Relaxed);
++        }
++    }
++}
++
++impl std::ops::Deref for RecordingList {
++    type Target = ID3D12GraphicsCommandList;
++
++    fn deref(&self) -> &Self::Target {
++        self.note_access();
++        &self.raw
++    }
++}
++
+ /// A host command list and its allocator, always used together.
+ pub(crate) struct HostList {
+     allocator: ID3D12CommandAllocator,
+-    pub(crate) list: ID3D12GraphicsCommandList,
+-    pub(crate) depth_bounds: Option<ID3D12GraphicsCommandList1>,
++    pub(crate) list: RecordingList,
++    depth_bounds: Option<ID3D12GraphicsCommandList1>,
+     /// Work for submission time, in recorded order.
+     deferred: Mutex<Deferred>,
+     /// Upload memory for data the list's draws make (expanded vertices),
+@@ -1017,6 +1041,8 @@ enum Step {
+ struct Deferred {
+     /// Destination, source, bytes.
+     copies: Vec<Step>,
++    /// Consecutive CPU copies recorded before the first access to the GPU recorder.
++    leading_copies: usize,
+     uploads: Vec<ID3D12Resource>,
+     /// Host objects the list's commands name (pipelines, root signatures,
+     /// descriptor heaps): the title may release its objects before it
+@@ -1167,7 +1193,7 @@ impl Host {
+             Ok(HostList {
+                 allocator,
+                 depth_bounds: self.depth_bounds_supported.then(|| list.cast()).transpose()?,
+-                list,
++                list: RecordingList { raw: list, accessed: false.into() },
+                 deferred: Mutex::default(),
+                 scratch: Mutex::default(),
+                 states: Mutex::default(),
+@@ -1241,9 +1267,26 @@ impl Host {
+             .collect();
+         #[cfg(feature = "diagnostics")]
+         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
+-        let uploads = (!heaps.is_empty() || !textures.is_empty())
++        let has_textures = !heaps.is_empty() || !textures.is_empty();
++        let mut batch = Batch::default();
++        let mut leading_copies = 0;
++        if has_textures {
++            // Apply only the submission's leading memory copies. Staging must see
++            // their bytes, while a later overwrite must not change an earlier draw.
++            for list in runs {
++                let deferred = list.deferred();
++                let count = deferred.leading_copies;
++                HostList::run_deferred(&deferred.copies[..count], &mut batch);
++                leading_copies += count;
++                if count < deferred.copies.len() || list.list.accessed.load(Ordering::Relaxed) {
++                    break;
++                }
++            }
++        }
++        let uploads = has_textures
+             .then(|| crate::bindless::uploads(&heaps, &textures))
+             .flatten();
++        let first_title_list = usize::from(uploads.is_some());
+         #[cfg(feature = "diagnostics")]
+         drop(uploading);
+         let runs: Vec<&HostList> = uploads
+@@ -1275,16 +1318,24 @@ impl Host {
+         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
+         // Where each run's lists start in `lists`.
+         let mut firsts = Vec::with_capacity(runs.len());
+-        let mut batch = Batch::default();
+-        for list in runs {
+-            list.run_deferred(&mut batch);
++        for (index, list) in runs.iter().enumerate() {
++            {
++                let deferred = list.deferred();
++                let done = if index < first_title_list {
++                    0
++                } else {
++                    leading_copies.min(deferred.copies.len())
++                };
++                leading_copies -= done;
++                HostList::run_deferred(&deferred.copies[done..], &mut batch);
++            }
+             firsts.push(lists.len());
+             #[cfg(feature = "diagnostics")]
+             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
+             if let Some(prelude) = list.prelude() {
+                 lists.push(Some(prelude));
+             }
+-            lists.push(list.list.cast().ok());
++            lists.push(list.list.raw.cast().ok());
+         }
+         batch.flush();
+         let prepared = std::time::Instant::now();
+@@ -1793,7 +1844,7 @@ impl HostList {
+                 }),
+             )
+         };
+-        let (pointers, name) = (identities(&self.list), list_name(self.id));
++        let (pointers, name) = (identities(&self.list.raw), list_name(self.id));
+         node_is_list(pointer, wide.as_deref(), &pointers, &name)
+             || node_is_list(None, ansi.as_deref(), &pointers, &name)
+     }
+@@ -1809,7 +1860,7 @@ impl HostList {
+             }
+         }
+         // SAFETY: our list.
+-        if let Err(e) = unsafe { self.list.Close() } {
++        if let Err(e) = unsafe { self.list.raw.Close() } {
+             fail(format_args!(
+                 "a host command list did not close ({e}): a command recorded into it was invalid"
+             ));
+@@ -1835,11 +1886,16 @@ impl HostList {
+         let reset = unsafe {
+             self.allocator
+                 .Reset()
+-                .and_then(|()| self.list.Reset(&self.allocator, None))
++                .and_then(|()| self.list.raw.Reset(&self.allocator, None))
+         };
+         if let Err(e) = reset {
+             fail(format_args!("a host command list did not reset ({e})"));
+         }
++        self.list.accessed.store(false, Ordering::Relaxed);
++    }
++
++    pub(crate) fn depth_bounds(&self) -> Option<&ID3D12GraphicsCommandList1> {
++        self.depth_bounds.as_ref().inspect(|_| self.list.note_access())
+     }
+ 
+     /// Moves a title texture's host copy to `wanted` (a host state) in this
+@@ -1871,6 +1927,8 @@ impl HostList {
+     /// one): the state it leaves, if that is a change. Nothing for the
+     /// list's first use (its prelude moves the texture there).
+     fn track(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) -> Option<u32> {
++        // A first transition can record GPU work only in the submission prelude.
++        self.list.note_access();
+         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+         match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
+             std::collections::hash_map::Entry::Vacant(v) => {
+@@ -1914,6 +1972,8 @@ impl HostList {
+         side: u8,
+         writes: bool,
+     ) -> Option<bool> {
++        // A twin copy can also be deferred to the list's prelude.
++        self.list.note_access();
+         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+         match twins.entry(std::sync::Arc::as_ptr(depth) as usize) {
+             std::collections::hash_map::Entry::Vacant(v) => {
+@@ -2106,6 +2166,11 @@ impl HostList {
+     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
+     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
+         let mut deferred = self.deferred();
++        if deferred.leading_copies == deferred.copies.len()
++            && !self.list.accessed.load(Ordering::Relaxed)
++        {
++            deferred.leading_copies += 1;
++        }
+         deferred
+             .copies
+             .push(Step::Copy(dst as usize, src as usize, len));
+@@ -2351,10 +2416,10 @@ impl HostList {
+     /// Runs the list's submission-time steps; refreshes go into `batch`
+     /// (the title's big buffers, a 174 MB one among them, are read by most
+     /// lists of a submission, through many ranges).
+-    fn run_deferred(&self, batch: &mut Batch) {
++    fn run_deferred(steps: &[Step], batch: &mut Batch) {
+         #[cfg(feature = "diagnostics")]
+         use crate::copystat::{C, add};
+-        for step in &self.deferred().copies {
++        for step in steps {
+             let started = std::time::Instant::now();
+             #[cfg(feature = "diagnostics")]
+             let _timed = crate::watch::Timed(
+diff --git a/crates/victory-gpu/src/pipeline/host.rs b/crates/victory-gpu/src/pipeline/host.rs
+index 2d915fc..03e393b 100644
+--- a/crates/victory-gpu/src/pipeline/host.rs
++++ b/crates/victory-gpu/src/pipeline/host.rs
+@@ -1347,7 +1347,7 @@ mod tests {
+         // bounds: the first pixel's red.
+         let draw = |min: f32, max: f32| -> u8 {
+             let list = host.new_list().unwrap();
+-            assert!(list.depth_bounds.is_some(), "the list of a supporting host sets bounds");
++            assert!(list.depth_bounds().is_some(), "the list of a supporting host sets bounds");
+             let mut state = crate::draw::State::default();
+             state.set_depth_bounds(&list, min, max);
+             let rtv = host.rtv(&color, None);
+diff --git a/crates/victory-gpu/src/resource_bc4_probe.rs b/crates/victory-gpu/src/resource_bc4_probe.rs
+index 960d78e..636b36e 100644
+--- a/crates/victory-gpu/src/resource_bc4_probe.rs
++++ b/crates/victory-gpu/src/resource_bc4_probe.rs
+@@ -163,18 +163,7 @@ impl Sampler {
+         }
+     }
+ 
+-    fn sample(&self, host: &Host, texture: &TitleTexture, upload: bool) -> [f32; TEXELS] {
+-        let list = host.new_list().expect("BC4 command list");
+-        let image = host_resource(texture.0).unwrap();
+-        let before = crate::texture::uploads(texture.0);
+-        if upload {
+-            crate::texture::upload(&list, texture.0, &image);
+-        }
+-        crate::list::ensure_state(
+-            &list,
+-            texture.0,
+-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 as u32,
+-        );
++    fn record(&self, list: &host::HostList) {
+         // SAFETY: the live descriptor, pipeline and buffers match the shader.
+         // All 32 lanes write a distinct float before the readback copy.
+         unsafe {
+@@ -202,12 +191,27 @@ impl Sampler {
+                 D3D12_RESOURCE_STATE_COMMON,
+             )]);
+         }
+-        list.close();
+-        host.execute(&[&list]);
+-        assert_eq!(
+-            crate::texture::uploads(texture.0) - before, u64::from(upload),
+-            "submission-time uploads of the BC4 probe texture"
+-        );
++    }
++
++    fn submit(
++        &self,
++        host: &Host,
++        texture: &TitleTexture,
++        expected_uploads: u64,
++        split: bool,
++        record: impl FnOnce(&host::HostList, &host::HostList),
++    ) -> [f32; TEXELS] {
++        let first = host.new_list().expect("BC4 command list");
++        let second = split.then(|| host.new_list().expect("second BC4 command list"));
++        let before = crate::texture::uploads(texture.0);
++        record(&first, second.as_ref().unwrap_or(&first));
++        first.close();
++        if let Some(second) = second {
++            second.close();
++            host.execute(&[&first, &second]);
++        } else {
++            host.execute(&[&first]);
++        }
+         // SAFETY: execute waits for this list. The readback buffer holds 32
+         // aligned floats, and the copy completes before its mapped span is read.
+         unsafe {
+@@ -228,6 +232,10 @@ impl Sampler {
+             let texels = ptr.cast::<[f32; TEXELS]>().read();
+             self.readback
+                 .Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
++            assert_eq!(
++                crate::texture::uploads(texture.0) - before, expected_uploads,
++                "BC4 upload count, first sampled texel = {:.1}/255", texels[0] * 255.0
++            );
+             texels
+         }
+     }
+@@ -319,7 +327,21 @@ pub fn run(fill: impl FnOnce(&mut [u8; 16]), require_hardware: bool) {
+     // SAFETY: the layout places two consecutive BC4 blocks in this owned
+     // texture. A mutable borrow spans only the writes, never a GPU submission.
+     let address = unsafe { memory.cast_mut().add(first as usize).cast::<[u8; 16]>() };
+-    let sampler = Sampler::new(host, &host_resource(raw).expect("BC4 host texture"));
++    let image = host_resource(raw).expect("BC4 host texture");
++    let sampler = Sampler::new(host, &image);
++    let request = |list: &host::HostList| crate::texture::upload(list, raw, &image);
++    let shader_read = |list: &host::HostList| {
++        crate::list::ensure_state(list, raw, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 as u32);
++    };
++    let sample = |upload: bool| {
++        sampler.submit(host, &texture, u64::from(upload), false, |_, list| {
++            if upload {
++                request(list);
++            }
++            shader_read(list);
++            sampler.record(list);
++        })
++    };
+     let sentinel = [51u8, 51, 0, 0, 0, 0, 0, 0];
+     {
+         // SAFETY: the two blocks lie in this texture and no work has been
+@@ -328,7 +350,7 @@ pub fn run(fill: impl FnOnce(&mut [u8; 16]), require_hardware: bool) {
+         blocks[..8].copy_from_slice(&sentinel);
+         blocks[8..].copy_from_slice(&sentinel);
+     }
+-    let original = sampler.sample(host, &texture, true);
++    let original = sample(true);
+     assert!(
+         original.iter().all(|&v| (v * 255.0 - 51.0).abs() < 0.01),
+         "sentinel upload: {original:?}"
+@@ -336,8 +358,8 @@ pub fn run(fill: impl FnOnce(&mut [u8; 16]), require_hardware: bool) {
+     // SAFETY: the previous list has completed and the callback waits for its
+     // storage request, which opens guarded pages first (`watch::writing`).
+     fill(unsafe { &mut *address });
+-    let stale = sampler.sample(host, &texture, false);
+-    let updated = sampler.sample(host, &texture, true);
++    let stale = sample(false);
++    let updated = sample(true);
+     assert_eq!(
+         stale, original,
+         "the skipped upload must preserve the previous GPU contents"
+@@ -366,4 +388,47 @@ pub fn run(fill: impl FnOnce(&mut [u8; 16]), require_hardware: bool) {
+         "unexpected GPU readback: {updated:?}"
+     );
+     eprintln!("BC4 readback: 32/32 expected texels; skipped upload: 32/32 stale texels detected");
++
++    // A leading memory copy writes the sampled blocks. A later one overwrites
++    // them after the draw. Each readback must see exactly its own generation.
++    let solid = |v| [v, v, 0, 0, 0, 0, 0, 0, v, v, 0, 0, 0, 0, 0, 0];
++    let (first, last, overwrite) = (solid(107), solid(213), solid(173));
++    for split in [false, true] {
++        let current = sampler.submit(host, &texture, 1, split, |a, b| {
++            a.defer_copy(address.cast(), first.as_ptr(), first.len());
++            request(b);
++            shader_read(b);
++            sampler.record(b);
++            b.defer_copy(address.cast(), last.as_ptr(), last.len());
++        });
++        assert!(
++            current.iter().all(|&v| (v * 255.0 - 107.0).abs() < 0.01),
++            "the first draw must see the preceding copy: {current:?}"
++        );
++        let next = sample(true);
++        assert!(
++            next.iter().all(|&v| (v * 255.0 - 213.0).abs() < 0.01),
++            "the next submission must see the later copy: {next:?}"
++        );
++
++        // A raw dispatch has no deferred texture or heap step. Its visible
++        // texture is still the old generation when the overwrite follows it.
++        let earlier = sampler.submit(host, &texture, 0, split, |a, b| {
++            // The previous submission already left the texture shader-readable.
++            sampler.record(a);
++            b.defer_copy(address.cast(), overwrite.as_ptr(), overwrite.len());
++            request(b);
++        });
++        assert!(
++            earlier.iter().all(|&v| (v * 255.0 - 213.0).abs() < 0.01),
++            "a later copy must not change a preceding raw dispatch: {earlier:?}"
++        );
++        let after = sample(true);
++        assert!(
++            after.iter().all(|&v| (v * 255.0 - 173.0).abs() < 0.01),
++            "the next submission must observe the deferred overwrite: {after:?}"
++        );
++    }
++    eprintln!("BC4 raw dispatch: 64/64 preserved texels, 64/64 later texels");
++    eprintln!("BC4 ordered copies: 64/64 current texels and 64/64 next-submission texels");
+ }
+diff --git a/crates/victory-gpu/src/texture.rs b/crates/victory-gpu/src/texture.rs
+index 83d1fc5..687f2d0 100644
+--- a/crates/victory-gpu/src/texture.rs
++++ b/crates/victory-gpu/src/texture.rs
+@@ -344,8 +344,8 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
+ /// then copied into the host texture by the submission's own upload list,
+ /// once for all its lists (`crate::bindless::uploads`).
+ ///
+-/// shortcut: a title copy into texture memory recorded in the same
+-/// submission shows from the next one on.
++/// Leading title memory copies are visible here. Copies after GPU recording
++/// or another kind of deferred step are visible on the next submission.
+ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+     // shortcut: a texture the host copied into keeps the host's contents
+     // even if the title later writes its memory too.
