@@ -282,6 +282,33 @@ cl /nologo /EHsc probes\adapter.cpp /Fotarget\adapter.obj /Fetarget\adapter.exe 
 .\target\adapter.exe
 ```
 
+## Indirect mesh dispatch and pipeline caching
+
+An authored fixture uses the runtime's indirect execution path to submit one mesh dispatch. On a physical RTX 4060, both passes returned all 256 expected RGBA32F pixels. The cold pass created one pipeline. The warm pass loaded the same entry from the Direct3D 12 pipeline library. This verifies the readback and cache reuse for one synthetic workload. The contribution of pipeline compilation to scene-level drops still needs measurement. [Fixture](../patches/0045-indirect-mesh-cache-fixture.patch)
+
+Diagnostics builds count indirect calls that found no host pipeline by command kind and reason. Kind 10 is a mesh dispatch. The counters distinguish pending compilation, shader translation failure and host pipeline creation failure. A separate reason records a pipeline that became ready between the drop and the diagnostic read. Setting `VICTORY_PIPELINE_LOG` also records the first drop for each pipeline key, kind and reason in the pipeline log. [Diagnostic counters](../patches/0044-indirect-pipeline-diagnostics.patch)
+
+Use the Windows setup described in the README. Build the test executable from the prepared engine. Cargo prints its path in the executable listing.
+
+```powershell
+$source = python portvi.py prepare
+Push-Location $source
+try {
+    cargo test --locked -p victory-gpu --lib --features diagnostics --no-run
+} finally {
+    Pop-Location
+}
+```
+
+Run the fixture on a physical adapter with mesh shader support. Set `$fixture` to the absolute path of the test executable that Cargo printed. The result directory must be new.
+
+```powershell
+New-Item -ItemType Directory -Force runs | Out-Null
+python tools/indirect_cache_pair.py $fixture runs/indirect-mesh-cache --libtest pipeline::host::tests::indirect_mesh_reuses_cached_pipeline --remap
+```
+
+The launcher gives each pass a fresh profile. The second pass reuses the cache written by the first. It retains the binary hash, result, pipeline counts and logs in the result directory and removes the temporary profiles and cache when the pair ends. [Pair runner](../tools/indirect_cache_pair.py)
+
 ## Measuring a 30 FPS target
 
 Run the same interactive scene for 120 seconds with the same build, driver, settings and resolution. Capture it once with a new cache directory and repeat with that directory populated. Record scene, drawn and missing work, observed visual faults and any device reset alongside the timings. A faster pass that skips geometry changes what the benchmark measures.

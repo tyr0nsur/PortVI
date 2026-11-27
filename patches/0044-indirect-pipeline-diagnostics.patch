@@ -1,0 +1,196 @@
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 6deecc2..69ac562 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -1753,5 +1753,5 @@ impl State {
+         if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+             #[cfg(feature = "diagnostics")]
+-            crate::pipeline::note_drop(self.pipeline as This);
++            crate::pipeline::note_indirect_pipeline_drop(kind, self.pipeline as This);
+             why("no host pipeline");
+             return false;
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 943537b..0c2ec54 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -3256,6 +3256,7 @@ impl Meter {
+                 );
+                 // Window caption updates leave the report counters intact.
+                 let drops = crate::pipeline::take_drops();
++                crate::pipeline::log_indirect_pipeline_drops(report_frames);
+                 crate::frame::log();
+                 log_gpu_times(report_frames);
+                 crate::copystat::log(report_frames);
+diff --git a/crates/victory-gpu/src/pipeline.rs b/crates/victory-gpu/src/pipeline.rs
+index 70e462d..e10a5a3 100644
+--- a/crates/victory-gpu/src/pipeline.rs
++++ b/crates/victory-gpu/src/pipeline.rs
+@@ -404,6 +404,11 @@ pub(crate) fn making() -> u64 {
+ #[cfg(all(windows, feature = "diagnostics"))]
+ static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
++// These totals are reported independently of the 40 most common drop reasons.
++#[cfg(all(windows, feature = "diagnostics"))]
++static INDIRECT_PIPELINE_DROPS: Mutex<std::collections::BTreeMap<(u32, &'static str), u64>> =
++    Mutex::new(std::collections::BTreeMap::new());
++
+ /// Shader hashes as printed in the pipeline diagnostics.
+ #[cfg(all(feature = "diagnostics", any(windows, test)))]
+ fn parse_skip_hashes(value: &str) -> Vec<String> {
+@@ -463,21 +468,53 @@ pub(crate) fn shaders_of(this: This) -> String {
+ /// for want of a host pipeline (diagnostics).
+ #[cfg(all(windows, feature = "diagnostics"))]
+ pub(crate) fn note_drop(this: This) {
+-    let why = if this.is_null() {
+-        Some("no pipeline set".to_owned())
+-    } else {
+-        let p = pipeline(this);
+-        p.host
+-            .skipped_shader
+-            .as_deref()
+-            .map(|hash| format!("skipped shader {hash}"))
+-            .or_else(|| make::missing(&p.host))
+-    };
+-    if let Some(why) = why {
++    if let Some((_, why)) = pipeline_drop_reason(this) {
++        note_why(why);
++    }
++}
++
++#[cfg(all(windows, feature = "diagnostics"))]
++fn pipeline_drop_reason(this: This) -> Option<(&'static str, String)> {
++    if this.is_null() {
++        return Some(("unbound", "no pipeline set".into()));
++    }
++    let p = pipeline(this);
++    p.host
++        .skipped_shader
++        .as_deref()
++        .map(|hash| ("skipped", format!("skipped shader {hash}")))
++        .or_else(|| make::missing(&p.host))
++}
++
++/// Counts one indirect call that found no host pipeline.
++#[cfg(all(windows, feature = "diagnostics"))]
++pub(crate) fn note_indirect_pipeline_drop(kind: u32, this: This) {
++    let reason = pipeline_drop_reason(this);
++    // The compilation worker can publish a pipeline after the call gave up.
++    let cause = reason.as_ref().map_or("ready-after-drop", |(cause, _)| *cause);
++    {
++        let mut counts = INDIRECT_PIPELINE_DROPS.lock().unwrap_or_else(|e| e.into_inner());
++        *counts.entry((kind, cause)).or_default() += 1;
++    }
++    if !this.is_null() {
++        make::log_indirect_drop(&pipeline(this).host.key, kind, cause);
++    }
++    if let Some((_, why)) = reason {
+         note_why(why);
+     }
+ }
+
++#[cfg(all(windows, feature = "diagnostics"))]
++pub(crate) fn log_indirect_pipeline_drops(frames: f64) {
++    let counts = std::mem::take(
++        &mut *INDIRECT_PIPELINE_DROPS.lock().unwrap_or_else(|e| e.into_inner()),
++    );
++    for ((kind, cause), calls) in counts {
++        tracing::info!(kind, cause, calls, calls_per_frame = calls as f64 / frames,
++            "indirect calls without a host pipeline");
++    }
++}
++
+ /// Counts a draw or dispatch dropped for `why` (diagnostics).
+ #[cfg(all(windows, feature = "diagnostics"))]
+ pub(crate) fn note_why(why: String) {
+diff --git a/crates/victory-gpu/src/pipeline/make.rs b/crates/victory-gpu/src/pipeline/make.rs
+index f3d03dd..2652f30 100644
+--- a/crates/victory-gpu/src/pipeline/make.rs
++++ b/crates/victory-gpu/src/pipeline/make.rs
+@@ -121,10 +121,10 @@ pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) ->
+ /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
+ /// not translate, else "refused" or "being made"; `None` if it has one.
+ #[cfg(feature = "diagnostics")]
+-pub(crate) fn missing(p: &Pending) -> Option<String> {
++pub(super) fn missing(p: &Pending) -> Option<(&'static str, String)> {
+     match p.made.get() {
+         Some(Some(_)) => None,
+-        None => Some("being made".into()),
++        None => Some(("pending", "being made".into())),
+         Some(None) => {
+             let failed: Vec<String> = p
+                 .shaders
+@@ -132,11 +132,11 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
+                 .filter(|s| matches!(s.translated.get(), Some(None)))
+                 .map(|s| format!("{} {}", s.stage, s.hash))
+                 .collect();
+-            Some(if failed.is_empty() {
+-                format!("refused {:?}", p.shaders)
++            if failed.is_empty() {
++                Some(("host-creation-failed", format!("refused {:?}", p.shaders)))
+             } else {
+-                failed.join(" + ")
+-            })
++                Some(("translation-failed", failed.join(" + ")))
++            }
+         }
+     }
+ }
+@@ -150,6 +150,20 @@ pub(crate) fn log_built(key: &str) {
+     }
+ }
+
++#[cfg(feature = "diagnostics")]
++fn log_path() -> Option<&'static std::ffi::OsString> {
++    static PATH: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
++    PATH.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_LOG")).as_ref()
++}
++
++/// Records the first indirect drop for each pipeline, command kind and cause.
++#[cfg(feature = "diagnostics")]
++pub(super) fn log_indirect_drop(key: &str, kind: u32, cause: &str) {
++    if log_path().is_some() {
++        log(&format!("indirect-drop-{kind}-{cause}"), key, String::new);
++    }
++}
++
+ /// `VICTORY_PIPELINE_LOG=<file>` (diagnostics): a line per title pipeline
+ /// key created (`created`, its shaders, its state as described) and first
+ /// drawn or dispatched with (`used`), and its host pipeline's library name
+@@ -160,8 +174,7 @@ fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
+     use std::collections::HashSet;
+     use std::io::Write;
+     static LOG: Mutex<Option<(std::fs::File, HashSet<String>)>> = Mutex::new(None);
+-    static PATH: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
+-    let Some(path) = PATH.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_LOG")) else {
++    let Some(path) = log_path() else {
+         return;
+     };
+     let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
+@@ -406,6 +419,27 @@ mod tests {
+         assert!(matches!(p.made.get(), Some(None)));
+     }
+
++    #[cfg(feature = "diagnostics")]
++    #[test]
++    fn classifies_pending_translation_and_host_creation_separately() {
++        let shader = Arc::new(Shader::new("mesh", b"authored test shader"));
++        let pending = Pending::new(vec![shader.clone()], None, &[]);
++        assert_eq!(missing(&pending).map(|(cause, _)| cause), Some("pending"));
++
++        let host_failed = Pending::new(vec![shader.clone()], None, &[]);
++        assert!(host_failed.made.set(None).is_ok());
++        assert_eq!(
++            missing(&host_failed).map(|(cause, _)| cause),
++            Some("host-creation-failed")
++        );
++
++        assert!(shader.translated.set(None).is_ok());
++        assert!(pending.made.set(None).is_ok());
++        let (cause, details) = missing(&pending).unwrap();
++        assert_eq!(cause, "translation-failed");
++        assert_eq!(details, format!("mesh {}", shader.hash));
++    }
++
+     #[cfg(feature = "diagnostics")]
+     #[test]
+     fn skipped_pipeline_stays_off_the_queue() {
