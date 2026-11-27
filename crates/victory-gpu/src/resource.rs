@@ -332,6 +332,8 @@ pub(crate) fn rgb9e5_stood_in(this: This) -> bool {
 /// A texture-to-texture operation that needs numeric conversion between
 /// native shared-exponent and substituted RGB texels. Direct copies preserve
 /// bits only; the two DXGI formats belong to different compatibility groups.
+/// Whole-resource and region copies convert on the GPU
+/// (`crate::rgb9e5::copy`); aliases and resolves keep their destination.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Rgb9Copy {
@@ -369,8 +371,13 @@ pub(crate) fn needs_rgb9_copy(
     }
     let index = 2 * kind as usize + usize::from(a == RGB9E5);
     if MIXED_RGB9_COPIES[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
-        tracing::warn!(?kind, source_format = a, destination_format = b,
-            "mixed RGB9E5 GPU copy requires numeric conversion; destination retained");
+        match kind {
+            // Converted on the GPU (`crate::rgb9e5::copy`).
+            Rgb9Copy::Resource | Rgb9Copy::Region => tracing::info!(?kind, source_format = a,
+                destination_format = b, "mixed RGB9E5 GPU copy converted numerically"),
+            Rgb9Copy::Alias | Rgb9Copy::Resolve => tracing::warn!(?kind, source_format = a,
+                destination_format = b, "mixed RGB9E5 GPU copy requires numeric conversion; destination retained"),
+        }
     }
     true
 }
@@ -3507,60 +3514,123 @@ mod tests {
         }
     }
 
-    /// Exercise both directions through the real queue while numeric GPU
-    /// copies between these physical formats remain unsupported.
+    /// Numeric GPU copies between a sampled RGB9E5 texture (native host
+    /// format) and a writable one (R11G11B10 stand-in), in both directions,
+    /// through the title's `CopyTextureRegion` and `CopyResource`: boxes from
+    /// one level and layer to an offset in another keep every texel outside
+    /// them; whole copies take every level and layer. Each copied texel reads
+    /// back as the CPU oracle's `to_title(to_host(word))`, so a colour R11
+    /// cannot hold reads back quantized (a bit copy would keep it, or the
+    /// destination's own texels where it is retained).
     #[cfg(windows)]
     #[test]
-    fn rgb9e5_mixed_texture_copies_retain_both_images_and_the_device() {
+    fn rgb9e5_mixed_texture_copies_convert_numerically_in_both_directions() {
+        use crate::rgb9e5::{TEST_COLOURS, to_host, to_title};
         let host = crate::host::host().expect("RGB9E5 copies require a D3D12 adapter");
-        let image = |flags| copy_test_resource(&ResourceDesc { flags, ..texture(4, 4, RGB9E5, 1) }, 0x400);
-        let images = [image(0), image(5)];
-        let input = copy_test_resource(&buffer(2048), 0);
-        let output = copy_test_resource(&buffer(2048), 0);
-        let (data, _) = buffer_bytes(input).unwrap();
-        let (out, _) = buffer_bytes(output).unwrap();
-        // SAFETY: each buffer contains 2048 bytes and submission is synchronous.
-        let bytes = unsafe { std::slice::from_raw_parts_mut(data, 2048) };
-        unsafe { out.write_bytes(0xa5, 2048) };
-        let mut expected = [0xa5; 2048];
-        let (queue, allocator, list) = copy_test_commands();
-        let copy = slot::<CopyTestRegion>(list, 0x80);
-        let whole = slot::<extern "system" fn(This, This, This)>(list, 0x88);
-        let footprint = PlacedFootprint { offset: 0, format: RGB9E5, width: 4, height: 4, depth: 1, row_pitch: 256 };
-        let image_at = |resource| CopyTestLocation { resource, kind: 0, footprint };
-        let linear = |resource, offset| CopyTestLocation { resource, kind: 1, footprint: PlacedFootprint { offset, ..footprint } };
-        for (i, &resource) in images.iter().enumerate() {
-            for y in 0..4 {
-                for x in 0..4 {
-                    let at = i * 1024 + y * 256 + x * 4;
-                    let colour = crate::rgb9e5::TEST_COLOURS[(x + y + i) % 3].0.to_le_bytes();
-                    bytes[at..at + 4].copy_from_slice(&colour);
-                    expected[at..at + 4].copy_from_slice(&colour);
+        // 257/64 red loses a mantissa bit in R11; 67/64 blue two in B10.
+        let quantized = [(18 << 27) | 257, (17 << 27) | (67 << 18) | (300 << 9) | 129];
+        let canonical = |word: u32| to_title(to_host(word));
+        for q in quantized {
+            assert_ne!(canonical(q), q, "{q:#x} quantizes");
+        }
+        // 8x8, two levels, two layers: subresource `mip + 2 * layer`.
+        const SUBS: usize = 4;
+        const CHUNK: usize = 2048; // 8 rows of 256 bytes
+        let size = |sub: usize| 8usize >> (sub % 2);
+        let source = |sub: usize, x: usize, y: usize| match (x + 3 * y + sub) % 5 {
+            3 => quantized[0],
+            4 => quantized[1],
+            i => TEST_COLOURS[i % 3].0,
+        };
+        let background = |sub: usize, x: usize, y: usize| TEST_COLOURS[(2 * x + y + sub) % 3].0;
+        // CopyTextureRegion: (source sub, box, destination sub, at).
+        let boxes: [(usize, [u32; 6], usize, [u32; 3]); 2] =
+            [(1, [1, 1, 0, 3, 3, 1], 3, [2, 1, 0]), (2, [2, 4, 0, 5, 8, 1], 0, [5, 3, 0])];
+        for native_source in [true, false] {
+            let image = |flags| {
+                copy_test_resource(&ResourceDesc { flags, depth_or_array_size: 2, ..texture(8, 8, RGB9E5, 2) }, 0x400)
+            };
+            let (src, dst) = if native_source { (image(0), image(5)) } else { (image(5), image(0)) };
+            let input = copy_test_resource(&buffer(2 * SUBS as u64 * CHUNK as u64), 0);
+            let output = copy_test_resource(&buffer(2 * SUBS as u64 * CHUNK as u64), 0);
+            let (data, _) = buffer_bytes(input).unwrap();
+            let (out, _) = buffer_bytes(output).unwrap();
+            let len = 2 * SUBS * CHUNK;
+            // SAFETY: both buffers hold `len` bytes; submission is synchronous.
+            let bytes = unsafe { std::slice::from_raw_parts_mut(data, len) };
+            // SAFETY: as above; nothing reads the output until it ran.
+            unsafe { out.write_bytes(0xa5, len) };
+            let put = |bytes: &mut [u8], at: usize, word: u32| bytes[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            let texel_at = |chunk: usize, sub: usize, x: usize, y: usize| (chunk * SUBS + sub) * CHUNK + y * 256 + x * 4;
+            for sub in 0..SUBS {
+                for y in 0..size(sub) {
+                    for x in 0..size(sub) {
+                        put(bytes, texel_at(0, sub, x, y), source(sub, x, y));
+                        put(bytes, texel_at(1, sub, x, y), background(sub, x, y));
+                    }
                 }
             }
-            copy(list, &image_at(resource), 0, 0, 0, &linear(input, (i * 1024) as u64), std::ptr::null());
-        }
-        let counts = || std::array::from_fn::<_, 4, _>(|i| MIXED_RGB9_COPIES[i].load(std::sync::atomic::Ordering::Relaxed));
-        let before = counts();
-        let region = [1u32, 1, 0, 3, 3, 1];
-        for (from, to) in [(images[0], images[1]), (images[1], images[0])] {
-            whole(list, to, from);
-            copy(list, &image_at(to), 0, 0, 0, &image_at(from), region.as_ptr().cast());
-        }
-        for (a, b) in before.into_iter().zip(counts()) {
-            assert!(b > a, "each direction of each operation was intercepted");
-        }
-        for (i, &resource) in images.iter().enumerate() {
-            copy(list, &linear(output, (i * 1024) as u64), 0, 0, 0, &image_at(resource), std::ptr::null());
-        }
-        assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
-        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
-        // SAFETY: the queue finished writing our output, and the host is live.
-        let read = unsafe { std::slice::from_raw_parts(out, 2048) };
-        assert_eq!(read, expected);
-        unsafe { host.device.GetDeviceRemovedReason() }.expect("mixed-copy guard preserves the device");
-        for object in [list, allocator, queue, output, input, images[1], images[0]] {
-            slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+            let (queue, allocator, list) = copy_test_commands();
+            let copy = slot::<CopyTestRegion>(list, 0x80);
+            let whole = slot::<extern "system" fn(This, This, This)>(list, 0x88);
+            let footprint = |sub: usize, offset: usize| PlacedFootprint {
+                offset: offset as u64,
+                format: RGB9E5,
+                width: size(sub) as u32,
+                height: size(sub) as u32,
+                depth: 1,
+                row_pitch: 256,
+            };
+            let image_at = |resource, sub: usize| CopyTestLocation { resource, kind: 0, footprint: footprint(sub, sub) };
+            let linear = |resource, chunk, sub| CopyTestLocation { resource, kind: 1, footprint: footprint(sub, texel_at(chunk, sub, 0, 0)) };
+            let null = std::ptr::null();
+            for sub in 0..SUBS {
+                copy(list, &image_at(src, sub), 0, 0, 0, &linear(input, 0, sub), null);
+                copy(list, &image_at(dst, sub), 0, 0, 0, &linear(input, 1, sub), null);
+            }
+            let converted = crate::rgb9e5::CONVERTED.load(std::sync::atomic::Ordering::Relaxed);
+            for (from, area, to, at) in boxes {
+                let [x, y, z] = at;
+                copy(list, &image_at(dst, to), x, y, z, &image_at(src, from), area.as_ptr().cast());
+            }
+            for sub in 0..SUBS {
+                copy(list, &linear(output, 0, sub), 0, 0, 0, &image_at(dst, sub), null);
+            }
+            whole(list, dst, src);
+            for sub in 0..SUBS {
+                copy(list, &linear(output, 1, sub), 0, 0, 0, &image_at(dst, sub), null);
+            }
+            assert!(
+                crate::rgb9e5::CONVERTED.load(std::sync::atomic::Ordering::Relaxed) >= converted + 3,
+                "both regions and the whole copy were converted",
+            );
+            assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+            slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+            let mut expected = vec![0xa5; len];
+            for sub in 0..SUBS {
+                for y in 0..size(sub) {
+                    for x in 0..size(sub) {
+                        let inside = boxes.iter().find_map(|&(from, [l, t, _, r, b, _], to, [ax, ay, _])| {
+                            let (sx, sy) = ((x as u32).checked_sub(ax)? + l, (y as u32).checked_sub(ay)? + t);
+                            (to == sub && sx < r && sy < b).then(|| source(from, sx as usize, sy as usize))
+                        });
+                        let region = inside.map_or(background(sub, x, y), canonical);
+                        put(&mut expected, texel_at(0, sub, x, y), region);
+                        put(&mut expected, texel_at(1, sub, x, y), canonical(source(sub, x, y)));
+                    }
+                }
+            }
+            // SAFETY: the queue finished writing our output.
+            let read = unsafe { std::slice::from_raw_parts(out, len) };
+            for (at, (got, want)) in read.as_chunks::<4>().0.iter().zip(expected.as_chunks::<4>().0).enumerate() {
+                assert_eq!(got, want, "native source {native_source}: chunk {}, sub {}, byte {}",
+                    at * 4 / (SUBS * CHUNK), at * 4 / CHUNK % SUBS, at * 4 % CHUNK);
+            }
+            // SAFETY: a plain query on the live device.
+            unsafe { host.device.GetDeviceRemovedReason() }.expect("mixed copies keep the device");
+            for object in [list, allocator, queue, output, input, dst, src] {
+                slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+            }
         }
     }
 

@@ -96,6 +96,305 @@ pub(crate) fn footprint(source: &[u8], destination: &mut [u8], width: u32, pitch
     true
 }
 
+/// Numeric GPU copies between a native RGB9E5 host texture and an
+/// R11G11B10 stand-in (`crate::resource::RGB9E5_STAND_IN`). The two formats
+/// are in different copy-compatibility groups, so D3D12 cannot copy one into
+/// the other: each region goes to a buffer in the source's format, a compute
+/// pass of ours converts its words in place by the rules of [`to_host`] and
+/// [`to_title`], and the buffer goes on to the destination in its format.
+///
+/// The texture-to-buffer-to-texture route, a 5.1 shader with its root
+/// signature inside and root views needing no descriptor heap follow the
+/// FP16-to-RGB9E5 bridge by marquezini (upstream `1f76bd2`, on
+/// `rgb-fx-pack-1868`); the conversion here is the integer one of this file.
+#[cfg(windows)]
+mod gpu {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    use windows::core::s;
+
+    use crate::host::{HostList, host, transition};
+    use crate::resource::{RGB9E5, RGB9E5_STAND_IN};
+
+    /// The integer conversions of the CPU path in 32-bit words: a value of
+    /// either format is `sig << sh` units of 2^-24, `sig` below 2^10.
+    const SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=5, b0), UAV(u0)"
+cbuffer C : register(b0) { uint width; uint height; uint rowPitch; uint slicePitch; uint toTitle; };
+RWByteAddressBuffer words : register(u0);
+// v / 2^s to nearest, ties to even; v below 2^31.
+uint rounded(uint v, uint s) {
+    uint r = v;
+    if (s > 31) r = 0;
+    else if (s != 0) r = (v + (1u << (s - 1)) - 1 + ((v >> s) & 1)) >> s;
+    return r;
+}
+// A 9-bit mantissa m over shared exponent e as an unsigned float with mb
+// mantissa bits and 5 exponent bits.
+uint toFloat(uint m, uint e, uint mb) {
+    uint top = firstbithigh(m);
+    uint highest = top + e;
+    uint r = 0;
+    // Zero, and R/G below R11's smallest subnormal, stay 0.
+    if (m == 0 || (mb == 6 && highest < 4)) {
+        r = 0;
+    } else if (highest < 10) {
+        r = rounded(m << e, 10 - mb);
+    } else {
+        uint exponent = highest - 9;
+        uint mantissa = top >= mb ? rounded(m, top - mb) : m << (mb - top);
+        if (mantissa == (2u << mb)) { mantissa >>= 1; exponent += 1; }
+        r = exponent >= 31 ? (31u << mb) - 1 : (exponent << mb) | (mantissa - (1u << mb));
+    }
+    return r;
+}
+uint toHost(uint w) {
+    uint e = w >> 27;
+    return toFloat(w & 511, e, 6) | toFloat((w >> 9) & 511, e, 6) << 11 | toFloat((w >> 18) & 511, e, 5) << 22;
+}
+// An unsigned float channel as (sig, sh); NaN is 0, infinity the largest.
+uint2 units(uint bits, uint mb) {
+    uint mantissa = bits & ((1u << mb) - 1);
+    uint exponent = bits >> mb;
+    uint2 r = uint2(mantissa | (1u << mb), exponent + 9 - mb);
+    if (exponent == 0) r = uint2(mantissa << (10 - mb), 0);
+    if (exponent == 31) r = mantissa != 0 ? uint2(0, 0) : uint2(511, 31);
+    return r;
+}
+uint bitLength(uint2 v) { return v.x == 0 ? 0 : firstbithigh(v.x) + 1 + v.y; }
+uint scaled(uint2 v, uint e) { return e <= v.y ? v.x << (v.y - e) : rounded(v.x, e - v.y); }
+uint toShared(uint w) {
+    uint2 r = units(w & 2047, 6), g = units((w >> 11) & 2047, 6), b = units(w >> 22, 5);
+    uint peak = max(bitLength(r), max(bitLength(g), bitLength(b)));
+    uint e = peak > 9 ? peak - 9 : 0;
+    if (max(scaled(r, e), max(scaled(g, e), scaled(b, e))) > 511) e += 1;
+    return scaled(r, e) | scaled(g, e) << 9 | scaled(b, e) << 18 | e << 27;
+}
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= width || id.y >= height) return;
+    uint at = id.z * slicePitch + id.y * rowPitch + id.x * 4;
+    uint w = words.Load(at);
+    words.Store(at, toTitle != 0 ? toShared(w) : toHost(w));
+}
+"#;
+
+    struct Converter {
+        root: ID3D12RootSignature,
+        pso: ID3D12PipelineState,
+    }
+
+    // SAFETY: D3D12 objects are free-threaded.
+    unsafe impl Send for Converter {}
+    // SAFETY: as above.
+    unsafe impl Sync for Converter {}
+
+    fn converter() -> Option<&'static Converter> {
+        static MADE: OnceLock<Option<Converter>> = OnceLock::new();
+        MADE.get_or_init(|| match compile() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(error = %e, "no RGB9E5 copy conversion: mixed-format copies keep their destination");
+                None
+            }
+        })
+        .as_ref()
+    }
+
+    fn compile() -> windows::core::Result<Converter> {
+        let device = &host().ok_or_else(windows::core::Error::empty)?.device;
+        let mut code: Option<ID3DBlob> = None;
+        let mut errors: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call; out pointers ours.
+        let compiled = unsafe {
+            D3DCompile(SOURCE.as_ptr().cast(), SOURCE.len(), s!("rgb9e5"), None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, Some(&mut errors))
+        };
+        if let Err(e) = compiled {
+            if let Some(errors) = errors {
+                // SAFETY: the blob's own bytes.
+                let text = unsafe { std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize()) };
+                tracing::warn!("RGB9E5 copy conversion: {}", String::from_utf8_lossy(text));
+            }
+            return Err(e);
+        }
+        let code = code.ok_or_else(windows::core::Error::empty)?;
+        // SAFETY: the blob's own bytes; the root signature is inside the shader.
+        unsafe {
+            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+            let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
+                ..Default::default()
+            })?;
+            Ok(Converter { root, pso })
+        }
+    }
+
+    /// Whether mixed copies can be converted (the pass compiled).
+    pub(crate) fn available() -> bool {
+        converter().is_some()
+    }
+
+    /// Converted copies recorded (tests).
+    pub(crate) static CONVERTED: AtomicU64 = AtomicU64::new(0);
+
+    /// One copy: host subresource `from` (the texels in `area`, left, top,
+    /// front, right, bottom, back; all of it if `None`) into host
+    /// subresource `to` at `at`.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct Region {
+        pub(crate) from: u32,
+        pub(crate) to: u32,
+        pub(crate) area: Option<[u32; 6]>,
+        pub(crate) at: [u32; 3],
+    }
+
+    fn subresources(d: &D3D12_RESOURCE_DESC) -> u32 {
+        let mips = u32::from(d.MipLevels).max(1);
+        if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { mips } else { mips * u32::from(d.DepthOrArraySize).max(1) }
+    }
+
+    /// The size of subresource `index` of a texture described by `d`.
+    fn extent(d: &D3D12_RESOURCE_DESC, index: u32) -> [u32; 3] {
+        let mip = index % u32::from(d.MipLevels).max(1);
+        let depth = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { u32::from(d.DepthOrArraySize) } else { 1 };
+        let at = |v: u32| (v >> mip).max(1);
+        [at(d.Width as u32), at(d.Height), at(depth)]
+    }
+
+    /// A default-heap buffer shaders may write, in `COPY_DEST`.
+    fn scratch(size: u64) -> Option<ID3D12Resource> {
+        let host = host()?;
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(256),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation.
+        let made = unsafe {
+            host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut buffer)
+        };
+        made.ok().and(buffer)
+    }
+
+    /// Records in `list` the numeric copy of `regions` from host texture
+    /// `from` into host texture `to`, one in RGB9E5 and the other in its
+    /// stand-in, both already in their copy states. Texels of `to` outside
+    /// the regions keep their values; a region outside either texture is
+    /// left out, as D3D12 would not copy it. The list keeps its buffer until
+    /// it is reset, and sets the title's compute root signature and
+    /// pipeline again at its next draw or dispatch ([`HostList::need_rebind`]).
+    /// False if nothing could be recorded.
+    pub(crate) fn copy(list: &HostList, to: &ID3D12Resource, from: &ID3D12Resource, regions: &[Region]) -> bool {
+        let Some(c) = converter() else { return false };
+        // SAFETY: live resources.
+        let (a, b) = unsafe { (from.GetDesc(), to.GetDesc()) };
+        let to_title = match (a.Format.0 as u32, b.Format.0 as u32) {
+            (RGB9E5, RGB9E5_STAND_IN) => 0,
+            (RGB9E5_STAND_IN, RGB9E5) => 1,
+            _ => return false,
+        };
+        let mut planned = Vec::with_capacity(regions.len());
+        let mut total = 0u64;
+        for r in regions {
+            if r.from >= subresources(&a) || r.to >= subresources(&b) {
+                continue;
+            }
+            let [w, h, d] = extent(&a, r.from);
+            let [left, top, front, right, bottom, back] = r.area.unwrap_or([0, 0, 0, w, h, d]);
+            if right <= left || bottom <= top || back <= front || right > w || bottom > h || back > d {
+                continue;
+            }
+            let size = [right - left, bottom - top, back - front];
+            let room = extent(&b, r.to);
+            if (0..3).any(|i| u64::from(r.at[i]) + u64::from(size[i]) > u64::from(room[i])) {
+                continue;
+            }
+            let pitch = (size[0] * 4).next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+            total = total.next_multiple_of(u64::from(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT));
+            let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: total,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: a.Format,
+                    Width: size[0],
+                    Height: size[1],
+                    Depth: size[2],
+                    RowPitch: pitch,
+                },
+            };
+            total += u64::from(pitch) * u64::from(size[1]) * u64::from(size[2]);
+            let area = D3D12_BOX { left, top, front, right, bottom, back };
+            planned.push((*r, area, footprint));
+        }
+        if planned.is_empty() {
+            return true;
+        }
+        let Some(buffer) = scratch(total) else { return false };
+        crate::host::name(&buffer, || format!("RGB9E5 copy conversion {total:#x}"));
+        list.keep(&buffer);
+        let place = |f: D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the copy does not release.
+            pResource: unsafe { std::mem::transmute_copy(&buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
+        };
+        let sub = |t: &ID3D12Resource, i: u32| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(t) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i },
+        };
+        let l = &list.list;
+        // SAFETY: an open list; our pipeline and buffer, and live textures
+        // in the copy states, the regions inside both (checked above).
+        unsafe {
+            for (r, area, f) in &planned {
+                l.CopyTextureRegion(&place(*f), 0, 0, 0, &sub(from, r.from), Some(area));
+            }
+            l.ResourceBarrier(&[transition(&buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            l.SetComputeRootSignature(&c.root);
+            l.SetPipelineState(&c.pso);
+            let gpu = buffer.GetGPUVirtualAddress();
+            for (_, _, f) in &planned {
+                let s = f.Footprint;
+                let constants = [s.Width, s.Height, s.RowPitch, s.RowPitch * s.Height, to_title];
+                l.SetComputeRoot32BitConstants(0, 5, constants.as_ptr().cast(), 0);
+                l.SetComputeRootUnorderedAccessView(1, gpu + f.Offset);
+                l.Dispatch(s.Width.div_ceil(8), s.Height.div_ceil(8), s.Depth);
+            }
+            l.ResourceBarrier(&[transition(&buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            for (r, _, f) in &planned {
+                let mut f = *f;
+                f.Footprint.Format = b.Format;
+                l.CopyTextureRegion(&sub(to, r.to), r.at[0], r.at[1], r.at[2], &place(f), None);
+            }
+        }
+        list.need_rebind();
+        CONVERTED.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+}
+
+#[cfg(all(windows, test))]
+pub(crate) use gpu::CONVERTED;
+#[cfg(windows)]
+pub(crate) use gpu::{Region, available, copy};
+
 /// Three source-authored colours which both formats represent exactly.
 #[cfg(test)]
 pub(crate) const TEST_COLOURS: [(u32, [f32; 4]); 3] = [
@@ -149,5 +448,120 @@ mod tests {
         assert_eq!(to_title(1), 16);
         // 257/64 quantizes to 4 in R11; the canonical packed result records that loss.
         assert_eq!(to_title(to_host((18 << 27) | 257)), (18 << 27) | 256);
+    }
+
+    /// The GPU pass of [`copy`] word for word against the CPU oracle, in
+    /// both directions: every (mantissa, exponent) of each shared-exponent
+    /// channel and every 11- and 10-bit float of each RGB channel (NaN,
+    /// infinity and subnormals among them), then pseudo-random words. The
+    /// pass leaves the list to set the title's compute state again.
+    #[cfg(windows)]
+    #[test]
+    fn gpu_rgb9e5_copy_conversion_matches_the_cpu_oracle_both_ways() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let host = crate::host::host().expect("RGB9E5 copy conversion requires a D3D12 adapter");
+        const W: u32 = 256;
+        const H: u32 = 128;
+        let n = (W * H) as usize;
+        let mut seed = 0x9e37_79b9u32;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let half = n as u32 / 2;
+        let shared: Vec<u32> = (0..n as u32)
+            .map(|i| match i < half {
+                true => {
+                    let (m, e) = (i % 512, i / 512 % 32);
+                    (e << 27) | m | (((m * 7 + 3) % 512) << 9) | (((m * 13 + 5) % 512) << 18)
+                }
+                false => random(),
+            })
+            .collect();
+        let floats: Vec<u32> = (0..n as u32)
+            .map(|i| match i < half {
+                true => (i % 2048) | (((i * 7 + 3) % 2048) << 11) | (((i * 13 + 5) % 1024) << 22),
+                false => random(),
+            })
+            .collect();
+        let texture = |format: DXGI_FORMAT| {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: u64::from(W),
+                Height: H,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: format,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let mut t: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation.
+            unsafe { host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut t) }
+                .unwrap();
+            t.unwrap()
+        };
+        let (packed, native) = (DXGI_FORMAT_R9G9B9E5_SHAREDEXP, DXGI_FORMAT_R11G11B10_FLOAT);
+        // (source, destination) for each direction.
+        let pairs = [(texture(packed), texture(native)), (texture(native), texture(packed))];
+        let pitch = W * 4;
+        let bytes = u64::from(pitch * H);
+        let list = host.new_list().unwrap();
+        let (upload, data) = list.upload(host, 2 * bytes).unwrap();
+        let (readback, read) = list.readback(host, 2 * bytes).unwrap();
+        let words = data.cast::<u32>();
+        for (i, word) in shared.iter().chain(&floats).enumerate() {
+            // SAFETY: 2 * n words of mapped upload memory.
+            unsafe { words.add(i).write(*word) };
+        }
+        let place = |buffer: &ID3D12Resource, k: u64, format| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the copy does not release.
+            pResource: unsafe { std::mem::transmute_copy(buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: k * bytes,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: format, Width: W, Height: H, Depth: 1, RowPitch: pitch },
+                },
+            },
+        };
+        let sub = |t: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(t) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        use D3D12_RESOURCE_STATE_COPY_DEST as DEST;
+        use D3D12_RESOURCE_STATE_COPY_SOURCE as SOURCE;
+        let _ = host.log_messages();
+        let whole = [Region { from: 0, to: 0, area: None, at: [0; 3] }];
+        for (k, (from, to)) in pairs.iter().enumerate() {
+            // SAFETY: an open list; live resources in the states named.
+            unsafe {
+                let (a, b) = (from.GetDesc().Format, to.GetDesc().Format);
+                list.list.CopyTextureRegion(&sub(from), 0, 0, 0, &place(&upload, k as u64, a), None);
+                list.list.ResourceBarrier(&[crate::host::transition(from, DEST, SOURCE)]);
+                assert!(!list.take_rebind());
+                assert!(copy(&list, to, from, &whole), "direction {k} recorded");
+                assert!(list.take_rebind(), "the title's compute state is set again after the pass");
+                list.list.ResourceBarrier(&[crate::host::transition(to, DEST, SOURCE)]);
+                list.list.CopyTextureRegion(&place(&readback, k as u64, b), 0, 0, 0, &sub(to), None);
+            }
+        }
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(host.log_messages(), None, "debug layer");
+        // SAFETY: the list ran; 2 * n words of mapped readback memory.
+        let out = unsafe { std::slice::from_raw_parts(read.cast::<u32>(), 2 * n) };
+        for (i, &word) in shared.iter().enumerate() {
+            assert_eq!(out[i], to_host(word), "to_host({word:#010x}) at {i}");
+        }
+        for (i, &word) in floats.iter().enumerate() {
+            assert_eq!(out[n + i], to_title(word), "to_title({word:#010x}) at {i}");
+        }
     }
 }

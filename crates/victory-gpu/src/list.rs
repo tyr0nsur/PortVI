@@ -652,8 +652,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            if crate::resource::needs_rgb9_copy(crate::resource::Rgb9Copy::Resource, src, &from, dst, &to) {
-                return;
+            let mixed = crate::resource::needs_rgb9_copy(crate::resource::Rgb9Copy::Resource, src, &from, dst, &to);
+            if mixed && !crate::rgb9e5::available() {
+                return; // the destination keeps its texels
             }
             if crate::texture::title_written(&from) {
                 crate::texture::upload(list, src, &from);
@@ -662,8 +663,26 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             ensure_state(list, src, COPY_SOURCE);
             crate::texture::host_writes(list, dst);
             #[cfg(feature = "diagnostics")]
-            list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
-            if crate::resource::dropped(dst) != crate::resource::dropped(src) {
+            list.note_op(|| format!("copy resource {src:?} to {dst:?}{}", if mixed { " (RGB9E5 converted)" } else { "" }));
+            if mixed {
+                // Each title subresource both host textures have, numerically.
+                let count = crate::resource::title_subresources(dst).min(crate::resource::title_subresources(src));
+                let mut left = false;
+                let regions: Vec<_> = (0..count)
+                    .filter_map(|i| {
+                        let pair = crate::resource::host_subresource(src, i).zip(crate::resource::host_subresource(dst, i));
+                        left |= pair.is_none();
+                        let (from, to) = pair?;
+                        Some(crate::rgb9e5::Region { from, to, area: None, at: [0; 3] })
+                    })
+                    .collect();
+                if left {
+                    left_out();
+                }
+                if !crate::rgb9e5::copy(list, &to, &from, &regions) {
+                    tracing::warn!(?src, ?dst, "mixed RGB9E5 copy not recorded; destination retained");
+                }
+            } else if crate::resource::dropped(dst) != crate::resource::dropped(src) {
                 // Host textures that leave out different numbers of the
                 // title's largest levels: level by level.
                 copy_levels(list, dst, &to, src, &from);
@@ -789,6 +808,9 @@ extern "system" fn copy_texture_region(
         }
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
+        // A source texture in the other physical format of a mixed RGB9E5
+        // copy, converted numerically (`crate::rgb9e5::copy`).
+        let mut mixed = None;
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
@@ -841,7 +863,10 @@ extern "system" fn copy_texture_region(
             if crate::resource::needs_rgb9_copy(
                 crate::resource::Rgb9Copy::Region, src.resource, &texture, dst.resource, &to,
             ) {
-                return;
+                if !crate::rgb9e5::available() {
+                    return; // the destination keeps its texels
+                }
+                mixed = Some(texture.clone());
             }
             // From a host texture without the title's largest levels: the
             // level it has (the title level's size), or nothing.
@@ -859,6 +884,23 @@ extern "system" fn copy_texture_region(
         }
         ensure_state(list, dst.resource, COPY_DEST);
         crate::texture::host_writes(list, dst.resource);
+        if let Some(texture) = mixed {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| format!("copy region {:?} to {:?} (RGB9E5 converted)", src.resource, dst.resource));
+            // SAFETY: the title's box, or null.
+            let area = unsafe { source_box.as_ref() }.copied();
+            // Both are subresource locations: the index is in the union.
+            let region = crate::rgb9e5::Region {
+                from: from.footprint.offset as u32,
+                to: dst.footprint.offset as u32,
+                area,
+                at: [x, y, z],
+            };
+            if !crate::rgb9e5::copy(list, &to, &texture, &[region]) {
+                tracing::warn!(src = ?src.resource, dst = ?dst.resource, "mixed RGB9E5 copy not recorded; destination retained");
+            }
+            return;
+        }
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
