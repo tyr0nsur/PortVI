@@ -64,12 +64,102 @@ pub(crate) struct Staging {
     copied: std::sync::atomic::AtomicU64,
 }
 
-/// What was last detiled: the hash of the memory (not tracked), or of each
-/// subresource's bytes (tracked).
+/// What was last detiled, for the entire texture or for individual subresources.
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
     hashes: Vec<Option<blake3::Hash>>,
+}
+
+impl Last {
+    /// DexNom/VIctory's streamed mip fallback (921d8d3 and ab34a8b),
+    /// adapted to PortVI's per-slice spans.
+    /// A complete mip or array slice can be sampled while other pages are absent.
+    fn refresh_sparse<T>(
+        &mut self,
+        memory: *const u8,
+        size: usize,
+        spans: &[(usize, usize)],
+        count: usize,
+        detile: impl FnOnce(&[u8], &[u32]) -> Option<T>,
+    ) -> (usize, Option<(T, Vec<u32>)>) {
+        let first = self.hash.is_none() && self.hashes.is_empty();
+        // Windows describes whole runs of pages at once. An empty reservation
+        // costs one query here even when it contains thousands of subresources.
+        let mut readable: Vec<(usize, usize)> = Vec::new();
+        visit_regions(memory, size, |a, b, accessible| {
+            if accessible {
+                if let Some(last) = readable.last_mut().filter(|r| r.1 == a) {
+                    last.1 = b;
+                } else {
+                    readable.push((a, b));
+                }
+            }
+            true
+        });
+        if !first && readable.is_empty() {
+            return (0, None);
+        }
+        // Packed tail mips can share one span. Check and hash it once. An
+        // unchanged 64 KiB mip in a large texture needs only 64 KiB of scratch.
+        let mut resident = std::collections::BTreeMap::new();
+        for &(a, b) in spans.iter().take(count) {
+            let region = readable.partition_point(|&(_, end)| end <= a);
+            if a < b && readable.get(region).is_some_and(|&(from, to)| from <= a && b <= to) {
+                resident.entry((a, b)).or_insert(None);
+            }
+        }
+        let mut read = 0;
+        for (&(a, b), hash) in &mut resident {
+            let mut scratch = Scratch::take(b - a);
+            let bytes = &mut scratch.0[..b - a];
+            // The mapping can change after the query.
+            if crate::host::read_into(memory.wrapping_add(a), bytes) {
+                read += bytes.len();
+                *hash = Some(blake3::hash(bytes));
+            }
+        }
+        let hash_for = |i: usize| spans.get(i).and_then(|span| *resident.get(span)?);
+        let changed: Vec<u32> = (0..count)
+            .filter(|&i| {
+                first || hash_for(i).is_some_and(|hash| self.hashes.get(i) != Some(&Some(hash)))
+            })
+            .map(|i| i as u32)
+            .collect();
+        if changed.is_empty() {
+            return (read, None);
+        }
+        let mut scratch = Scratch::take(size);
+        let tiled = &mut scratch.0[..size];
+        // The scratch buffer is reused. Define every hole and padding byte of
+        // the upload, including the first write to an aliased host texture.
+        tiled.fill(0);
+        let mut copied = std::collections::BTreeSet::new();
+        for &i in &changed {
+            let Some(&span) = spans.get(i as usize) else { continue };
+            let Some(Some(hash)) = resident.get_mut(&span) else { continue };
+            if !copied.insert(span) {
+                continue;
+            }
+            let (a, b) = span;
+            if !crate::host::read_into(memory.wrapping_add(a), &mut tiled[a..b]) {
+                return (read, None);
+            }
+            read += b - a;
+            // Record the bytes actually supplied to the upload.
+            *hash = blake3::hash(&tiled[a..b]);
+        }
+        let Some(upload) = detile(tiled, &changed) else {
+            return (read, None);
+        };
+        self.hash = None;
+        self.hashes.resize(count, None);
+        for &i in &changed {
+            let i = i as usize;
+            self.hashes[i] = spans.get(i).and_then(|span| *resident.get(span)?);
+        }
+        (read, Some((upload, changed)))
+    }
 }
 
 /// Per subresource of `layout` (`mips` per array slice; a 3D texture's
@@ -640,16 +730,11 @@ impl Staging {
                 desc = ?self.layout.desc,
                 "a sampled texture's memory is not committed"
             );
-            // Never uploaded: zeros, as a committed texture starts (one in
-            // a heap of textures starts with whatever the range held).
-            if last.hash.is_some() {
-                return (0, None);
-            }
-            let zeros = vec![0u8; size];
-            let every = all();
-            let buffer = self.detile(&zeros, &every);
-            last.hash = buffer.is_some().then(|| blake3::hash(&zeros));
-            return (0, buffer.map(|(b, at)| (b, at, every)));
+            let (read, buffer) = last.refresh_sparse(
+                self.memory, size, &self.spans, self.footprints.len(),
+                |tiled, changed| self.detile(tiled, changed),
+            );
+            return (read, buffer.map(|((b, at), changed)| (b, at, changed)));
         }
         // SAFETY: committed memory of the texture's layout size.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
@@ -661,7 +746,10 @@ impl Staging {
         }
         let every = all();
         let buffer = self.detile(tiled, &every);
-        last.hash = buffer.is_some().then_some(hash);
+        if buffer.is_some() {
+            last.hash = Some(hash);
+            last.hashes.clear();
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         (size, buffer.map(|(b, at)| (b, at, every)))
@@ -753,6 +841,12 @@ fn subresource_len(offset: u64, pitch: usize, rows: u32, depth: u32, total: u64)
 /// Whether `[at, at + len)` is committed, readable memory (streamed textures
 /// may be unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
+    visit_regions(at, len, |_, _, readable| readable)
+}
+
+/// Visits the regions in the range, passing offsets relative to `at`.
+/// Stops on a failed query or when the visitor returns false.
+fn visit_regions(at: *const u8, len: usize, mut visit: impl FnMut(usize, usize, bool) -> bool) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
     };
@@ -767,14 +861,18 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
         let unreadable = info.Protect == 0
             || info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0;
-        if n == 0 || info.State != MEM_COMMIT || unreadable {
+        if n == 0 {
             return false;
         }
         let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
         if next <= p {
             return false;
         }
-        p = next;
+        let stop = next.min(end);
+        if !visit(p - at as usize, stop - at as usize, info.State == MEM_COMMIT && !unreadable) {
+            return false;
+        }
+        p = stop;
     }
     true
 }
@@ -850,6 +948,150 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE,
+        VirtualAlloc, VirtualFree,
+    };
+
+    struct Reservation(*mut u8, usize);
+
+    impl Reservation {
+        fn new(size: usize) -> Self {
+            // SAFETY: the returned range belongs to this test until Reservation drops.
+            let ptr = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_NOACCESS) };
+            assert!(!ptr.is_null());
+            Self(ptr.cast(), size)
+        }
+        fn paint(&self, (a, b): (usize, usize), rgba: [u8; 4]) {
+            assert!(a < b && b <= self.1 && a % 4096 == 0 && b % 4096 == 0);
+            let source = self.0.wrapping_add(a);
+            // SAFETY: callers provide page-aligned ranges inside this reservation.
+            let ptr = unsafe { VirtualAlloc(source.cast(), b - a, MEM_COMMIT, PAGE_READWRITE) };
+            assert_eq!(ptr, source.cast());
+            // SAFETY: the test owns this committed range.
+            for pixel in unsafe { std::slice::from_raw_parts_mut(source, b - a) }.chunks_exact_mut(4) {
+                pixel.copy_from_slice(&rgba);
+            }
+        }
+    }
+
+    impl Drop for Reservation {
+        fn drop(&mut self) {
+            // SAFETY: the base of the private reservation owned by this test.
+            unsafe { VirtualFree(self.0.cast(), 0, MEM_RELEASE) };
+        }
+    }
+
+    fn tiled_rgba(slices: u32, mips: u32) -> Layout {
+        Layout::new(&Desc {
+            dimension: Dimension::Tex2d, width: 64, height: 64, depth: slices, mips,
+            element_bytes: 4, block: 1, samples: 1, swizzle: Swizzle::SW_4KB_S,
+        }).unwrap()
+    }
+
+    #[test]
+    fn sparse_stream_keeps_resident_texture_slices() {
+        let layout = tiled_rgba(3, 1);
+        let size = layout.size as usize;
+        let spans = spans(&layout, 3, 1, 0);
+        assert_eq!(spans, [(0, 16384), (16384, 32768), (32768, 49152)]);
+        let reservation = Reservation::new(size);
+        let memory = reservation.0;
+        let mut last = Last::default();
+        let mut pixels = vec![vec![0xce; 64 * 64 * 4]; 3];
+        let refresh = |last: &mut Last, pixels: &mut [Vec<u8>]| {
+            last.refresh_sparse(memory, size, &spans, 3, |tiled, changed| {
+                for &slice in changed {
+                    layout.detile(tiled, 0, slice, &mut pixels[slice as usize], 64 * 4, 64 * 64 * 4).unwrap();
+                }
+                Some(())
+            }).1.map(|(_, selected)| selected)
+        };
+        let solid = |slice: &[u8], rgba: [u8; 4]| slice.chunks_exact(4).all(|pixel| pixel == rgba);
+
+        reservation.paint(spans[1], [0x18, 0x35, 0x6d, 0xff]);
+        assert!(!committed(memory, size));
+        assert!(crate::watch::track(memory as usize, size, true).is_none());
+        assert_eq!(refresh(&mut last, &mut pixels), Some(vec![0, 1, 2]));
+        assert!(solid(&pixels[0], [0; 4]) && solid(&pixels[2], [0; 4]));
+        assert!(solid(&pixels[1], [0x18, 0x35, 0x6d, 0xff]));
+        assert_eq!(refresh(&mut last, &mut pixels), None);
+
+        // An updated zero-valued material is real data. A failed staging upload must retry.
+        reservation.paint(spans[1], [0; 4]);
+        let (_, failed) = last.refresh_sparse(memory, size, &spans, 3, |_, changed| {
+            assert_eq!(changed, &[1]);
+            None::<()>
+        });
+        assert!(failed.is_none());
+        assert_eq!(refresh(&mut last, &mut pixels), Some(vec![1]));
+        assert!(solid(&pixels[1], [0; 4]));
+
+        reservation.paint(spans[1], [7, 6, 5, 4]);
+        assert_eq!(refresh(&mut last, &mut pixels), Some(vec![1]));
+        // SAFETY: an entire committed slice in this test's reservation.
+        assert_ne!(unsafe { VirtualFree(memory.wrapping_add(spans[1].0).cast(), 16384, MEM_DECOMMIT) }, 0);
+        reservation.paint(spans[2], [1, 2, 3, 4]);
+        assert_eq!(refresh(&mut last, &mut pixels), Some(vec![2]));
+        assert!(solid(&pixels[1], [7, 6, 5, 4]));
+        assert!(solid(&pixels[2], [1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn sparse_stream_recovers_the_shared_mip_tail() {
+        let layout = tiled_rgba(1, 4);
+        let size = layout.size as usize;
+        let spans = spans(&layout, 4, 4, 0);
+        assert_eq!(spans[2], (0, 4096));
+        assert_eq!(spans[3], spans[2]);
+        let reservation = Reservation::new(size);
+        let mut last = Last::default();
+        let (_, initial) = last.refresh_sparse(reservation.0, size, &spans, 4, |tiled, levels| {
+            assert!(tiled.iter().all(|&byte| byte == 0));
+            assert_eq!(levels, &[0, 1, 2, 3]);
+            Some(())
+        });
+        assert!(initial.is_some());
+        let mut queries = 0;
+        assert!(visit_regions(reservation.0, size, |_, _, readable| {
+            queries += 1;
+            assert!(!readable);
+            true
+        }));
+        assert_eq!(queries, 1);
+        let (read, skipped) = last.refresh_sparse(reservation.0, size, &spans, 4, |_, _| -> Option<()> {
+            panic!("an empty reservation has already been initialized");
+        });
+        assert_eq!(read, 0);
+        assert!(skipped.is_none());
+        reservation.paint(spans[2], [0x46, 0x18, 0x83, 0xff]);
+        assert!(!committed(reservation.0, size));
+        let mut reused = Scratch::take(size);
+        reused.0[..size].fill(0xce);
+        drop(reused);
+        let (_, update) = last.refresh_sparse(reservation.0, size, &spans, 4, |tiled, levels| {
+            assert_eq!(levels, &[2, 3]);
+            assert!(tiled[4096..].iter().all(|&byte| byte == 0));
+            for &level in levels {
+                let side = 64 >> level;
+                let mut rgb = vec![0; side * side * 4];
+                layout.detile(tiled, level, 0, &mut rgb, side * 4, side * side * 4).unwrap();
+                assert!(rgb.chunks_exact(4).all(|pixel| pixel == [0x46, 0x18, 0x83, 0xff]));
+            }
+            Some(())
+        });
+        assert!(update.is_some());
+
+        // Invalid or missing layout spans never read outside the allocation.
+        let invalid = [(size, usize::MAX), (9, 8), (8, 8)];
+        let (bytes, invalid_upload) = last.refresh_sparse(reservation.0, size, &invalid, 4, |_, _| -> Option<()> {
+            panic!("none of these spans describes a complete subresource");
+        });
+        assert_eq!(bytes, 0);
+        assert!(invalid_upload.is_none());
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {
