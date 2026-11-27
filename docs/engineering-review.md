@@ -1,5 +1,13 @@
 # Native runtime engineering review
 
+## Direct resource indexing on capped descriptor heaps
+
+Some D3D12 adapters cap shader-visible resource heaps at one million descriptors. A program with a larger logical heap can use `VICTORY_VIEW_REMAP=1` to map its active high indices into available physical descriptors. PortVI preserves the ranges reserved for dynamic tables and paired views. All shader stages read the same map through one root SRV. [Upstream descriptor remapping](https://github.com/Marvisak/VIctory/pull/3518)
+
+An open compute fixture reads the four expected values from logical slot 1,150,000, writes them through slot 1,500,000 and checks a null read from slot 1,800,000. It passed on the desktop RTX 4060 and WARP. A second fixture on the RTX 4060 checks placement, materialization and reuse of a high slot. [PortVI implementation and fixtures](../patches/0039-capped-heap-view-map.patch)
+
+The option defaults to off. An experimental RTX 4060 scene run with the mapper enabled showed missing lighting and incorrect color. The fixtures establish descriptor access on these adapters. Visual fidelity and frame-rate gains remain unverified.
+
 ## Ray intersections on 27 November 2026
 
 PortVI preserves both words of a wide node pointer when a compute shader traces a ray using a root descriptor. A small test buffer maps nodes 4 GiB and 32 GiB above the virtual base. With the high word discarded, the 32 GiB case read the lower alias and returned a different intersection on the RTX 4060. With the fix, all 16 traversal tests passed. Hardware and WARP matched the CPU reference for box and triangle hits. [64-bit offsets](https://github.com/Marvisak/VIctory/pull/2501) · [High pointer word](https://github.com/Marvisak/VIctory/pull/2467)
