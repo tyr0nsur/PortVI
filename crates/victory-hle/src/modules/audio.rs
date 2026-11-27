@@ -555,8 +555,25 @@ fn pump(context: Context, voice: &mut Voice) {
         return;
     }
     while context.field(1, 31, 1) == 1 {
-        if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
-            return;
+        // A bank change or a whole-frame skip can decode no samples. Keep
+        // the ring cursor still until there is PCM, and yield on a loop
+        // that repeatedly skips all its samples.
+        const MAX_EMPTY_STEPS: usize = 16;
+        let mut empty_steps = 0;
+        while voice.pcm.len() < SAMPLES_PER_BLOCK {
+            let before = voice.pcm.len();
+            if !decode(context, voice) {
+                if voice.pcm.is_empty() {
+                    return;
+                }
+                break;
+            }
+            if voice.pcm.len() == before {
+                empty_steps += 1;
+                if empty_steps >= MAX_EMPTY_STEPS {
+                    return;
+                }
+            }
         }
         // The write block is the title's too: taken modulo the ring before
         // the first write, which would otherwise land past the ring's end.
@@ -587,12 +604,20 @@ fn pump(context: Context, voice: &mut Voice) {
 /// Decodes the next frame of the current input into `voice.pcm`; false
 /// when there is nothing left to decode.
 fn decode(context: Context, voice: &mut Voice) -> bool {
+    let valid = context.field(0, 20, 2);
     if voice.ended {
-        return false;
+        // The title can refill either input while the context stays enabled.
+        // The previous tail was flushed and its overlap reset when it ended.
+        if valid == 0 {
+            return false;
+        }
+        voice.ended = false;
+        if context.field(2, 26, 5) == INPUT_INVALID {
+            context.set_field(2, 26, 6, 0);
+        }
     }
     let channels = context.channels();
     let mut current = context.field(4, 31, 1);
-    let valid = context.field(0, 20, 2);
     if valid & (1 << current) == 0 {
         if valid & (1 << (1 - current)) == 0 {
             // Out of input: the overlap tail, then nothing.
@@ -1216,6 +1241,50 @@ mod tests {
     }
 
     #[test]
+    fn ended_voice_stays_ended_until_input_is_republished() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: the allocation holds the two-packet stream.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+        let mut words = [0u32; 16];
+        let context = Context(words.as_mut_ptr());
+        context.set(1, 2 | 3 << 27);
+        context.set(2, 32 | INPUT_INVALID << 26 | 1 << 31);
+        context.set(6, input_apu);
+        let mut voice = Voice {
+            decoder: None,
+            pcm: VecDeque::new(),
+            skip: 0,
+            ended: true,
+            trace: Trace {
+                since: Instant::now(),
+                produced: 0,
+                taken: 0,
+                takes: 0,
+                partial_takes: 0,
+                frames: 0,
+                bad_frames: 0,
+                peak: 0,
+                ended_ms: None,
+            },
+        };
+        assert!(!decode(context, &mut voice));
+        assert!(voice.ended);
+        assert_eq!(context.field(2, 26, 5), INPUT_INVALID);
+        assert_eq!(voice.trace.frames, 0);
+
+        context.set_field(0, 20, 2, 2);
+        assert!(decode(context, &mut voice));
+        assert!(!voice.ended);
+        assert_eq!(context.field(2, 26, 6), 0);
+        assert_eq!(voice.trace.frames, 1);
+        assert!(!voice.pcm.is_empty());
+        ApuFree(input);
+    }
+
+    #[test]
     fn xma_contexts_decode_into_their_output_rings() {
         let _serial = lock(&CONTEXT_TESTS);
         let mut request = ShapeContexts {
@@ -1359,6 +1428,87 @@ mod tests {
         // No loops left: both frames whole, and on to the third.
         assert_eq!(step(third), 4 * subframe);
         ApuFree(input);
+    }
+
+    /// Refilling `voice.pcm` in `pump` must keep decoding across calls that
+    /// produce zero samples (an empty buffer-0 transitioning to buffer-1, or a
+    /// start-skip covering a full 4-subframe frame) instead of emitting a
+    /// spurious silent output block.
+    #[test]
+    fn pump_refills_across_empty_decode_steps_without_spurious_silence() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: two packets were allocated.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+        let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(
+            ApuAlloc(&mut output, &mut output_apu, 0x400, 0x100, 2),
+            S_OK
+        );
+
+        let drain_all = |words: &mut [u32; 16], skip: usize| -> usize {
+            let context = Context(words.as_mut_ptr());
+            let mut voice = Voice {
+                decoder: None,
+                pcm: VecDeque::new(),
+                skip,
+                ended: false,
+                trace: Trace {
+                    since: Instant::now(),
+                    produced: 0,
+                    taken: 0,
+                    takes: 0,
+                    partial_takes: 0,
+                    frames: 0,
+                    bad_frames: 0,
+                    peak: 0,
+                    ended_ms: None,
+                },
+            };
+            for _ in 0..32 {
+                pump(context, &mut voice);
+                if voice.ended {
+                    break;
+                }
+                // Advance the read pointer to free the 4-block ring.
+                let write = context.field(0, 27, 5);
+                context.set_field(9, 0, 5, write);
+                context.set_field(1, 31, 1, 1);
+            }
+            assert!(voice.ended);
+            voice.trace.produced
+        };
+
+        // Case 1: input 0 is valid with 0 packets and input 1 holds the
+        // 6-frame stream (24 blocks + 2-block overlap tail = 26 blocks).
+        let mut words = [0u32; 16];
+        words[0] = (0b11 << 20) | (4 << 22); // buf0=0 packets, both valid, ring=4
+        words[1] = 2 | (3 << 27) | (1 << 31); // buf1=2 packets, 48 kHz, writable
+        words[2] = 32;
+        words[5] = input_apu;
+        words[6] = input_apu;
+        words[7] = output_apu;
+        let after_bank_change = drain_all(&mut words, 0);
+
+        // Case 2: start-skip of 4 subframes drops frame 0 whole, leaving 5
+        // frames + 2-block overlap tail = 22 blocks (not 23).
+        let mut words = [0u32; 16];
+        words[0] = 2 | (1 << 20) | (4 << 22); // buf0=2 packets, valid, ring=4
+        words[1] = (4 << 24) | (3 << 27) | (1 << 31); // start_skip=4, 48 kHz, writable
+        words[2] = 32;
+        words[5] = input_apu;
+        words[7] = output_apu;
+        let after_skip = drain_all(&mut words, 4 * xma::SUBFRAME_SAMPLES);
+
+        ApuFree(input);
+        ApuFree(output);
+        assert_eq!(
+            (after_bank_change, after_skip),
+            (26 * SAMPLES_PER_BLOCK, 22 * SAMPLES_PER_BLOCK),
+            "PCM samples published after a bank change and after a whole-frame skip"
+        );
     }
 
     #[test]
