@@ -2,7 +2,7 @@
   <img src="docs/assets/portvi-logo.png" width="500" alt="PortVI">
 </h1>
 
-<p align="center"><strong>Native x86-64 runtime for Windows</strong></p>
+<p align="center"><strong>VIctory on the desktop GeForce RTX 4060 · 8 GB</strong></p>
 
 <p align="center">
   <a href="https://github.com/tyr0nsur/PortVI/actions/workflows/windows.yml"><img src="https://github.com/tyr0nsur/PortVI/actions/workflows/windows.yml/badge.svg?branch=main" alt="Windows native checks on main"></a>
@@ -20,9 +20,11 @@
   <a href="docs/engineering-review.md">Engineering notes</a>
 </p>
 
-PortVI is an experimental Windows x64 runtime for native console software compatibility. It runs x86-64 console code directly on the Windows host CPU. It builds on Marvisak’s VIctory, binds platform calls and translates console shaders to DXIL for Direct3D 12. We verify selected results on physical hardware. [Pinned engine](https://github.com/Marvisak/VIctory/commit/61bfc773d3296252918572921237075d8a748649)
+PortVI builds on Marvisak’s VIctory to bring native Windows x64 compatibility to the desktop GeForce RTX 4060 with 8 GB of VRAM. Our first milestone is a complete 1080p scene with the geometry, materials, full-detail textures and ray-traced lighting intact. The performance target for that same scene is 30 rendered frames per second. [Upstream engine](https://github.com/Marvisak/VIctory) · [1080p rendering milestone](https://github.com/tyr0nsur/PortVI/issues/26)
 
-**Current status.** PortVI has verified native loader and Direct3D 12 test fixtures, including hardware results on the NVIDIA GeForce RTX 4060. Two preliminary 120-second runs of an introductory sequence reached partial geometry and averaged about one present per second. [Frame times](docs/engineering-review.md#preliminary-startup-frame-timings) · [Project status and evidence](docs/project-status.md) · [Contribute hardware results](CONTRIBUTING.md)
+**What runs today.** On the RTX 4060, PortVI has verified high-index resource bindings and 64-bit ray-intersection tests. Earlier scene captures showed partial geometry. A recent experimental build ran for 110 seconds after entering the scene, but its captures showed subtitles on black. Nine shaders in the ray-tracing builder still need working translations on this card. [Resource bindings](https://github.com/tyr0nsur/PortVI/pull/23) · [Ray-intersection tests](https://github.com/tyr0nsur/PortVI/pull/22) · [Scene result](https://github.com/tyr0nsur/PortVI/pull/24)
+
+**Help bring up the lighting.** Shader developers can adapt a 64-lane operation and check the values written by the GPU. GeForce owners can run a source-built texture fixture and compare their result with the reference card. We work in English and Spanish. [Pick a task](https://github.com/tyr0nsur/PortVI/issues/26) · [Run your first hardware check](CONTRIBUTING.md#run-a-hardware-check)
 
 ## Development dashboard
 
@@ -143,4 +145,4 @@ Add the reproducible result to the engineering notes or its tracking issue. Upda
 
 ## Credits and license
 
-Marvisak and the VIctory contributors wrote the native engine. PortVI pins the original repository at `61bfc77`. Earlier PortVI revisions used LooperSalty’s integration of fxceless’s fork. Their work informed the texture and depth-bounds changes carried forward here. PortVI’s changes and test tools are available under GPL-3.0-or-later. [Current engine](https://github.com/Marvisak/VIctory/commit/61bfc773d3296252918572921237075d8a748649) · [Earlier integration](https://github.com/LooperSalty/victory/commit/fd021bf26a7003749d668e5d9bf6b234bfab2e47) · [fxceless’s fork](https://github.com/fxceless/victory-fork) · [License](LICENSE)
+Marvisak and the VIctory contributors wrote the native engine. PortVI pins the upstream engine as a Git submodule and maintains its own series of patches and hardware fixtures. Earlier PortVI revisions used LooperSalty’s integration of fxceless’s fork. Their work informed the texture and depth-bounds changes carried forward here. PortVI’s changes and test tools are available under GPL-3.0-or-later. [Pinned engine revision](engine) · [Earlier integration](https://github.com/LooperSalty/victory/commit/fd021bf26a7003749d668e5d9bf6b234bfab2e47) · [fxceless’s fork](https://github.com/fxceless/victory-fork) · [License](LICENSE)

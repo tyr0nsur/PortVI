@@ -1,9 +1,10 @@
 # Contribute to PortVI
 
-PortVI tests native Windows x64 compatibility on Direct3D 12. Hardware reports and small, reproducible fixtures are welcome. Start from an exact commit and use the prepared, source-built inputs.
+Our reference card is the desktop GeForce RTX 4060 with 8 GB. If you work on shader translation, compare GPU results or test on another GeForce, start with the [1080p lighting milestone](https://github.com/tyr0nsur/PortVI/issues/26). It includes the current rendering failure, the upstream implementation that translates the missing shaders on CPU, and ways to help using original fixtures. Questions and results are welcome in English or Spanish.
 
 | Report | Where to share it |
 | --- | --- |
+| Ray-traced lighting on the RTX 4060 | [Rendering milestone](https://github.com/tyr0nsur/PortVI/issues/26) |
 | Median shader or another GPU adapter | [GPU validation](https://github.com/tyr0nsur/PortVI/issues/1) |
 | BC4 streaming and skipped-upload control | [Texture validation](https://github.com/tyr0nsur/PortVI/issues/2) |
 | Cold and warm scene frame times | [Frame timing](https://github.com/tyr0nsur/PortVI/issues/3) |
