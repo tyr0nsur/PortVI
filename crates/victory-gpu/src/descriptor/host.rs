@@ -2110,6 +2110,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 }
                 if let Some(desc) = desc.as_mut() {
                     shift_view_levels(crate::resource::dropped(resource), desc);
+                    desc.Format.0 = copy.view_format(desc.Format.0 as u32) as i32;
                 }
                 if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
@@ -2158,6 +2159,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 && let Some(format) = crate::resource::view_format(resource)
             {
                 desc.Format = DXGI_FORMAT(format as i32);
+            }
+            if let Some(desc) = desc.as_mut() {
+                desc.Format.0 = copy.view_format(desc.Format.0 as u32) as i32;
             }
             if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;

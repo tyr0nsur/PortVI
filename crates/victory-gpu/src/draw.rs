@@ -3046,6 +3046,136 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    /// A writable HDR texture can be sampled through its resource and a
+    /// placed alias. A native RGB9E5 device retains the ninth mantissa bit.
+    #[test]
+    fn an_rgb9e5_target_written_through_an_unordered_view_reads_back() {
+        let host = crate::host::host().expect("RGB9E5 readback requires a D3D12 adapter");
+        let slots = Slots::new(4);
+        let read = compile_cs(READ);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        let address = title_memory(1 << 20);
+        // Render target and unordered access, as the title makes it.
+        let object = texture_at_address(address, &texture_words(64, 64, 67, 0x105, 5));
+        let host_texture = crate::resource::host_resource(object).expect("a host texture for an RGB9E5 target");
+        // SAFETY: a live resource.
+        let made = unsafe { host_texture.GetDesc() }.Format.0 as u32;
+        assert_eq!(made, host.rgb9e5_write_format);
+        let unordered = View::Unordered(object as usize, 0, Some([67, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
+        let mut desc = [0u32; 10];
+        desc[..6].copy_from_slice(&[67, 4, 0x1688, 0, 0, 1]);
+        let own = View::Shader(object as usize, Some(desc));
+        let placed = placed_view(address, texture_words(64, 64, 67, 0x105, 0));
+        let write = compile_cs(
+            "#define RS \"DescriptorTable(UAV(u0))\"\nRWTexture2D<float4> o : register(u0);\n[RootSignature(RS)]\n[numthreads(8, 8, 1)]\nvoid main(uint3 id : SV_DispatchThreadID) { o[id.xy] = float4(4.015625, 0.5, 0.25, 0.0); }",
+        );
+        let red = if host.rgb9e5_write_format == crate::resource::RGB9E5 { 4.015625 } else { 4.0 };
+        let want = [red, 0.5, 0.25, 1.0];
+        for (round, view) in [own, placed].iter().enumerate() {
+            slots.make(0, &unordered);
+            slots.make(1, view);
+            let list = host.new_list().unwrap();
+            readable(&list, &used(ResourceType::Uav), &unordered, false);
+            run(&list, &slots, &write, 0, None, (8, 8));
+            readable(&list, &used(ResourceType::Srv), view, false);
+            run(&list, &slots, &read, 1, Some(&out), (8, 8));
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: a plain device query.
+            assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok(), "the device survives");
+            for i in [0usize, 7, 64 * 9 + 33, 64 * 64 - 1] {
+                // SAFETY: inside the mapped output.
+                let got = unsafe { (data.add(i * 16) as *const [f32; 4]).read() };
+                assert_eq!(got, want, "round {round} texel {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn rgb9e5_rtv_clear_reaches_a_float_srv_with_the_devices_precision() {
+        let host = crate::host::host().expect("RGB9E5 RTV readback requires a D3D12 adapter");
+        let address = title_memory(1 << 16);
+        let object = texture_at_address(address, &texture_words(64, 64, 67, 0x100, 1));
+        let texture = crate::resource::host_resource(object).unwrap();
+        let mut slot = [0u8; 128];
+        let handle = slot.as_mut_ptr() as u64;
+        let desc = [67, 4, 0, 0, 0, 0];
+        crate::descriptor::create_rtv(std::ptr::null(), object, &desc, handle);
+        let rtv = crate::descriptor::rtv_record(handle).unwrap().desc().unwrap();
+        assert_eq!(rtv.Format.0 as u32, host.rgb9e5_write_format);
+        let mut desc = [0u32; 10];
+        desc[..6].copy_from_slice(&[67, 4, 0x1688, 0, 0, 1]);
+        let view = View::Shader(object as usize, Some(desc));
+        let table = Slots::new(1);
+        table.make(0, &view);
+        let read = compile_cs(READ);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        let list = host.new_list().unwrap();
+        crate::list::ensure_state(&list, object, 0x4);
+        let clear = [4.015625, 0.5, 0.25, 1.0];
+        // SAFETY: the live texture is in render-target state and the RTV names it.
+        unsafe { list.list.ClearRenderTargetView(host.rtv(&texture, Some(&rtv)), &clear, None) };
+        readable(&list, &used(ResourceType::Srv), &view, false);
+        run(&list, &table, &read, 0, Some(&out), (8, 8));
+        list.close();
+        host.execute(&[&list]);
+        let red = if host.rgb9e5_write_format == crate::resource::RGB9E5 { clear[0] } else { 4.0 };
+        // SAFETY: the completed dispatch wrote 4096 float4s into our mapped output.
+        let pixels = unsafe { std::slice::from_raw_parts(data.cast::<[f32; 4]>(), 64 * 64) };
+        for pixel in pixels {
+            assert_eq!(*pixel, [red, 0.5, 0.25, 1.0]);
+        }
+    }
+
+    #[test]
+    fn rgb9e5_read_only_resource_and_placed_views_sample_packed_words() {
+        sample_rgb9e5_words(0, crate::resource::RGB9E5);
+    }
+
+    #[test]
+    fn rgb9e5_writable_resource_and_placed_views_sample_initial_packed_words() {
+        let host = crate::host::host().expect("RGB9E5 readback requires a D3D12 adapter");
+        sample_rgb9e5_words(5, host.rgb9e5_write_format);
+    }
+
+    fn sample_rgb9e5_words(flags: u32, host_format: u32) {
+        let host = crate::host::host().expect("RGB9E5 readback requires a D3D12 adapter");
+        let slots = Slots::new(2);
+        let read = compile_cs(READ);
+        let (out, data) = host.shared_buffer(64 * 64 * 16).unwrap();
+        let address = title_memory(1 << 16);
+        let words = texture_words(64, 64, 67, 0x100, flags);
+        let object = texture_at_address(address, &words);
+        let copy = crate::resource::host_copy(object).unwrap();
+        // SAFETY: the resource remains live throughout the test.
+        assert_eq!(unsafe { copy.texture.GetDesc() }.Format.0 as u32, host_format);
+        let mut srv = [0u32; 10];
+        srv[..6].copy_from_slice(&[67, 4, 0x1688, 0, 0, 1]);
+        let views = [
+            View::Shader(object as usize, Some(srv)),
+            placed_view(address, texture_words(64, 64, 67, 0x100, 0)),
+        ];
+        let colours = crate::rgb9e5::TEST_COLOURS;
+        // SAFETY: the owned linear plane has 64 words per 256-byte row.
+        let words = unsafe { std::slice::from_raw_parts_mut(address as *mut u32, 64 * 64) };
+        for (i, word) in words.iter_mut().enumerate() {
+            *word = colours[i % colours.len()].0;
+        }
+        for view in &views {
+            slots.make(0, view);
+            let list = host.new_list().unwrap();
+            readable(&list, &used(ResourceType::Srv), view, false);
+            run(&list, &slots, &read, 0, Some(&out), (8, 8));
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: the queue finished writing all 4096 float4s to our buffer.
+            let pixels = unsafe { std::slice::from_raw_parts(data.cast::<[f32; 4]>(), 64 * 64) };
+            for (i, pixel) in pixels.iter().enumerate() {
+                assert_eq!(*pixel, colours[i % colours.len()].1, "host format {host_format}, pixel {i}");
+            }
+        }
+    }
+
     /// A texture the title wrote, read through tables by two lists of one
     /// submission, is uploaded once; the next submission uploads it again
     /// only after the title writes it (run perf7 uploaded the same textures

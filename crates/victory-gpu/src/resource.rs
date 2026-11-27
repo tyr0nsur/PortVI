@@ -287,11 +287,137 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
 pub(crate) fn view_format(this: This) -> Option<u32> {
-    let own = pc_format(resource(this).desc.format);
-    let host = host_resource(this)?;
+    let copy = host_copy(this)?;
     // SAFETY: a live resource.
-    let format = unsafe { host.GetDesc() }.Format.0 as u32;
+    let format = unsafe { copy.texture.GetDesc() }.Format.0 as u32;
+    let own = copy.view_format(pc_format(resource(this).desc.format));
     (format != own).then_some(own)
+}
+
+/// Shared-exponent HDR format used by render targets and unordered views.
+pub(crate) const RGB9E5: u32 = 67;
+/// `R11G11B10_FLOAT`, the fallback when native RGB9E5 lacks required writes:
+/// the same element (4 bytes), unsigned
+/// floats of the same range (to 65 024 against 65 408), alpha read as one
+/// as RGB9E5's is; a host render target and typed unordered store format.
+/// R/G retain six mantissa bits and B retains five. CPU uploads and readbacks
+/// convert the numeric texels. Integer GPU reinterpretations of these targets
+/// still observe the stand-in's bit layout.
+pub(crate) const RGB9E5_STAND_IN: u32 = 26;
+
+/// Use one physical format for RGB9E5 render targets and typed stores so a
+/// later placed alias can add a use without invalidating the graphics PSO.
+#[cfg(windows)]
+fn rgb9e5_supported_write_format(support: Option<(i32, i32)>) -> u32 {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FORMAT_SUPPORT1_RENDER_TARGET, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+        D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE,
+    };
+    let views = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+    if support.is_some_and(|(s1, s2)| s1 & views == views && s2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 != 0) {
+        RGB9E5
+    } else {
+        RGB9E5_STAND_IN
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn rgb9e5_device_format(device: &windows::Win32::Graphics::Direct3D12::ID3D12Device) -> u32 {
+    use windows::Win32::Graphics::Direct3D12::{D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_FORMAT_SUPPORT};
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+    let mut info = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: DXGI_FORMAT_R9G9B9E5_SHAREDEXP, ..Default::default() };
+    // SAFETY: the device receives the matching feature struct and its size.
+    let result = unsafe {
+        device.CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, (&raw mut info).cast(), size_of_val(&info) as u32)
+    };
+    let format = rgb9e5_supported_write_format(result.ok().map(|()| (info.Support1.0, info.Support2.0)));
+    tracing::debug!(format, support1 = info.Support1.0, support2 = info.Support2.0, "RGB9E5 writable backing selected");
+    format
+}
+
+/// The same device choice used to create resources and views is used in the graphics PSO.
+#[cfg(windows)]
+pub(crate) fn target_format(format: u32) -> u32 {
+    if format != RGB9E5 { return format; }
+    crate::host::host().map_or(RGB9E5_STAND_IN, |h| h.rgb9e5_write_format)
+}
+
+/// The format a view in `view` takes of a host texture in `host`: an
+/// RGB9E5 view of a stand-in texture is made in the stand-in's format.
+fn host_view_format(view: u32, rgb9e5_target: bool) -> u32 {
+    if view == RGB9E5 && rgb9e5_target { RGB9E5_STAND_IN } else { view }
+}
+
+/// Whether title texture `this` is RGB9E5 with its host texture in the
+/// stand-in (whose bytes are R11G11B10's).
+#[cfg(windows)]
+pub(crate) fn rgb9e5_stood_in(this: This) -> bool {
+    !this.is_null()
+        && pc_format(resource(this).desc.format) == RGB9E5
+        && host_copy(this).is_some_and(|copy| copy.rgb9e5_target)
+}
+
+/// A texture-to-texture operation that needs numeric conversion between
+/// native shared-exponent and substituted RGB texels. Direct copies preserve
+/// bits only; the two DXGI formats belong to different compatibility groups.
+/// Whole-resource and region copies convert on the GPU
+/// (`crate::rgb9e5::copy`); aliases and resolves keep their destination.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Rgb9Copy {
+    Resource,
+    Region,
+    Alias,
+    Resolve,
+}
+
+#[cfg(windows)]
+static MIXED_RGB9_COPIES: [std::sync::atomic::AtomicU64; 8] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+#[cfg(windows)]
+pub(crate) fn needs_rgb9_copy(
+    kind: Rgb9Copy,
+    src: This,
+    from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    dst: This,
+    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> bool {
+    // Typical copies never involve a shared-exponent title texture.
+    if pc_format(resource(src).desc.format) != RGB9E5 && pc_format(resource(dst).desc.format) != RGB9E5 {
+        return false;
+    }
+    // SAFETY: callers hold both live host textures throughout recording.
+    let (a, b) = unsafe { (from.GetDesc().Format.0 as u32, to.GetDesc().Format.0 as u32) };
+    // Equal formats (both native where the adapter writes RGB9E5) copy bits.
+    let substituted = match crate::rgb9e5::converts(a, b) {
+        Some(false) => dst,
+        Some(true) => src,
+        None => return false,
+    };
+    if !host_copy(substituted).is_some_and(|copy| copy.rgb9e5_target) {
+        return false; // A deliberate native raw alias has its normal bit-copy path.
+    }
+    let index = 2 * kind as usize + usize::from(a == RGB9E5);
+    if MIXED_RGB9_COPIES[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        match kind {
+            // Converted on the GPU (`crate::rgb9e5::copy`).
+            Rgb9Copy::Resource | Rgb9Copy::Region => tracing::info!(?kind, source_format = a,
+                destination_format = b, "mixed RGB9E5 GPU copy converted numerically"),
+            Rgb9Copy::Alias | Rgb9Copy::Resolve => tracing::warn!(?kind, source_format = a,
+                destination_format = b, "mixed RGB9E5 GPU copy requires numeric conversion; destination retained"),
+        }
+    }
+    true
+}
+
+/// [`host_view_format`] for a view of title texture `this`.
+#[cfg(windows)]
+pub(crate) fn stand_in_view(this: This, view: u32) -> u32 {
+    if view != RGB9E5 {
+        return view;
+    }
+    host_copy(this).map_or(view, |copy| copy.view_format(view))
 }
 
 /// Depth formats with their typeless family: depth textures that shaders
@@ -908,6 +1034,11 @@ pub(crate) struct HostTexture {
     /// A host copy or resolve wrote it: its contents are the host's, not
     /// title memory's (`crate::texture`).
     pub(crate) host_written: std::sync::atomic::AtomicBool,
+    /// A writable shared-exponent resource uses R11G11B10_FLOAT storage.
+    /// Native R11G11B10 resources may still have genuine packed RGB9E5 aliases.
+    pub(crate) rgb9e5_target: bool,
+    /// The title writes this RGB9E5 backing, whether native or substituted.
+    pub(crate) rgb9e5_writable: bool,
     /// Its uploads from title memory (`crate::texture`), made on first use.
     pub(crate) staging: std::sync::Mutex<Option<std::sync::Arc<crate::texture::Staging>>>,
     /// A depth texture's writable twin (`crate::twin`), made with its first
@@ -931,6 +1062,10 @@ pub(crate) struct HostTexture {
 
 #[cfg(windows)]
 impl HostTexture {
+    pub(crate) fn view_format(&self, view: u32) -> u32 {
+        host_view_format(view, self.rgb9e5_target)
+    }
+
     /// A host texture made outside the title's resources (twins).
     pub(crate) fn new(
         texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
@@ -948,6 +1083,8 @@ impl HostTexture {
             state: state.into(),
             castable,
             host_written: false.into(),
+            rgb9e5_target: false,
+            rgb9e5_writable: false,
             staging: std::sync::Mutex::new(None),
             twin: std::sync::OnceLock::new(),
             bytes,
@@ -1204,7 +1341,7 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 /// The host description of a title texture: the same, without the
 /// console's layout and flags, in a format the host takes for its use.
 #[cfg(windows)]
-fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
+fn host_desc(desc: &ResourceDesc, rgb9e5_write_format: u32) -> Option<ResourceDesc> {
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
         return None;
@@ -1221,6 +1358,9 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
         d.flags &= !UNORDERED;
     }
     d.format = pc_format(d.format);
+    if writable_rgb9e5(&d) {
+        d.format = rgb9e5_write_format;
+    }
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -1235,6 +1375,13 @@ fn host_desc(desc: &ResourceDesc) -> Option<ResourceDesc> {
     Some(d)
 }
 
+#[cfg(windows)]
+fn writable_rgb9e5(d: &ResourceDesc) -> bool {
+    pc_format(d.format) == RGB9E5 && d.flags & (RENDER_TARGET | UNORDERED) != 0
+}
+
+#[cfg(windows)]
+const RENDER_TARGET: u32 = 1;
 const DEPTH: u32 = 2;
 #[cfg(windows)]
 const UNORDERED: u32 = 4;
@@ -1314,12 +1461,15 @@ fn shared_texture(
     state: u32,
     clear: *const c_void,
 ) -> Option<std::sync::Arc<HostTexture>> {
-    let d = host_desc(desc)?;
+    let rgb9e5_write_format = crate::host::host()?.rgb9e5_write_format;
+    let d = host_desc(desc, rgb9e5_write_format)?;
     let key = memory_key(address, desc);
     let mut map = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(Default::default);
     let live = key.and_then(|k| map.get(&k)?.upgrade());
+    let mut rgb9e5_writable = writable_rgb9e5(desc);
     if let Some(t) = &live
+        && (!rgb9e5_writable || t.rgb9e5_writable)
         && takes(t, &d)
     {
         SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1338,14 +1488,27 @@ fn shared_texture(
     let mut d = d;
     // Whether the GPU writes the memory through any title texture of it.
     let mut written = false;
+    let mut alias_writer = None;
     if let Some(k) = key {
         let at = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         for r in at.get(&address).into_iter().flatten().map(|&r| resource(r as This)) {
             written |= r.desc.flags & USES != 0;
-            if memory_key(address, &r.desc) == Some(k) {
-                d.flags |= host_desc(&r.desc).map_or(0, |h| h.flags & USES);
+            if memory_key(address, &r.desc) == Some(k) && let Some(h) = host_desc(&r.desc, rgb9e5_write_format) {
+                d.flags |= h.flags & USES;
+                rgb9e5_writable |= writable_rgb9e5(&r.desc);
+                if h.flags & USES != 0 {
+                    alias_writer.get_or_insert(h.format);
+                }
             }
         }
+    }
+    // A placed read-only alias can be the first object to realize the backing.
+    // A native R32_UINT writer retains its packed RGB9E5 shader view.
+    let rgb9e5_target = rgb9e5_writable && rgb9e5_write_format == RGB9E5_STAND_IN;
+    if rgb9e5_writable {
+        d.format = rgb9e5_write_format;
+    } else if d.format == RGB9E5 && let Some(format) = alias_writer {
+        d.format = format;
     }
     // The first host texture of a memory only the title fills may leave
     // out its largest levels (`drop_levels`); one replacing a live one
@@ -1359,8 +1522,10 @@ fn shared_texture(
     // shortcut: title textures of a replaced host texture keep it (placed
     // views move to the new one, `texture_at`); copies (`alias_source`)
     // bridge the two where the shapes allow.
-    let mut t = make_texture(&d, state, clear)?;
+    let mut t = make_texture(&d, state, clear, rgb9e5_target)?;
     t.key = key;
+    t.rgb9e5_target = rgb9e5_target;
+    t.rgb9e5_writable = rgb9e5_writable;
     let t = std::sync::Arc::new(t);
     if let Some(k) = key {
         remade(&k);
@@ -1384,9 +1549,15 @@ fn takes(t: &HostTexture, d: &ResourceDesc) -> bool {
     // SAFETY: a live resource.
     let td = unsafe { t.texture.GetDesc() };
     let (flags, own) = (td.Flags.0 as u32, td.Format.0 as u32);
-    d.flags & USES & !flags == 0
-        && (family(d.format) == family(own)
-            || t.castable.iter().any(|&c| family(c) == family(d.format)))
+    let view = t.view_format(d.format);
+    d.flags & USES & !flags == 0 && compatible_host_view(own, view, &t.castable)
+}
+
+/// A typed view outside the resource's own family must be present in
+/// the exact format list that D3D12 accepted at resource creation.
+#[cfg(windows)]
+fn compatible_host_view(own: u32, view: u32, castable: &[u32]) -> bool {
+    family(own) == family(view) || castable.contains(&view)
 }
 
 /// Whether `this`'s host texture is still its memory's (not replaced by one
@@ -1408,7 +1579,7 @@ fn current(this: This) -> bool {
 /// [`castable`]'s formats (colour textures, through the enhanced-barrier
 /// creation; it starts in the common state) where the host takes that.
 #[cfg(windows)]
-fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<HostTexture> {
+fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void, rgb9e5_target: bool) -> Option<HostTexture> {
     use windows::Win32::Graphics::Direct3D12::*;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
     use windows::core::Interface;
@@ -1418,7 +1589,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     let clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
-        value[0] = pc_format(value[0]);
+        value[0] = host_view_format(pc_format(value[0]), rgb9e5_target);
         value
     });
     let clear_value = clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast::<D3D12_CLEAR_VALUE>());
@@ -1876,7 +2047,7 @@ fn hand_out_resource(
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
-    } else if host_desc(&desc).is_some() {
+    } else {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(resource.data() as u64).or_default().push(at);
@@ -2604,6 +2775,93 @@ mod tests {
         assert!(choose(&[early], frame, now, 0).is_empty(), "too few frames ago");
     }
 
+    /// An RGB9E5 texture the title renders to or writes is made in the
+    /// stand-in (same element, so one memory key with its placed views);
+    /// one only read keeps RGB9E5, which the host samples. RGB9E5 views of
+    /// a stand-in take its format; other views and textures are untouched.
+    #[cfg(windows)]
+    #[test]
+    fn rgb9e5_targets_stand_in_r11g11b10_and_their_views_follow() {
+        let target = ResourceDesc { flags: 5, ..texture(1920, 1080, RGB9E5, 1) };
+        let read = ResourceDesc { flags: 0, ..target };
+        for write_format in [RGB9E5_STAND_IN, RGB9E5] {
+            for flags in [5, 4, 1, 0] {
+                let d = host_desc(&ResourceDesc { flags, ..target }, write_format).unwrap();
+                let want = if flags == 0 { RGB9E5 } else { write_format };
+                assert_eq!((d.format, d.flags), (want, flags), "backing {write_format}, flags {flags:#x}");
+            }
+        }
+        // A placed view of the memory names its layout, as the target's.
+        let (target, read) = (ResourceDesc { layout: 0x105, ..target }, ResourceDesc { layout: 0x105, ..read });
+        assert_eq!(memory_key(0x1_0000, &target), memory_key(0x1_0000, &read));
+        let other = ResourceDesc { flags: 5, ..texture(64, 64, 28, 1) };
+        assert_eq!(host_desc(&other, RGB9E5).unwrap().format, 28);
+        assert_eq!(host_view_format(RGB9E5, true), RGB9E5_STAND_IN);
+        assert_eq!(host_view_format(RGB9E5, false), RGB9E5, "a native resource retains its shared-exponent view");
+        assert_eq!(host_view_format(42, true), 42);
+        assert_eq!(target_format(28), 28);
+        assert!(compatible_host_view(42, RGB9E5, &[RGB9E5]), "R32_UINT has the packed read view");
+        assert!(!compatible_host_view(RGB9E5, 42, &[41]), "R32_FLOAT does not authorize R32_UINT");
+        assert!(compatible_host_view(RGB9E5, 42, &[42]), "explicit integer alias");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rgb9e5_native_write_requires_rtv_and_typed_uav_stores() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FORMAT_SUPPORT1_RENDER_TARGET, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+            D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE,
+        };
+        assert_eq!(rgb9e5_supported_write_format(None), RGB9E5_STAND_IN, "feature query failed");
+        for mask in 0..8 {
+            let rt = if mask & 1 != 0 { D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 } else { 0 };
+            let uav = if mask & 2 != 0 { D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 } else { 0 };
+            let store = if mask & 4 != 0 { D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 } else { 0 };
+            let want = if mask == 7 { RGB9E5 } else { RGB9E5_STAND_IN };
+            assert_eq!(rgb9e5_supported_write_format(Some((rt | uav, store))), want, "capability mask {mask}");
+        }
+    }
+
+    /// From the adapter's capabilities to the copy route: with native
+    /// RGB9E5 writes a sampled and a writable RGB9E5 texture share the
+    /// format and copy bits; with the stand-in (any capability missing, or
+    /// the query failing) copies between them convert, packing into the
+    /// sampled one and unpacking into the writable one. No other pair does.
+    #[cfg(windows)]
+    #[test]
+    fn rgb9e5_copies_convert_only_between_the_selected_stand_in_and_native_rgb9e5() {
+        use crate::rgb9e5::converts;
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FORMAT_SUPPORT1_RENDER_TARGET, D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW,
+            D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE,
+        };
+        let views = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+        let store = D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0;
+        let sampled = ResourceDesc { flags: 0, depth_or_array_size: 2, ..texture(64, 64, RGB9E5, 3) };
+        for (support, stood_in) in [
+            (None, true),
+            (Some((views, store)), false),
+            (Some((views, 0)), true),
+            (Some((D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0, store)), true),
+        ] {
+            let write_format = rgb9e5_supported_write_format(support);
+            for flags in [1, 4, 5] {
+                let s = host_desc(&sampled, write_format).unwrap().format;
+                let w = host_desc(&ResourceDesc { flags, ..sampled }, write_format).unwrap().format;
+                let case = format!("support {support:?}, flags {flags}: {s} and {w}");
+                assert_eq!((s, w == RGB9E5_STAND_IN), (RGB9E5, stood_in), "{case}");
+                assert_eq!(converts(s, w), stood_in.then_some(false), "into the writable one, {case}");
+                assert_eq!(converts(w, s), stood_in.then_some(true), "into the sampled one, {case}");
+                assert_eq!((converts(s, s), converts(w, w)), (None, None), "same format, {case}");
+            }
+        }
+        for other in [10, 28, 41, 42] {
+            for packed in [RGB9E5, RGB9E5_STAND_IN] {
+                assert_eq!((converts(other, packed), converts(packed, other)), (None, None), "format {other}");
+            }
+        }
+    }
+
     /// Views of a host texture without its largest level keep their texels:
     /// a view of title level 0 alone shows host level 0 (title level 1),
     /// one of levels 3 and 4 shows host levels 2 and 3, all levels stay all.
@@ -3227,25 +3485,65 @@ mod tests {
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
-        let null = std::ptr::null();
-        let iid = &RESOURCE_IIDS[0];
-        const COPY_DEST: u32 = 0x400;
-        let (mut image, mut source, mut target) = (null, null, null);
-        let created = |desc: &ResourceDesc, state, out: &mut This| {
-            assert_eq!(create_committed(null, &PROPERTIES, 0, desc, state, null.cast(), iid, out), S_OK);
+        copy_buffer_region_roundtrip(28, 0, |x, y| {
+            let pixel = u32::from_le_bytes(std::array::from_fn(|c| ((y * 256 + x * 4 + c) % 251) as u8));
+            (pixel, pixel)
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rgb9e5_buffer_upload_and_subregion_readback_preserve_packed_words_and_padding() {
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter1, IDXGIFactory4,
         };
-        created(&texture(4, 4, 28, 1), COPY_DEST, &mut image);
-        created(&buffer(1024), 0, &mut source);
-        created(&buffer(4096), 0, &mut target);
-        let (data, _) = buffer_bytes(source).unwrap();
-        // SAFETY: the buffer holds 1024 bytes.
-        let bytes = unsafe { std::slice::from_raw_parts_mut(data, 1024) };
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = (i % 251) as u8;
-        }
-        let (out, _) = buffer_bytes(target).unwrap();
-        // SAFETY: the buffer holds 4096 bytes.
-        unsafe { std::ptr::write_bytes(out, 0xEE, 4096) };
+        let host = crate::host::host().expect("RGB9E5 readback requires a D3D12 adapter");
+        // SAFETY: the factory looks up the adapter of this exact live D3D12 device.
+        let adapter = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory1().unwrap();
+            let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(host.device.GetAdapterLuid()).unwrap();
+            adapter.GetDesc1().unwrap()
+        };
+        let end = adapter.Description.iter().position(|&c| c == 0).unwrap_or(adapter.Description.len());
+        let name = String::from_utf16_lossy(&adapter.Description[..end]);
+        eprintln!(
+            "RGB9E5 adapter={name} vendor={:04x} device={:04x} luid={:08x}:{:08x} software={} write_format={}",
+            adapter.VendorId, adapter.DeviceId, adapter.AdapterLuid.HighPart, adapter.AdapterLuid.LowPart,
+            adapter.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0, host.rgb9e5_write_format,
+        );
+        let colours = crate::rgb9e5::TEST_COLOURS;
+        copy_buffer_region_roundtrip(RGB9E5, 5, |x, y| match (x + 2 * y) % 4 {
+            // Only the R11 fallback loses this bit. A native RGB9E5 target keeps it.
+            3 => {
+                let mantissa = if host.rgb9e5_write_format == RGB9E5 { 257 } else { 256 };
+                ((18 << 27) | 257, (18 << 27) | mantissa)
+            }
+            i => (colours[i].0, colours[i].0),
+        });
+    }
+
+    #[cfg(windows)]
+    #[repr(C)]
+    struct CopyTestLocation {
+        resource: This,
+        kind: u32,
+        footprint: PlacedFootprint,
+    }
+
+    #[cfg(windows)]
+    type CopyTestRegion = extern "system" fn(This, *const CopyTestLocation, u32, u32, u32, *const CopyTestLocation, *const u8);
+
+    #[cfg(windows)]
+    fn copy_test_resource(desc: &ResourceDesc, state: u32) -> This {
+        let null = std::ptr::null();
+        let mut out = null;
+        assert_eq!(create_committed(null, &PROPERTIES, 0, desc, state, null.cast(), &RESOURCE_IIDS[0], &mut out), S_OK);
+        out
+    }
+
+    #[cfg(windows)]
+    fn copy_test_commands() -> (This, This, This) {
+        let null = std::ptr::null();
         let (mut queue, mut allocator, mut list) = (null, null, null);
         let queue_desc = [0u32; 4];
         assert_eq!(
@@ -3260,32 +3558,185 @@ mod tests {
             crate::list::create_list(null, 0, 0, allocator, null, &guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]), &mut list),
             S_OK
         );
-        #[repr(C)]
-        struct Location {
-            resource: This,
-            kind: u32,
-            footprint: PlacedFootprint,
-        }
-        let rows = PlacedFootprint { offset: 0, format: 28, width: 4, height: 4, depth: 1, row_pitch: 256 };
-        let image_at = Location { resource: image, kind: 0, footprint: rows };
-        let from_source = Location { resource: source, kind: 1, footprint: rows };
+        (queue, allocator, list)
+    }
+
+    #[cfg(windows)]
+    fn copy_buffer_region_roundtrip(format: u32, flags: u32, texel: impl Fn(usize, usize) -> (u32, u32)) {
+        let null = std::ptr::null::<u8>();
+        let image = copy_test_resource(&ResourceDesc { flags, ..texture(4, 4, format, 1) }, 0x400);
+        let source = copy_test_resource(&buffer(1024), 0);
+        let target = copy_test_resource(&buffer(4096), 0);
+        let (data, _) = buffer_bytes(source).unwrap();
+        // SAFETY: the buffer holds 1024 bytes.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(data, 1024) };
+        bytes.fill(0xcc);
+        let (out, _) = buffer_bytes(target).unwrap();
+        // SAFETY: the buffer holds 4096 bytes.
+        unsafe { std::ptr::write_bytes(out, 0xEE, 4096) };
+        let (queue, allocator, list) = copy_test_commands();
+        let rows = PlacedFootprint { offset: 0, format, width: 4, height: 4, depth: 1, row_pitch: 256 };
+        let image_at = CopyTestLocation { resource: image, kind: 0, footprint: rows };
+        let from_source = CopyTestLocation { resource: source, kind: 1, footprint: rows };
         // Texels (1..3, 1..3) into the target's footprint at 512, at texel (2, 1).
-        let into_target = Location { resource: target, kind: 1, footprint: PlacedFootprint { offset: 512, ..rows } };
+        let into_target = CopyTestLocation { resource: target, kind: 1, footprint: PlacedFootprint { offset: 512, ..rows } };
         let region: [u32; 6] = [1, 1, 0, 3, 3, 1];
-        type Copy = extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
-        let copy = slot::<Copy>(list, 0x80);
+        let copy = slot::<CopyTestRegion>(list, 0x80);
         copy(list, &image_at, 0, 0, 0, &from_source, null.cast());
         copy(list, &into_target, 2, 1, 0, &image_at, region.as_ptr().cast());
         slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
+        // A producer may fill the input after recording, before submission.
+        for y in 0..4 {
+            for x in 0..4 {
+                let start = y * 256 + x * 4;
+                bytes[start..start + 4].copy_from_slice(&texel(x, y).0.to_le_bytes());
+            }
+        }
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
         // SAFETY: the buffer holds 4096 bytes; the submission has run.
         let read = unsafe { std::slice::from_raw_parts(out, 4096) };
         let mut want = vec![0xEEu8; 4096];
-        for row in 0..2 {
-            let (to, from) = (512 + (1 + row) * 256 + 2 * 4, (1 + row) * 256 + 4);
-            want[to..to + 8].copy_from_slice(&bytes[from..from + 8]);
+        for y in 0..2 {
+            for x in 0..2 {
+                let to = 512 + (1 + y) * 256 + (2 + x) * 4;
+                want[to..to + 4].copy_from_slice(&texel(1 + x, 1 + y).1.to_le_bytes());
+            }
         }
-        assert!(read == want.as_slice(), "the region's rows, and nothing else");
+        for (at, (&actual, expected)) in read.iter().zip(want).enumerate() {
+            assert_eq!(actual, expected, "destination byte {at}");
+        }
+        for object in [list, allocator, queue, target, source, image] {
+            slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        }
+    }
+
+    /// Copies between a sampled RGB9E5 texture and a writable one, in both
+    /// directions, through the title's `CopyTextureRegion` and
+    /// `CopyResource`: boxes from one level and layer to an offset in another
+    /// keep every texel outside them; whole copies take every level and
+    /// layer. Where the adapter writes RGB9E5 natively
+    /// (`Host::rgb9e5_write_format`) both host textures are RGB9E5 and the
+    /// copies keep every bit. Otherwise the writable one is the R11G11B10
+    /// stand-in, the copies convert numerically and each copied texel reads
+    /// back as the CPU oracle's `to_title(to_host(word))`: a colour R11
+    /// cannot hold reads back quantized (a bit copy would keep it, and a
+    /// retained destination its own texels).
+    #[cfg(windows)]
+    #[test]
+    fn rgb9e5_mixed_texture_copies_convert_numerically_in_both_directions() {
+        use crate::rgb9e5::{TEST_COLOURS, to_host, to_title};
+        let host = crate::host::host().expect("RGB9E5 copies require a D3D12 adapter");
+        let native = host.rgb9e5_write_format == RGB9E5;
+        eprintln!("RGB9E5 mixed copies: write_format={} ({})", host.rgb9e5_write_format,
+            if native { "native bit copies" } else { "stand-in numeric conversion" });
+        // 257/64 red loses a mantissa bit in R11; 67/64 blue two in B10.
+        let quantized = [(18 << 27) | 257, (17 << 27) | (67 << 18) | (300 << 9) | 129];
+        let canonical = |word: u32| if native { word } else { to_title(to_host(word)) };
+        for q in quantized {
+            assert_ne!(to_title(to_host(q)), q, "{q:#x} quantizes in the stand-in");
+        }
+        // 8x8, two levels, two layers: subresource `mip + 2 * layer`.
+        const SUBS: usize = 4;
+        const CHUNK: usize = 2048; // 8 rows of 256 bytes
+        let size = |sub: usize| 8usize >> (sub % 2);
+        let source = |sub: usize, x: usize, y: usize| match (x + 3 * y + sub) % 5 {
+            3 => quantized[0],
+            4 => quantized[1],
+            i => TEST_COLOURS[i % 3].0,
+        };
+        let background = |sub: usize, x: usize, y: usize| TEST_COLOURS[(2 * x + y + sub) % 3].0;
+        // CopyTextureRegion: (source sub, box, destination sub, at).
+        let boxes: [(usize, [u32; 6], usize, [u32; 3]); 2] =
+            [(1, [1, 1, 0, 3, 3, 1], 3, [2, 1, 0]), (2, [2, 4, 0, 5, 8, 1], 0, [5, 3, 0])];
+        for native_source in [true, false] {
+            let image = |flags| {
+                copy_test_resource(&ResourceDesc { flags, depth_or_array_size: 2, ..texture(8, 8, RGB9E5, 2) }, 0x400)
+            };
+            let (src, dst) = if native_source { (image(0), image(5)) } else { (image(5), image(0)) };
+            let input = copy_test_resource(&buffer(2 * SUBS as u64 * CHUNK as u64), 0);
+            let output = copy_test_resource(&buffer(2 * SUBS as u64 * CHUNK as u64), 0);
+            let (data, _) = buffer_bytes(input).unwrap();
+            let (out, _) = buffer_bytes(output).unwrap();
+            let len = 2 * SUBS * CHUNK;
+            // SAFETY: both buffers hold `len` bytes; submission is synchronous.
+            let bytes = unsafe { std::slice::from_raw_parts_mut(data, len) };
+            // SAFETY: as above; nothing reads the output until it ran.
+            unsafe { out.write_bytes(0xa5, len) };
+            let put = |bytes: &mut [u8], at: usize, word: u32| bytes[at..at + 4].copy_from_slice(&word.to_le_bytes());
+            let texel_at = |chunk: usize, sub: usize, x: usize, y: usize| (chunk * SUBS + sub) * CHUNK + y * 256 + x * 4;
+            for sub in 0..SUBS {
+                for y in 0..size(sub) {
+                    for x in 0..size(sub) {
+                        put(bytes, texel_at(0, sub, x, y), source(sub, x, y));
+                        put(bytes, texel_at(1, sub, x, y), background(sub, x, y));
+                    }
+                }
+            }
+            let (queue, allocator, list) = copy_test_commands();
+            let copy = slot::<CopyTestRegion>(list, 0x80);
+            let whole = slot::<extern "system" fn(This, This, This)>(list, 0x88);
+            let footprint = |sub: usize, offset: usize| PlacedFootprint {
+                offset: offset as u64,
+                format: RGB9E5,
+                width: size(sub) as u32,
+                height: size(sub) as u32,
+                depth: 1,
+                row_pitch: 256,
+            };
+            let image_at = |resource, sub: usize| CopyTestLocation { resource, kind: 0, footprint: footprint(sub, sub) };
+            let linear = |resource, chunk, sub| CopyTestLocation { resource, kind: 1, footprint: footprint(sub, texel_at(chunk, sub, 0, 0)) };
+            let null = std::ptr::null();
+            for sub in 0..SUBS {
+                copy(list, &image_at(src, sub), 0, 0, 0, &linear(input, 0, sub), null);
+                copy(list, &image_at(dst, sub), 0, 0, 0, &linear(input, 1, sub), null);
+            }
+            let converted = crate::rgb9e5::CONVERTED.load(std::sync::atomic::Ordering::Relaxed);
+            for (from, area, to, at) in boxes {
+                let [x, y, z] = at;
+                copy(list, &image_at(dst, to), x, y, z, &image_at(src, from), area.as_ptr().cast());
+            }
+            for sub in 0..SUBS {
+                copy(list, &linear(output, 0, sub), 0, 0, 0, &image_at(dst, sub), null);
+            }
+            whole(list, dst, src);
+            for sub in 0..SUBS {
+                copy(list, &linear(output, 1, sub), 0, 0, 0, &image_at(dst, sub), null);
+            }
+            // Other tests may convert meanwhile: only the stand-in case counts.
+            if !native {
+                assert!(
+                    crate::rgb9e5::CONVERTED.load(std::sync::atomic::Ordering::Relaxed) >= converted + 3,
+                    "both regions and the whole copy were converted",
+                );
+            }
+            assert_eq!(slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list), S_OK);
+            slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+            let mut expected = vec![0xa5; len];
+            for sub in 0..SUBS {
+                for y in 0..size(sub) {
+                    for x in 0..size(sub) {
+                        let inside = boxes.iter().find_map(|&(from, [l, t, _, r, b, _], to, [ax, ay, _])| {
+                            let (sx, sy) = ((x as u32).checked_sub(ax)? + l, (y as u32).checked_sub(ay)? + t);
+                            (to == sub && sx < r && sy < b).then(|| source(from, sx as usize, sy as usize))
+                        });
+                        let region = inside.map_or(background(sub, x, y), canonical);
+                        put(&mut expected, texel_at(0, sub, x, y), region);
+                        put(&mut expected, texel_at(1, sub, x, y), canonical(source(sub, x, y)));
+                    }
+                }
+            }
+            // SAFETY: the queue finished writing our output.
+            let read = unsafe { std::slice::from_raw_parts(out, len) };
+            for (at, (got, want)) in read.as_chunks::<4>().0.iter().zip(expected.as_chunks::<4>().0).enumerate() {
+                assert_eq!(got, want, "native source {native_source}: chunk {}, sub {}, byte {}",
+                    at * 4 / (SUBS * CHUNK), at * 4 / CHUNK % SUBS, at * 4 % CHUNK);
+            }
+            // SAFETY: a plain query on the live device.
+            unsafe { host.device.GetDeviceRemovedReason() }.expect("mixed copies keep the device");
+            for object in [list, allocator, queue, output, input, dst, src] {
+                slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+            }
+        }
     }
 
     /// Two queues, as Grand Theft Auto VI's: a compute list copies a buffer,
