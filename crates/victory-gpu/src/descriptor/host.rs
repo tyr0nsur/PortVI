@@ -104,6 +104,7 @@ pub(crate) struct HostHeap {
     pub(crate) id: u64,
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
+    gpu: u64,
     step: u32,
     /// Slots mirroring the title's, title slot `i` in host slot `i`; view
     /// heaps have `dynamic` more.
@@ -388,6 +389,7 @@ impl HostHeap {
             id: NEXT_HEAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             heap,
             cpu,
+            gpu,
             step,
             count,
             title_count,
@@ -964,10 +966,8 @@ impl HostHeap {
 
     /// The shader-visible handle of slot `index`.
     pub(crate) fn gpu(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
-        // SAFETY: a live shader-visible heap.
-        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart() };
         D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: start.ptr + u64::from(index) * u64::from(self.step),
+            ptr: self.gpu + u64::from(index) * u64::from(self.step),
         }
     }
 
