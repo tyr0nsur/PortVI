@@ -4,7 +4,7 @@ title = "Native loader probe"
 unit = "runtime imports bound"
 verified = 4
 total = 4
-evidence = "probes/runtime.rs"
+evidence = "tests/fixtures/portvi-smoke.rs"
 
 [upscaler]
 title = "Upscaler compute · RTX 4060"

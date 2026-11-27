@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import unittest
 
-from portvi import build_cache
+from portvi import build_cache, source_revision
 
 
 def directory_link(link, destination):
@@ -36,6 +36,21 @@ class BuildCacheTests(unittest.TestCase):
             self.assertFalse(first.exists())
         with build_cache(self.repo, self.b):
             self.assertFalse(fresh.exists())
+
+    def test_source_edits_change_the_revision_and_build_output_does_not(self):
+        for name in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml"):
+            (self.repo / name).touch()
+        source = self.repo / "crates" / "renderer" / "src"
+        source.mkdir(parents=True)
+        shader = source / "shader.rs"
+        shader.write_text("pub const VALUE: u32 = 1;")
+        first = source_revision(self.repo)
+        output = self.repo / "crates" / "renderer" / "target"
+        output.mkdir()
+        (output / "artifact").touch()
+        self.assertEqual(first, source_revision(self.repo))
+        shader.write_text("pub const VALUE: u32 = 2;")
+        self.assertNotEqual(first, source_revision(self.repo))
 
     def test_active_and_unowned_directories_survive(self):
         with build_cache(self.repo, self.a) as active:

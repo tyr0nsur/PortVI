@@ -1,4 +1,4 @@
-"""Build the pinned native runtime and exercise it with open test programs."""
+"""Build the native Cargo workspace and exercise it with open test programs."""
 import argparse
 from contextlib import contextmanager
 import hashlib
@@ -13,7 +13,6 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parent
-ENGINE = ROOT / "engine"
 WORK = ROOT / ".work"
 TARGET = ROOT / "target"
 EXE = TARGET / "release" / "portvi.exe"
@@ -92,46 +91,25 @@ def build_cache(repo, revision):
         (current / ".portvi-active").rename(current / ".portvi-ready")
 
 
-def git(directory, *args, capture=False):
-    return subprocess.run(
-        ["git", "-C", str(directory), *map(str, args)],
-        check=True, text=True, stdout=subprocess.PIPE if capture else None,
-    ).stdout
-
-
 def native_tree():
-    # The gitlink selects the engine. Moving an upstream branch cannot change a build.
-    entry = git(ROOT, "ls-files", "--stage", "--", "engine", capture=True).split()
-    if len(entry) != 4 or entry[0] != "160000" or entry[2] != "0":
-        raise RuntimeError("The engine gitlink is missing or conflicted.")
-    revision = entry[1]
-    if not (ENGINE / ".git").exists():
-        git(ROOT, "submodule", "update", "--init", "--", "engine")
-    if git(ENGINE, "rev-parse", "HEAD", capture=True).strip() != revision:
-        raise RuntimeError("The engine checkout differs from the gitlink. Check git submodule status.")
-    patches = sorted((ROOT / "patches").glob("*.patch"))
-    identity = hashlib.sha256(revision.encode("ascii"))
-    for patch in patches:
-        identity.update(patch.name.encode("utf-8") + b"\0")
-        identity.update(hashlib.sha256(patch.read_bytes()).digest())
     WORK.mkdir(exist_ok=True)
-    source = WORK / identity.hexdigest()[:20]
-    if source.is_dir():
-        return source
-    with tempfile.TemporaryDirectory(prefix="prepare-", dir=WORK) as staging:
-        checkout = Path(staging) / "engine"
-        git(ROOT, "clone", "--quiet", "--no-checkout", "-c", "core.autocrlf=false",
-            "--", ENGINE, checkout)
-        git(checkout, "checkout", "--quiet", "--detach", revision)
-        for patch in patches:
-            git(checkout, "apply", "--index", "--whitespace=error", patch)
-        try:
-            checkout.rename(source)
-        except OSError:
-            # Another build may have finished preparing the identical input.
-            if not source.is_dir():
-                raise
-    return source
+    return ROOT
+
+
+def source_revision(source):
+    """Key reusable build output on the workspace inputs, including local edits."""
+    files = [source / name for name in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml")]
+    for name in (".cargo", "apps", "crates", "tests", "xtask"):
+        for directory, children, names in os.walk(source / name):
+            children[:] = [child for child in children if child not in {"target", ".git", "__pycache__"}]
+            files.extend(Path(directory) / filename for filename in names)
+
+    digest = hashlib.sha256()
+    for path in sorted(files):
+        digest.update(path.relative_to(source).as_posix().encode("utf-8") + b"\0")
+        with path.open("rb") as stream:
+            digest.update(hashlib.file_digest(stream, "sha256").digest())
+    return digest.hexdigest()[:20]
 
 
 def toolchain(source):
@@ -153,8 +131,6 @@ def toolchain(source):
     rustc = shutil.which("rustc", path=env["PATH"])
     if not cargo or not rustc:
         raise RuntimeError("Both cargo and rustc must be available through rustup.")
-    # Cargo's incremental output must belong to this engine and patch set.
-    env["CARGO_TARGET_DIR"] = str(TARGET / "builds" / source.name)
     return cargo, rustc, "+" + version, env
 
 
@@ -165,7 +141,7 @@ def smoke(executable, rustc, version, env):
         subprocess.run([
             rustc, version, "--edition=2024", "-C", "panic=abort", "-C", "opt-level=2",
             "-C", "link-arg=/ENTRY:probe_entry", "-C", "link-arg=/SUBSYSTEM:CONSOLE",
-            str(ROOT / "probes" / "runtime.rs"), "-o", str(probe),
+            str(ROOT / "tests" / "fixtures" / "portvi-smoke.rs"), "-o", str(probe),
         ], cwd=folder, env=env, check=True)
         # A scratch directory keeps developer settings and saves out of this test.
         run_env = env.copy()
@@ -198,7 +174,7 @@ def main():
         print(source)
         return
     cargo, rustc, version, env = toolchain(source)
-    with build_cache(ROOT, source.name) as cache:
+    with build_cache(ROOT, source_revision(source)) as cache:
         env["CARGO_TARGET_DIR"] = str(cache)
         run_action(args.action, source, cargo, rustc, version, env, args.experimental_barycentrics)
 
