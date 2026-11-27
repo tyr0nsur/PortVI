@@ -20,6 +20,8 @@ jobs:
         run: |
           $version = python -c "import tomllib; print(tomllib.load(open('rust-toolchain.toml', 'rb'))['toolchain']['channel'])"
           rustup toolchain install $version --profile minimal
+      - name: Compile GPU diagnostics fixtures
+        run: cargo test --locked -p victory-gpu --features diagnostics --lib --no-run
       - name: Test the native cache and loader
         run: python portvi.py test
       - name: Execute the open x64 probe
