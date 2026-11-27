@@ -490,6 +490,12 @@ fn copies(
 /// and the subresources detiled into it.
 pub(crate) type Upload = (ID3D12Resource, u64, Vec<u32>);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UploadError {
+    NoStaging,
+    Layout,
+}
+
 /// Runs `f(i)` for each `i` below `n` on up to a quarter of the CPUs (four
 /// at most: the title's own threads need the rest), here when that is
 /// fewer than two.
@@ -557,6 +563,13 @@ impl Staging {
     /// Returns the bytes of title memory read, and the buffer it detiled
     /// into with the subresources detiled.
     fn refresh_now(&self) -> (usize, Option<Upload>) {
+        self.refresh_using(|bytes, subresources| self.detile(bytes, subresources))
+    }
+
+    fn refresh_using<T>(
+        &self,
+        detile: impl Fn(&[u8], &[u32]) -> Result<(T, u64), UploadError>,
+    ) -> (usize, Option<(T, u64, Vec<u32>)>) {
         let all = || (0..self.footprints.len() as u32).collect::<Vec<_>>();
         let size = self.layout.size as usize;
         let start = self.memory as usize;
@@ -622,15 +635,18 @@ impl Staging {
             if fresh.is_empty() {
                 return (bytes, None);
             }
-            let buffer = self.detile(read, &fresh);
-            if buffer.is_none() {
+            let buffer = detile(read, &fresh);
+            if matches!(buffer, Err(UploadError::NoStaging)) {
+                t.retry(&ranges);
+            }
+            if buffer.is_err() {
                 for &i in &fresh {
                     last.hashes[i as usize] = None;
                 }
             }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, bytes as u64);
-            return (bytes, buffer.map(|(b, at)| (b, at, fresh)));
+            return (bytes, buffer.ok().map(|(b, at)| (b, at, fresh)));
         }
         if !committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
@@ -647,7 +663,7 @@ impl Staging {
             }
             let zeros = vec![0u8; size];
             let every = all();
-            let buffer = self.detile(&zeros, &every);
+            let buffer = detile(&zeros, &every).ok();
             last.hash = buffer.is_some().then(|| blake3::hash(&zeros));
             return (0, buffer.map(|(b, at)| (b, at, every)));
         }
@@ -660,18 +676,17 @@ impl Staging {
             return (size, None);
         }
         let every = all();
-        let buffer = self.detile(tiled, &every);
+        let buffer = detile(tiled, &every).ok();
         last.hash = buffer.is_some().then_some(hash);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         (size, buffer.map(|(b, at)| (b, at, every)))
     }
 
-    /// Detiles `subresources` of `tiled` (the texture's memory) into a
-    /// staging buffer (`None` if none could be had or a subresource could
-    /// not be read).
-    fn detile(&self, tiled: &[u8], subresources: &[u32]) -> Option<(ID3D12Resource, u64)> {
-        let (buffer, at, data) = staging_space(self.size)?;
+    /// Detiles `subresources` of `tiled` into a staging buffer. A temporary
+    /// shortage of staging space can be retried without another title write.
+    fn detile(&self, tiled: &[u8], subresources: &[u32]) -> Result<(ID3D12Resource, u64), UploadError> {
+        let (buffer, at, data) = staging_space(self.size).ok_or(UploadError::NoStaging)?;
         #[cfg(feature = "diagnostics")]
         // Scanned only when its message is wanted: a pass over every
         // texture read, in timing runs too.
@@ -701,10 +716,10 @@ impl Staging {
                     .detile(tiled, mip + self.first_mip, slice, linear, pitch, pitch * rows as usize)
             {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
-                return None;
+                return Err(UploadError::Layout);
             }
         }
-        Some((buffer, at))
+        Ok((buffer, at))
     }
 }
 
@@ -883,6 +898,59 @@ mod tests {
         assert!(committed(rw.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
         unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+    }
+
+    /// A temporary loss of upload space must leave an unchanged title
+    /// texture eligible for the next submission. No device is needed here.
+    #[test]
+    fn r8_upload_retries_unchanged_pages_after_staging_is_unavailable() {
+        use crate::watch::{PAGE, tests::{free, pool}, track};
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        struct OwnedPage(usize);
+        impl Drop for OwnedPage {
+            fn drop(&mut self) { free(self.0); }
+        }
+        let memory = OwnedPage(pool(1));
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d, width: 64, height: 32, depth: 1, mips: 1,
+            element_bytes: 1, block: 1, samples: 1, swizzle: Swizzle::LINEAR,
+        }).unwrap();
+        let len = layout.size as usize;
+        assert!(len <= PAGE);
+        // SAFETY: the fixture owns one committed page.
+        unsafe { (memory.0 as *mut u8).write_bytes(0x71, len) };
+        let staging = Staging {
+            size: len as u64,
+            footprints: vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default()],
+            rows: vec![32], layout, mips: 1, first_mip: 0, memory: memory.0 as *const _,
+            tracked: track(memory.0, len, true), spans: vec![(0, len)],
+            last: Mutex::default(), uploads: Default::default(), copied: Default::default(),
+        };
+        // Another resource may sample the same memory; its own successful
+        // copy must stay current when this texture's upload fails.
+        let other = track(memory.0, len, true).expect("tracked comparison copy");
+        assert!(!other.take(memory.0, memory.0 + len).is_empty());
+        assert!(other.clean());
+        for _ in 0..2 {
+            assert!(staging.maybe_changed(), "unchanged pixels still need their first upload");
+            let (_, upload) = staging.refresh_using(|bytes, mips| {
+                assert!(bytes.iter().all(|b| *b == 0x71));
+                assert_eq!(mips, &[0]);
+                Err::<((), u64), _>(UploadError::NoStaging)
+            });
+            assert!(upload.is_none());
+            assert!(other.clean());
+        }
+        let (_, upload) = staging.refresh_using(|bytes, _| Ok((bytes[0], 0)));
+        assert_eq!(upload, Some((0x71, 0, vec![0])));
+        assert!(!staging.maybe_changed(), "success returns the texture to the clean fast path");
+
+        // Invalid layout data does not become valid on the next submission.
+        // SAFETY: the fixture still owns the same committed page.
+        unsafe { (memory.0 as *mut u8).write(0x12) };
+        let (_, upload) = staging.refresh_using(|_, _| Err::<((), u64), _>(UploadError::Layout));
+        assert!(upload.is_none());
+        assert!(!staging.maybe_changed(), "a permanent layout error waits for new title data");
     }
 
     #[test]

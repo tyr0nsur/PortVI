@@ -531,6 +531,16 @@ impl Tracked {
         (copy, zero)
     }
 
+    /// Requeues ranges returned by this tracker's `take` when their upload
+    /// could not run. Other copies and the pages' write tracking are unchanged.
+    pub(crate) fn retry(&self, ranges: &[(usize, usize)]) {
+        let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+        for &(start, end) in ranges {
+            changed.extend(start / PAGE..end.div_ceil(PAGE));
+        }
+        set_dirty(self.changed.2, !changed.is_empty());
+    }
+
     /// Whether page `page` (a page number) changed since it was taken.
     pub(crate) fn changed(&self, page: usize) -> bool {
         self.changed
