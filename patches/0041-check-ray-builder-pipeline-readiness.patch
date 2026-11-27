@@ -1,0 +1,676 @@
+diff --git a/apps/victory/src/run.rs b/apps/victory/src/run.rs
+index 471c0a1a78..7d9303e503 100644
+--- a/apps/victory/src/run.rs
++++ b/apps/victory/src/run.rs
+@@ -119,6 +119,7 @@ pub fn run(
+     for (name, dll) in &dlls {
+         println!("title dll      {name} at {:#x}", dll.base());
+         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
++        victory_gpu::pipeline::note_title_dll(name, dll.base(), dll.info().size_of_image as usize);
+     }
+     let imported: Vec<&str> = image
+         .info()
+@@ -386,6 +387,11 @@ impl LateDlls {
+                     );
+                     show(name, dll.bind_imports(&resolver, self.policy)?);
+                     set_image_path(dll.base(), &self.title_dir.join(name));
++                    victory_gpu::pipeline::note_title_dll(
++                        name,
++                        dll.base(),
++                        dll.info().size_of_image as usize,
++                    );
+                 }
+                 // Visible before their `DllMain`s run, which may load more.
+                 mapped.extend(new.iter().cloned());
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index c44f0369a8..5d7e948254 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -179,18 +179,14 @@ fn dropped(list: &HostList, pipeline: usize, kind: &str) {
+     }
+ }
+ 
+-#[cfg(feature = "diagnostics")]
+ thread_local! {
+     /// Why the draw or dispatch this thread last prepared cannot run.
+     static NOT_RUN: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+ }
+ 
+-/// Notes why the draw or dispatch being prepared cannot run (diagnostics).
++/// Notes why the draw or dispatch being prepared cannot run.
+ fn not_run(why: &'static str) {
+-    #[cfg(feature = "diagnostics")]
+     NOT_RUN.with(|w| w.set(why));
+-    #[cfg(not(feature = "diagnostics"))]
+-    let _ = why;
+ }
+ 
+ /// Dispatches run on the host so far.
+@@ -1100,22 +1096,37 @@ impl State {
+             dropped(list, self.pipeline, "dispatch");
+             return;
+         }
++        // The acceleration-structure builder runs whole or not at all
++        // (`pipeline::builder`).
++        if crate::pipeline::held_back(self.pipeline as This) {
++            once!(
++                "a dispatch of the BVH builder held back: a pipeline of it is not made or a \
++                 dispatch of it was dropped (see the `BVH builder held back` line)"
++            );
++            DROPPED.fetch_add(1, Ordering::Relaxed);
++            #[cfg(feature = "diagnostics")]
++            dropped(list, self.pipeline, "dispatch");
++            return;
++        }
+         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+             once!(
+                 pipeline = format_args!("{:#x}", self.pipeline),
+                 "a dispatch without a host pipeline dropped"
+             );
+             DROPPED.fetch_add(1, Ordering::Relaxed);
++            crate::pipeline::not_dispatched(self.pipeline as This, "no host pipeline");
+             #[cfg(feature = "diagnostics")]
+             dropped(list, self.pipeline, "dispatch");
+             return;
+         };
+         if !p.compute {
+             once!("a dispatch with a graphics pipeline");
++            crate::pipeline::not_dispatched(self.pipeline as This, "a graphics pipeline");
+             return;
+         }
+         if !self.bind(list, p, true) {
+             DROPPED.fetch_add(1, Ordering::Relaxed);
++            crate::pipeline::not_dispatched(self.pipeline as This, NOT_RUN.with(|w| w.get()));
+             #[cfg(feature = "diagnostics")]
+             dropped(list, self.pipeline, "dispatch");
+             return;
+@@ -1715,15 +1726,20 @@ impl State {
+         const INDEXED: u32 = 1;
+         const DISPATCH: u32 = 2;
+         const MESH: u32 = 10;
+-        #[cfg(feature = "diagnostics")]
+         let pipeline = self.pipeline as This;
+         #[cfg(feature = "diagnostics")]
+-        let why = |what: &str| {
++        let note = |what: &str| {
+             crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+             list.note_op(|| format!("DROPPED indirect kind {kind} max {max} ({what}) {}", crate::pipeline::shaders_of(pipeline)));
+         };
+         #[cfg(not(feature = "diagnostics"))]
+-        let why = |_: &str| {};
++        let note = |_: &str| {};
++        // Not run: one of the BVH builder's holds the builder back
++        // (`pipeline::builder`).
++        let why = |what: &str| {
++            crate::pipeline::not_dispatched(pipeline, what);
++            note(what);
++        };
+         // A call with no host pipeline cannot run, and that is the common
+         // case while the world builds its pipelines: #400 measures 1 400-1 750
+         // indirect calls a frame dropped this way. Drop it here, before the
+@@ -1731,6 +1747,10 @@ impl State {
+         // the arguments and dispatch a compute shader for records nothing
+         // reads. Same order as the `is_skipped` check above, for the same
+         // reason.
++        if crate::pipeline::held_back(self.pipeline as This) {
++            note("the BVH builder held back");
++            return false;
++        }
+         if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+             #[cfg(feature = "diagnostics")]
+             crate::pipeline::note_drop(self.pipeline as This);
+@@ -1786,10 +1806,12 @@ impl State {
+         };
+         if !ran {
+             crate::indirect::done(list, &clamped);
+-            #[cfg(feature = "diagnostics")]
+             match crate::pipeline::host_pipeline(self.pipeline as This) {
+                 None => {
++                    crate::pipeline::not_dispatched(pipeline, "no host pipeline");
++                    #[cfg(feature = "diagnostics")]
+                     crate::pipeline::note_drop(self.pipeline as This);
++                    #[cfg(feature = "diagnostics")]
+                     list.note_op(|| format!("DROPPED indirect kind {kind} (no host pipeline) {}", crate::pipeline::shaders_of(pipeline)));
+                 }
+                 Some(p) => why(&format!(
+diff --git a/crates/victory-gpu/src/pipeline.rs b/crates/victory-gpu/src/pipeline.rs
+index e03ca0d261..d60e227ab8 100644
+--- a/crates/victory-gpu/src/pipeline.rs
++++ b/crates/victory-gpu/src/pipeline.rs
+@@ -218,6 +218,10 @@ struct Pipeline {
+     /// (by a worker: the title may release the pipeline meanwhile).
+     #[cfg(windows)]
+     host: Arc<make::Pending>,
++    /// Whether it is one of the title's acceleration-structure builder's
++    /// ([`builder`]).
++    #[cfg(windows)]
++    builder: bool,
+ }
+ const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
+ 
+@@ -256,6 +260,31 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
+     make::ready(&pipeline(this).host)
+ }
+ 
++/// Whether a dispatch with the title pipeline is held back: it is the
++/// acceleration-structure builder's, which does not run this frame
++/// ([`builder::runs`]).
++#[cfg(windows)]
++pub(crate) fn held_back(this: This) -> bool {
++    !this.is_null() && pipeline(this).builder && !builder::runs()
++}
++
++/// A dispatch with the title pipeline was not run on the host (`why`): one
++/// of the acceleration-structure builder's holds the builder back
++/// ([`builder::dropped`]).
++#[cfg(windows)]
++pub(crate) fn not_dispatched(this: This, why: &str) {
++    if !this.is_null() && pipeline(this).builder {
++        builder::dropped(&pipeline(this).host, why);
++    }
++}
++
++/// A title DLL was mapped at `base`, `size` bytes (the acceleration-
++/// structure builder's pipelines are known by its image).
++#[cfg(windows)]
++pub fn note_title_dll(file: &str, base: usize, size: usize) {
++    builder::note_title_dll(file, base, size);
++}
++
+ /// Host pipelines queued and not made yet.
+ #[cfg(windows)]
+ pub(crate) fn making() -> u64 {
+@@ -371,14 +400,21 @@ fn code_of(code: &Bytecode) -> Option<*const [u8]> {
+         .then(|| std::ptr::slice_from_raw_parts(code.code, code.size))
+ }
+ 
++/// `code`: the title's bytecode pointers (by which a pipeline of the
++/// acceleration-structure builder is known, [`builder`]).
+ fn hand_out(
+     shaders: Vec<Arc<Shader>>,
+     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
++    code: &[*const u8],
+     iid: *const Iid,
+     out: *mut This,
+ ) -> HRESULT {
+     tracing::trace!(?shaders, "pipeline state");
+     #[cfg(windows)]
++    let builder = !code.is_empty() && builder::created_by_builder(code);
++    #[cfg(not(windows))]
++    let _ = code;
++    #[cfg(windows)]
+     let host = Arc::new(make::Pending::new(
+         shaders.clone(),
+         graphics,
+@@ -387,11 +423,17 @@ fn hand_out(
+     ));
+     #[cfg(windows)]
+     make::early(&host);
++    #[cfg(windows)]
++    if builder {
++        builder::note(&host);
++    }
+     let pipeline = Box::new(Pipeline {
+         object: Object::new(&FUNCTIONS),
+         packet: [0; 8],
+         #[cfg(windows)]
+         host,
++        #[cfg(windows)]
++        builder,
+         shaders,
+         bound: std::sync::atomic::AtomicBool::new(false),
+     });
+@@ -415,6 +457,7 @@ pub(crate) extern "system" fn create_graphics(
+         shaders,
+         #[cfg(windows)]
+         None,
++        &[],
+         iid,
+         out,
+     )
+@@ -435,6 +478,7 @@ pub(crate) extern "system" fn create_compute(
+         copy("compute", &desc.stage).into_iter().collect(),
+         #[cfg(windows)]
+         None,
++        &[desc.stage.code],
+         iid,
+         out,
+     )
+@@ -514,6 +558,7 @@ pub(crate) extern "system" fn create_stream(
+         shaders,
+         #[cfg(windows)]
+         Some(Box::new(graphics)),
++        &[],
+         iid,
+         out,
+     )
+@@ -581,6 +626,8 @@ static FUNCTIONS: Table<24> = {
+     Table(f)
+ };
+ 
++#[cfg(windows)]
++mod builder;
+ #[cfg(windows)]
+ pub(crate) mod host;
+ #[cfg(windows)]
+@@ -747,6 +794,142 @@ mod tests {
+             .collect()
+     }
+ 
++    /// A compute pipeline the acceleration-structure builder creates (its
++    /// bytecode in the builder's image) is known as the builder's, and its
++    /// dispatches are held back while its host pipeline is not made: here
++    /// never, as its bytes are no shader container. Pipelines of other
++    /// code are never held back.
++    #[cfg(windows)]
++    #[test]
++    fn builder_dispatches_wait_for_every_builder_pipeline() {
++        let _one = builder::test_lock();
++        let code = [0xB0u8; 64];
++        let create = |code: &[u8]| {
++            let desc = ComputeHead {
++                root: std::ptr::null(),
++                stage: Bytecode {
++                    code: code.as_ptr(),
++                    size: code.len(),
++                },
++            };
++            let mut p: This = std::ptr::null();
++            assert_eq!(
++                create_compute(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
++                S_OK
++            );
++            p
++        };
++        builder::note_title_dll("xboxbvhbuilder.DLL", code.as_ptr() as usize, code.len());
++        let p = create(&code);
++        let other_code = [0xC0u8; 64];
++        let other = create(&other_code);
++        builder::note_title_dll("XboxBvhBuilder.dll", 0, 0);
++        assert!(
++            pipeline(p).builder,
++            "its bytecode is in the builder's image"
++        );
++        assert!(!pipeline(other).builder);
++        // Its host pipeline is started at once and refused.
++        let refused = (0..500).any(|_| {
++            std::thread::sleep(std::time::Duration::from_millis(10));
++            make::state(&pipeline(p).host).is_some()
++        });
++        assert!(refused, "the builder's pipeline was started");
++        assert_eq!(make::state(&pipeline(p).host), Some(false));
++        assert!(
++            held_back(p),
++            "one builder pipeline missing: the builder waits"
++        );
++        assert!(!held_back(other));
++        for q in [p, other] {
++            slot::<extern "system" fn(This) -> u32>(q, 0x10)(q);
++        }
++    }
++
++    /// A compute shader that only ends (`s_endpgm`), translated.
++    #[cfg(windows)]
++    fn ending_shader() -> Arc<Shader> {
++        use victory_shader::native::{ComputeIo, NativeProgram, StageIo};
++        use victory_shader::{Container, HwStage, emit, io, ir, resource, structure};
++        let native = NativeProgram {
++            stage: HwStage::Cs,
++            wave64: false,
++            vgprs: 4,
++            layout: Vec::new(),
++            used: Vec::new(),
++            io: StageIo::Cs(ComputeIo {
++                rsrc2: 0,
++                threads: [1, 1, 1],
++            }),
++            code: 0xBF81_0000u32.to_le_bytes().to_vec(),
++        };
++        let c = Container {
++            digest: [0; 16],
++            version: (1, 0),
++            parts: Vec::new(),
++        };
++        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
++        let st = structure::structure(&p).unwrap();
++        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
++        let io = io::raise(&p, &native).unwrap();
++        let host = emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
++        Shader::for_test(
++            "compute",
++            Translated {
++                host,
++                used: native.used,
++            },
++        )
++    }
++
++    /// A dispatch of a made builder pipeline that is dropped all the same
++    /// (as `State::bind` drops one whose root view offset it cannot place)
++    /// holds the builder back at once and in later frames, until the title
++    /// releases that pipeline.
++    #[cfg(windows)]
++    #[test]
++    fn a_dropped_builder_dispatch_holds_the_builder() {
++        let _one = builder::test_lock();
++        let image = [0xB0u8; 64];
++        builder::note_title_dll("XboxBvhBuilder.dll", image.as_ptr() as usize, image.len());
++        let mut p: This = std::ptr::null();
++        assert_eq!(
++            hand_out(
++                vec![ending_shader()],
++                None,
++                &[image.as_ptr()],
++                &PIPELINE_IIDS[0],
++                &mut p
++            ),
++            S_OK
++        );
++        builder::note_title_dll("XboxBvhBuilder.dll", 0, 0);
++        let release = || slot::<extern "system" fn(This) -> u32>(p, 0x10)(p);
++        assert!(pipeline(p).builder);
++        let made = (0..500).find_map(|_| {
++            std::thread::sleep(std::time::Duration::from_millis(10));
++            make::state(&pipeline(p).host)
++        });
++        if made != Some(true) {
++            release();
++            return; // no host GPU here
++        }
++        assert!(
++            !held_back(p),
++            "every builder pipeline made: the builder runs"
++        );
++        not_dispatched(
++            p,
++            "a root view's offset: no root view, or outside title buffers",
++        );
++        assert!(held_back(p), "held back for the rest of the frame");
++        builder::forget_decision();
++        assert!(held_back(p), "and in later frames");
++        release();
++        builder::forget_decision();
++        assert!(builder::runs(), "the pipeline released: the hold is lifted");
++    }
++
+     #[test]
+     fn pipelines_keep_their_shaders() {
+         let (vs, ps) = ([1u8, 2, 3], [4u8; 5]);
+diff --git a/crates/victory-gpu/src/pipeline/builder.rs b/crates/victory-gpu/src/pipeline/builder.rs
+new file mode 100644
+index 0000000000..26830f1ec7
+--- /dev/null
++++ b/crates/victory-gpu/src/pipeline/builder.rs
+@@ -0,0 +1,235 @@
++//! The title's acceleration-structure builder runs whole or not at all.
++//!
++//! `XboxBvhBuilder.dll` builds and refits the ray-tracing structures in
++//! title memory every frame through some fifty compute programs, one
++//! dispatch after another. A dispatch whose host pipeline is missing is
++//! dropped on its own (`State::dispatch`), and some of the builder's are
++//! missing for a long time or for good: refused (64-lane waves on a host of
++//! 32-lane waves), not translated, or still being made. The stages that do
++//! run then work on what the missing ones never wrote, and write the result
++//! into title memory: on fxceless/victory-fork, garbage bounds that crashed
++//! the title. So the builder's dispatches run only in frames where every
++//! pipeline it has created has its host pipeline; otherwise none of them
++//! run (the structures keep what they held). A dispatch of a made pipeline
++//! can still be dropped (`State::bind` fails, say): that holds the builder
++//! back at once, for the rest of the frame and while that pipeline lives.
++//!
++//! Its pipelines are known by where they come from: created by its code (a
++//! return address in its image on the stack) or from bytecode in its image.
++
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::{Arc, Mutex, Weak};
++
++use super::make::{self, Pending};
++
++/// The builder's image, `[start, end)`, once mapped.
++static IMAGE: Mutex<Option<(usize, usize)>> = Mutex::new(None);
++
++/// The builder's file name.
++const FILE: &str = "XboxBvhBuilder.dll";
++
++/// A title DLL was mapped at `base`, `size` bytes: noted if it is the
++/// builder.
++pub fn note_title_dll(file: &str, base: usize, size: usize) {
++    if file.eq_ignore_ascii_case(FILE) {
++        tracing::info!(base = format_args!("{base:#x}"), size, "BVH builder mapped");
++        *IMAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some((base, base + size));
++    }
++}
++
++fn image() -> Option<(usize, usize)> {
++    *IMAGE.lock().unwrap_or_else(|e| e.into_inner())
++}
++
++/// Whether the pipeline being created is the builder's: `code` (the title's
++/// bytecode pointers) lies in its image, or its code is among our callers.
++#[inline(never)]
++pub(crate) fn created_by_builder(code: &[*const u8]) -> bool {
++    let Some((start, end)) = image() else {
++        return false;
++    };
++    let inside = |a: usize| (start..end).contains(&a);
++    if code.iter().any(|&c| inside(c as usize)) {
++        return true;
++    }
++    callers().into_iter().any(inside)
++}
++
++/// Return addresses on the stack, ours first.
++fn callers() -> Vec<usize> {
++    #[cfg(windows)]
++    {
++        use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
++        let mut frames = [std::ptr::null_mut(); 24];
++        // SAFETY: room for that many frames.
++        let n = unsafe {
++            RtlCaptureStackBackTrace(
++                1,
++                frames.len() as u32,
++                frames.as_mut_ptr(),
++                std::ptr::null_mut(),
++            )
++        };
++        frames[..usize::from(n)]
++            .iter()
++            .map(|&f| f as usize)
++            .collect()
++    }
++    #[cfg(not(windows))]
++    Vec::new()
++}
++
++/// One of the builder's pipelines (alive while the title holds it), and
++/// whether a dispatch of it was dropped though it is made.
++struct Noted {
++    pipeline: Weak<Pending>,
++    dropped: bool,
++}
++
++/// The builder's pipelines.
++static PIPELINES: Mutex<Vec<Noted>> = Mutex::new(Vec::new());
++
++/// The builder created pipeline `p`: it counts towards [`runs`], and is
++/// made at once (no frame's wait budget holds it back).
++pub(crate) fn note(p: &Arc<Pending>) {
++    PIPELINES
++        .lock()
++        .unwrap_or_else(|e| e.into_inner())
++        .push(Noted {
++            pipeline: Arc::downgrade(p),
++            dropped: false,
++        });
++    make::begin(p);
++}
++
++/// A dispatch of the builder's pipeline `p` was not run on the host
++/// (`why`): none of the builder's dispatches run for the rest of the frame.
++/// If `p` is made, none run while it lives either; one not made yet holds
++/// the builder back through [`runs`] until it is.
++pub(crate) fn dropped(p: &Arc<Pending>, why: &str) {
++    let frame = crate::frame::current();
++    let mut decided = DECIDED.lock().unwrap_or_else(|e| e.into_inner());
++    if decided.0 == frame {
++        decided.1 = false;
++    }
++    if make::state(p) != Some(true) {
++        return;
++    }
++    let mut pipelines = PIPELINES.lock().unwrap_or_else(|e| e.into_inner());
++    if let Some(n) = pipelines
++        .iter_mut()
++        .find(|n| std::ptr::eq(n.pipeline.as_ptr(), Arc::as_ptr(p)) && !n.dropped)
++    {
++        n.dropped = true;
++        tracing::warn!(
++            frame,
++            why,
++            "BVH builder held back: a dispatch of it was dropped"
++        );
++    }
++}
++
++/// The frame [`runs`] last decided for, and its decision.
++static DECIDED: Mutex<(u64, bool)> = Mutex::new((u64::MAX, true));
++
++/// Whether the builder's dispatches run in the current frame: decided once
++/// per frame, so that a frame never runs part of the builder.
++pub(crate) fn runs() -> bool {
++    static SAID: AtomicBool = AtomicBool::new(false);
++    let frame = crate::frame::current();
++    let mut decided = DECIDED.lock().unwrap_or_else(|e| e.into_inner());
++    if decided.0 == frame {
++        return decided.1;
++    }
++    let (states, dropped): (Vec<Option<bool>>, usize) = {
++        let mut pipelines = PIPELINES.lock().unwrap_or_else(|e| e.into_inner());
++        pipelines.retain(|n| n.pipeline.strong_count() > 0);
++        let states = pipelines
++            .iter()
++            .filter_map(|n| n.pipeline.upgrade())
++            .map(|p| make::state(&p))
++            .collect();
++        (states, pipelines.iter().filter(|n| n.dropped).count())
++    };
++    let open = all_made(&states) && dropped == 0;
++    if open != decided.1 || !SAID.swap(true, Ordering::Relaxed) {
++        let (made, refused) = (
++            states.iter().filter(|s| **s == Some(true)).count(),
++            states.iter().filter(|s| **s == Some(false)).count(),
++        );
++        tracing::info!(
++            frame,
++            pipelines = states.len(),
++            made,
++            refused,
++            dropped,
++            "BVH builder {}",
++            if open {
++                "runs"
++            } else if dropped > 0 {
++                "held back: a dispatch of it was dropped"
++            } else {
++                "held back: not all its pipelines are made"
++            }
++        );
++    }
++    *decided = (frame, open);
++    open
++}
++
++/// Whether every pipeline is made (`Some(true)`); refused ones are
++/// `Some(false)`, those still being made `None`.
++fn all_made(states: &[Option<bool>]) -> bool {
++    states.iter().all(|s| *s == Some(true))
++}
++
++/// Tests that set the builder's image, one at a time; each starts with
++/// no decision made.
++#[cfg(test)]
++pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
++    static LOCK: Mutex<()> = Mutex::new(());
++    let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
++    forget_decision();
++    guard
++}
++
++/// As if a new frame began: [`runs`] decides afresh.
++#[cfg(test)]
++pub(crate) fn forget_decision() {
++    *DECIDED.lock().unwrap_or_else(|e| e.into_inner()) = (u64::MAX, true);
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// The builder runs only when every one of its pipelines is made: one
++    /// refused or still being made holds all of them back.
++    #[test]
++    fn the_builder_runs_only_with_every_pipeline_made() {
++        assert!(all_made(&[]), "no builder: nothing to hold back");
++        assert!(all_made(&[Some(true), Some(true)]));
++        assert!(!all_made(&[Some(true), Some(false)]), "one refused");
++        assert!(!all_made(&[Some(true), None]), "one still being made");
++    }
++
++    /// Pipelines are the builder's by their bytecode in its image, or by
++    /// its code among the callers; not otherwise.
++    #[test]
++    fn builder_pipelines_are_known_by_their_origin() {
++        let _one = test_lock();
++        // A range that holds this test's own code (a caller of the check).
++        let here = builder_pipelines_are_known_by_their_origin as *const () as usize;
++        let elsewhere = [0x7_0000_0000usize as *const u8];
++        *IMAGE.lock().unwrap() = None;
++        assert!(!created_by_builder(&elsewhere), "no builder mapped");
++        // Bytecode inside the image.
++        *IMAGE.lock().unwrap() = Some((0x7_0000_0000, 0x7_0001_0000));
++        assert!(created_by_builder(&elsewhere));
++        assert!(!created_by_builder(&[0x8_0000_0000usize as *const u8]));
++        // A caller inside the image: this function's own code.
++        *IMAGE.lock().unwrap() = Some((here - 0x10_0000, here + 0x10_0000));
++        assert!(created_by_builder(&[]));
++        *IMAGE.lock().unwrap() = None;
++    }
++}
+diff --git a/crates/victory-gpu/src/pipeline/make.rs b/crates/victory-gpu/src/pipeline/make.rs
+index f3d03dd4e6..7514619c58 100644
+--- a/crates/victory-gpu/src/pipeline/make.rs
++++ b/crates/victory-gpu/src/pipeline/make.rs
+@@ -205,6 +205,19 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+     p.made.get()?.as_ref()
+ }
+ 
++/// Starts making `p` now, without waiting for it.
++pub(crate) fn begin(p: &Arc<Pending>) {
++    if !p.shaders.is_empty() {
++        start(p, false);
++    }
++}
++
++/// Whether `p`'s host pipeline is made (`Some(true)`), refused or not
++/// translated (`Some(false)`), or not yet (`None`); never waits.
++pub(crate) fn state(p: &Pending) -> Option<bool> {
++    p.made.get().map(Option::is_some)
++}
++
+ /// Queues `p` for the workers: once, and once more ahead of the early
+ /// starts if a draw waits for it (`now`) while it is still queued.
+ fn start(p: &Arc<Pending>, now: bool) {
+diff --git a/crates/victory-gpu/src/pipeline/placed_uav_tests.rs b/crates/victory-gpu/src/pipeline/placed_uav_tests.rs
+index 69071cac24..915ce083bc 100644
+--- a/crates/victory-gpu/src/pipeline/placed_uav_tests.rs
++++ b/crates/victory-gpu/src/pipeline/placed_uav_tests.rs
+@@ -121,7 +121,7 @@ fn placed_uav_dispatch_writes_its_texture() {
+ 
+     let mut pipeline = std::ptr::null();
+     assert_eq!(
+-        hand_out(vec![store_shader()], None, &PIPELINE_IIDS[0], &mut pipeline),
++        hand_out(vec![store_shader()], None, &[], &PIPELINE_IIDS[0], &mut pipeline),
+         S_OK
+     );
+     let pipeline = Guest(pipeline);

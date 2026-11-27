@@ -22,6 +22,8 @@ The synthetic compute fixture supplies its output address as a byte offset in th
 
 With this binding fix and high-index descriptor mapping both enabled, an experimental scene run lost the D3D12 device during loading. The trace identifies a submission containing two command lists. It does not identify which command failed.
 
+PortVI also tracks the availability of pipelines created by the acceleration-structure builder. The runtime holds its dispatches while a known pipeline is pending or unavailable. If a builder dispatch is dropped, subsequent builder dispatches are held while that pipeline lives. The origin checks and readiness tests passed, including the dropped-dispatch case on WARP. [VIctory PR 2118](https://github.com/Marvisak/VIctory/pull/2118) · [Readiness tests and implementation](../patches/0041-check-ray-builder-pipeline-readiness.patch)
+
 ## Texture copy order and shader masks on 27 November 2026
 
 The texture upload at the start of a submission now sees CPU memory copies recorded before the first GPU use. A copy recorded after a draw takes effect on the next texture upload. The distinction also applies across command lists in the same submission. AvatarManz's texture upload changes prompted this check. The PortVI regression exercises both orders with a BC4 texture and reads back the texels from the GPU. [AvatarManz change](https://github.com/avatarmanz/VIctory-7900XTX/commit/5d6bd84) · [PortVI implementation and readback test](../patches/0033-stage-leading-texture-copies.patch)
