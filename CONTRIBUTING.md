@@ -17,9 +17,9 @@ Follow the [Windows setup](README.md#build-and-run). Use `python portvi.py gpu` 
 
 Include the command, observed and expected result, and a compact, sanitized excerpt. For a frame capture, include the scene, settings, duration, cold or warm cache state, displayed FPS and frame-time percentiles. Both successful and failing reproductions are helpful. [Frame-time protocol](docs/engineering-review.md#measuring-a-30-fps-target)
 
-## Send a patch
+## Change the runtime
 
-Follow the [engine patch instructions](README.md#contribute). Include the smallest reproduction available, expected and observed results before and after the change, and any upstream commit or pull request you built on. Use authored or redistributable inputs. Run the affected tests and `python portvi.py test` before asking for review. If you changed a dashboard result, update its evidence and run `python tools/render_progress.py`.
+Create a branch and edit the Rust workspace directly. The [CLI, renderer and shader translator](README.md#work-on-the-runtime) are in this repository. Include the smallest reproduction available, expected and observed results before and after the change, and any upstream commit or pull request you built on. Use authored or redistributable inputs. Run the affected tests and `python portvi.py test` before asking for review. If you changed a dashboard result, update its evidence and run `python tools/render_progress.py`.
 
 ## Community rules
 

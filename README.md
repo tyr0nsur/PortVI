@@ -20,9 +20,9 @@
   <a href="docs/engineering-review.md">Engineering notes</a>
 </p>
 
-PortVI builds on Marvisak’s VIctory to bring native Windows x64 compatibility to the desktop GeForce RTX 4060 with 8 GB of VRAM. Our first milestone is a complete 1080p scene with the geometry, materials, full-detail textures and ray-traced lighting intact. The performance target for that same scene is 30 rendered frames per second. [Upstream engine](https://github.com/Marvisak/VIctory) · [1080p rendering milestone](https://github.com/tyr0nsur/PortVI/issues/26)
+PortVI builds on Marvisak’s VIctory to bring native Windows x64 compatibility to the desktop GeForce RTX 4060 with 8 GB of VRAM. Our first visual milestone is a reproducible in-game view with the scene geometry, materials, full-detail textures and ray-traced lighting visible. We are targeting 1080p and comparing the same view with the console reference. The performance target for that same scene is 30 rendered frames per second. [Upstream engine](https://github.com/Marvisak/VIctory) · [1080p rendering milestone](https://github.com/tyr0nsur/PortVI/issues/26)
 
-**What runs today.** On the RTX 4060, PortVI has verified high-index resource bindings and 64-bit ray-intersection tests. Earlier scene captures showed partial geometry. A recent experimental build ran for 110 seconds after entering the scene, but its captures showed subtitles on black. Nine shaders in the ray-tracing builder still need working translations on this card. [Resource bindings](https://github.com/tyr0nsur/PortVI/pull/23) · [Ray-intersection tests](https://github.com/tyr0nsur/PortVI/pull/22) · [Scene result](https://github.com/tyr0nsur/PortVI/pull/24)
+**What runs today.** On the RTX 4060, PortVI has verified high-index resource bindings and 64-bit ray-intersection tests. Earlier scene captures showed partial geometry. A recent experimental build ran for 110 seconds after entering the scene, but its captures showed subtitles on black. The RTX 4060 has since created all nine previously refused ray-builder pipelines with Castyan’s candidate translator. Scene lighting still needs verification in PortVI. [Resource bindings](https://github.com/tyr0nsur/PortVI/pull/23) · [Ray-intersection tests](https://github.com/tyr0nsur/PortVI/pull/22) · [Scene result](https://github.com/tyr0nsur/PortVI/pull/24) · [Candidate hardware results](https://github.com/tyr0nsur/PortVI/issues/26#issuecomment-7226052967)
 
 **Help bring up the lighting.** Shader developers can adapt a 64-lane operation and check the values written by the GPU. GeForce owners can run a source-built texture fixture and compare their result with the reference card. We work in English and Spanish. [Pick a task](https://github.com/tyr0nsur/PortVI/issues/26) · [Run your first hardware check](CONTRIBUTING.md#run-a-hardware-check)
 
@@ -32,7 +32,7 @@ The cards show the results of individual tests. The mesh draw checks all four co
 
 <!-- verification:start -->
 <p align="center">
-  <a href="probes/runtime.rs"><img src="docs/assets/progress-loader.svg" width="366" alt="Native loader probe — 4 / 4 runtime imports bound (100%)"></a>
+  <a href="tests/fixtures/portvi-smoke.rs"><img src="docs/assets/progress-loader.svg" width="366" alt="Native loader probe — 4 / 4 runtime imports bound (100%)"></a>
   <a href="docs/engineering-review.md#component-tests"><img src="docs/assets/progress-upscaler.svg" width="366" alt="Upscaler compute · RTX 4060 — 25 / 29 D3D12 pipelines created (86%)"></a>
   <a href="docs/engineering-review.md#wave64-on-a-32-lane-gpu"><img src="docs/assets/progress-split_rows.svg" width="366" alt="Row shuffles · RTX 4060 — 143360 / 143360 lane values matched (100%)"></a>
   <a href="docs/engineering-review.md#bcpack-entropy"><img src="docs/assets/progress-bcpack.svg" width="366" alt="BCPack · independent encoder — 128 / 128 synthetic streams decoded exactly (100%)"></a>
@@ -75,12 +75,12 @@ The cards show the results of individual tests. The mesh draw checks all four co
 Use Windows x64 with Git, Python 3.11+, Rust via rustup, and Visual Studio C++ Build Tools with a Windows SDK. The hardware check requires a physical Direct3D 12 adapter with Shader Model 6.6.
 
 ```powershell
-git clone --recurse-submodules https://github.com/tyr0nsur/PortVI.git
+git clone https://github.com/tyr0nsur/PortVI.git
 cd PortVI
 python portvi.py smoke
 ```
 
-This builds `target\release\portvi.exe`, compiles the [open x64 probe](probes/runtime.rs) and executes it. A successful run prints `title exited with 73`. The wrapper checks that the process also returned 73.
+This builds `target\release\portvi.exe`, compiles the [open x64 probe](tests/fixtures/portvi-smoke.rs) and executes it. A successful run prints `title exited with 73`. The wrapper checks that the process also returned 73.
 
 | Command | What it checks |
 | --- | --- |
@@ -88,9 +88,11 @@ This builds `target\release\portvi.exe`, compiles the [open x64 probe](probes/ru
 | `python portvi.py gpu` | Executes the median shader on the physical adapter and checks its outputs. |
 | `python portvi.py texture` | Streams and samples the BC4 fixture on the physical GPU, then verifies the stale-content control. |
 | `python portvi.py barycentrics` | Draws a projective triangle on the physical GPU and checks both forms of pixel-center interpolation across 120 interior and 120 exterior pixels. Requires Direct3D 12 barycentrics support and the Windows SDK shader compiler (`dxc.exe`). |
-| `python portvi.py build` | Builds the release executable using the pinned engine and Cargo dependencies. |
+| `python portvi.py build` | Builds the release executable from the Rust workspace at the repository root. |
 
 To try direct barycentric reads in a separate runtime, run `python portvi.py smoke --experimental-barycentrics`. It builds `target\release\experimental-barycentrics\portvi.exe` and runs the native probe. The translation assumes Direct3D primitive vertex order. Console hardware can rotate that order, so scene comparisons still require a reference image.
+
+The source-built smoke and hardware fixtures run from this checkout. To decode production BCPack textures, point the VICTORY_BCPACK_TABLES environment variable at your own matching format-table file, or place bcpack-tables.bin beside portvi.exe. [Codec input and provenance](docs/asset-policy.md#project-artwork-and-codec-data)
 
 Textures keep their full mip chains by default. For a memory-constrained run, set `$env:VICTORY_TEXTURE_DROP_MIPS = '1'` before launching the runtime. Values from 1 to 4 omit the largest levels of eligible CPU-filled 2D textures, including arrays and cubes. This reduces fine texture detail. Use `Remove-Item Env:VICTORY_TEXTURE_DROP_MIPS` before a full-detail comparison. [Upstream implementation](https://github.com/fxceless/victory-fork/pull/610)
 
@@ -122,19 +124,14 @@ The census counts runtime and Windows exports. For functions provided by a DLL a
 
 Public reproductions use source and assets you can redistribute. Repeat runs belong on the corresponding tracking issue. Read the [contribution and community guide](CONTRIBUTING.md) before submitting a new report.
 
-<details>
-<summary><strong>Work on an engine patch</strong></summary>
+### Work on the runtime
 
-The `engine` submodule pins the upstream revision. `prepare` prints the path of a working tree with PortVI’s patches staged. Edit an existing engine file there, then export your unstaged change as the next numbered patch.
+Edit the Rust code directly in your checkout. The command-line app lives in [apps/victory](apps/victory), the shader translator in [crates/victory-shader](crates/victory-shader), and the D3D12 renderer in [crates/victory-gpu](crates/victory-gpu). Open a pull request with the changed files and the result of the affected test.
 
 ```powershell
-$source = python portvi.py prepare
-$patchPath = Join-Path $PWD 'patches/0025-description.patch'
-git -C $source diff --output=$patchPath
-python portvi.py test
+cargo test --locked -p victory-shader --lib
+cargo build --release --locked -p victory --bin portvi
 ```
-
-</details>
 
 <details>
 <summary><strong>Update a dashboard result</strong></summary>
@@ -145,4 +142,4 @@ Add the reproducible result to the engineering notes or its tracking issue. Upda
 
 ## Credits and license
 
-Marvisak and the VIctory contributors wrote the native engine. PortVI pins the upstream engine as a Git submodule and maintains its own series of patches and hardware fixtures. Earlier PortVI revisions used LooperSalty’s integration of fxceless’s fork. Their work informed the texture and depth-bounds changes carried forward here. PortVI’s changes and test tools are available under GPL-3.0-or-later. [Pinned engine revision](engine) · [Earlier integration](https://github.com/LooperSalty/victory/commit/fd021bf26a7003749d668e5d9bf6b234bfab2e47) · [fxceless’s fork](https://github.com/fxceless/victory-fork) · [License](LICENSE)
+PortVI builds on the native engine by Marvisak and the VIctory contributors. Its Rust workspace, RTX 4060 changes and hardware fixtures are maintained here. Earlier PortVI revisions used LooperSalty’s integration of fxceless’s fork. Their work informed the texture and depth-bounds changes carried forward here. PortVI’s changes and test tools are available under GPL-3.0-or-later. [Upstream revision](https://github.com/Marvisak/VIctory/commit/63bcca43c6a00a758510398fa43096ce7e4f7df0) · [PortVI patch archive](docs/history/patches) · [Earlier integration](https://github.com/LooperSalty/victory/commit/fd021bf26a7003749d668e5d9bf6b234bfab2e47) · [fxceless’s fork](https://github.com/fxceless/victory-fork) · [License](LICENSE)
