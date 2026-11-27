@@ -1,8 +1,10 @@
 # PortVI project status
 
-Updated 26 November 2026. [Component baseline at `134b1bf`](https://github.com/tyr0nsur/PortVI/tree/134b1bf9b324c19c43958b62a549cfffd1451cd6)
+Updated 27 November 2026. [Component baseline at `134b1bf`](https://github.com/tyr0nsur/PortVI/tree/134b1bf9b324c19c43958b62a549cfffd1451cd6)
 
-PortVI is an experimental Windows x64 compatibility runtime built on Marvisak’s VIctory. Its public work covers native platform bindings, translation to DXIL and repeatable Direct3D 12 hardware checks.
+PortVI targets the desktop GeForce RTX 4060 with 8 GB through VIctory’s native Windows x64 runtime. The first milestone is a correctly lit scene with a measured 1920 × 1080 internal render target and output. The longer-term target is 30 rendered FPS at that quality. [Work on this milestone](https://github.com/tyr0nsur/PortVI/issues/26)
+
+The latest experimental scene run stayed up for 110 seconds. The three world captures showed subtitles on black. Its ray-tracing builder had 44 of 53 pipelines ready. A source translator from the DexNom project translated the nine rejected programs in a CPU comparison. Validating their GPU output on the RTX 4060 is the next step. [Scene experiment](https://github.com/tyr0nsur/PortVI/pull/24) · [Candidate translator](https://github.com/DexNom/VIctory/pull/64)
 
 | Check | Observed result |
 | --- | --- |
