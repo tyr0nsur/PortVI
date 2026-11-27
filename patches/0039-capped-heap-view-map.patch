@@ -1,0 +1,1603 @@
+diff --git a/apps/victory/src/translate.rs b/apps/victory/src/translate.rs
+index 36cf412..b5e04f7 100644
+--- a/apps/victory/src/translate.rs
++++ b/apps/victory/src/translate.rs
+@@ -583,6 +583,7 @@ fn translate(
+                     let marks = emit::Options {
+                         view_marks: true,
+                         host_wave32: checks.wave32,
++                        view_remap: false,
+                     };
+                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
+                         Ok(shader) => {
+diff --git a/crates/victory-gpu/src/descriptor.rs b/crates/victory-gpu/src/descriptor.rs
+index bbf37c2..993c21e 100644
+--- a/crates/victory-gpu/src/descriptor.rs
++++ b/crates/victory-gpu/src/descriptor.rs
+@@ -218,7 +218,14 @@ pub(crate) fn make_read(slots: &[u32]) {
+             .map(|&(_, _, at)| unsafe { &*(at as *const Heap) })
+             .filter(|heap| heap.desc.kind == VIEWS_KIND)
+             .filter_map(|heap| heap.host.get()?.as_ref().map(|host| (heap, host)))
+-            .flat_map(|(heap, host)| slots.iter().filter(|&&i| i < heap.desc.count).filter_map(|&i| host.unmade_placed(i)))
++            // Shaders mark the host slots they read; a title slot past the
++            // direct ones lives in an overflow slot (`HostHeap::title_slot`).
++            .flat_map(|(heap, host)| {
++                slots
++                    .iter()
++                    .filter(|&&i| host.title_slot(i).is_some_and(|t| t < heap.desc.count))
++                    .filter_map(|&i| host.unmade_placed(i))
++            })
+             .collect()
+     };
+     #[cfg(test)]
+@@ -238,8 +245,11 @@ pub(crate) fn make_read(slots: &[u32]) {
+         if heap.desc.kind != VIEWS_KIND {
+             continue;
+         }
+-        for &i in slots.iter().filter(|&&i| i < heap.desc.count) {
+-            host.mirror(i, start + u64::from(i) * u64::from(step), true);
++        for &i in slots {
++            let Some(title) = host.title_slot(i).filter(|&t| t < heap.desc.count) else {
++                continue;
++            };
++            host.mirror(title, start + u64::from(title) * u64::from(step), true);
+             host.stamp_read(i);
+         }
+     }
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index d8ab063..5dcbc91 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -13,12 +13,103 @@ use windows::Win32::Graphics::Dxgi::Common::*;
+ use super::{VIEW_TAG, View, view_at, views_current};
+ use crate::host::host;
+ 
++/// The title slots a view heap was made from, and where title slots past
++/// its direct ones live (`crate::host::Host::view_remap`): a host slot of
++/// the overflow range (`count..count + overflow`) while one holds a view,
++/// none otherwise. After Marvisak/VIctory#3518.
++struct Slots {
++    /// The record (view index and generation) each title slot (all of the
++    /// title heap's) was last made from; 0 for none.
++    made: Vec<u64>,
++    /// Title slot (at or past `count`) to its overflow host slot.
++    to_phys: std::collections::HashMap<u32, u32>,
++    /// Overflow host slot (less `count`) to its title slot; `u32::MAX` free.
++    to_title: Vec<u32>,
++    /// Free overflow host slots, the last freed taken first.
++    free: Vec<u32>,
++}
++
++impl Slots {
++    fn new(title_count: u32, direct: u32, overflow: u32) -> Self {
++        // Only indices that the shader can reach need generation records.
++        let tracked = if overflow == 0 { direct } else { title_count.min(victory_shader::emit::REMAP_VIEWS) };
++        Slots {
++            made: vec![0; tracked as usize],
++            to_phys: std::collections::HashMap::new(),
++            to_title: vec![u32::MAX; overflow as usize],
++            free: (direct..direct + overflow).rev().collect(),
++        }
++    }
++
++    /// The host slot of title slot `title`: itself below `direct`, its
++    /// overflow slot past it; none for one that has none.
++    fn phys_of(&self, direct: u32, title: u32) -> Option<u32> {
++        if title < direct { Some(title) } else { self.to_phys.get(&title).copied() }
++    }
++
++    /// The overflow slot of title slot `title` (at or past `direct`), taken
++    /// for it if it had none: the slot and whether it was taken now; none
++    /// when every overflow slot is taken.
++    fn take_overflow(&mut self, direct: u32, title: u32) -> Option<(u32, bool)> {
++        if let Some(&phys) = self.to_phys.get(&title) {
++            return Some((phys, false));
++        }
++        let phys = self.free.pop()?;
++        self.to_phys.insert(title, phys);
++        self.to_title[(phys - direct) as usize] = title;
++        Some((phys, true))
++    }
++
++    /// Gives back title slot `title`'s overflow slot, if it has one.
++    fn free_overflow(&mut self, direct: u32, title: u32) -> Option<u32> {
++        let phys = self.to_phys.remove(&title)?;
++        self.to_title[(phys - direct) as usize] = u32::MAX;
++        self.free.push(phys);
++        Some(phys)
++    }
++
++    /// The title slot host slot `phys` holds: itself below `direct`, the
++    /// one an overflow slot holds, none for a free one or past them.
++    fn title_of(&self, direct: u32, phys: u32) -> Option<u32> {
++        if phys < direct {
++            return Some(phys);
++        }
++        let t = *self.to_title.get((phys - direct) as usize)?;
++        (t != u32::MAX).then_some(t)
++    }
++}
++
++/// Overflow host slots a capped view heap keeps for title slots past its
++/// direct ones when the title's slots do not all fit
++/// (`crate::host::Host::view_remap`), taken from the title range of
++/// [`capped_layout`] (the dynamic slots and view pairs keep theirs): 2^18,
++/// as upstream, at most half the title range; `VICTORY_VIEW_OVERFLOW=n`
++/// another number. Tables reaching past the direct slots are made afresh
++/// in dynamic slots.
++fn overflow_slots(title: u32) -> u32 {
++    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
++    let n = *N.get_or_init(|| {
++        std::env::var("VICTORY_VIEW_OVERFLOW")
++            .ok()
++            .and_then(|v| v.trim().parse().ok())
++            .unwrap_or(1 << 18)
++    });
++    n.min(title / 2)
++}
++
+ pub(crate) struct HostHeap {
+     pub(crate) heap: ID3D12DescriptorHeap,
+     cpu: usize,
+     step: u32,
+-    /// Slots mirroring the title's; view heaps have `dynamic` more.
++    /// Slots mirroring the title's, title slot `i` in host slot `i`; view
++    /// heaps have `dynamic` more.
+     count: u32,
++    /// The title heap's slots; past `count`, title slots live in the
++    /// overflow range while they hold a view ([`Slots`]), else nowhere.
++    title_count: u32,
++    /// Host slots `count..count + overflow` for title slots past `count`
++    /// (`crate::host::Host::view_remap`; none otherwise).
++    overflow: u32,
+     /// Dynamic slots from `base` (none in sampler heaps): [`DYNAMIC`],
+     /// fewer only in a capped heap too small for it ([`capped_layout`]).
+     dynamic: u32,
+@@ -33,8 +124,9 @@ pub(crate) struct HostHeap {
+     /// (`victory_shader::emit::heap_views`): indices below it exist, the
+     /// stride and mark tables cover them, the null views lie just below it.
+     views: u32,
+-    /// The record (view index and generation) each slot was last made from.
+-    made: Mutex<Vec<u64>>,
++    /// The record each title slot was last made from, and the overflow
++    /// slots title slots past `count` hold.
++    slots: Mutex<Slots>,
+     /// The host resource each slot views, held while the slot does: shaders
+     /// index heaps directly, so a slot the title has not rewritten since it
+     /// released the resource may still be read, and a freed host resource
+@@ -67,6 +159,11 @@ pub(crate) struct HostHeap {
+     /// [`write_address`]): the buffer, its mapping and host address, made on
+     /// first use.
+     addresses: std::sync::OnceLock<Option<(ID3D12Resource, usize, u64)>>,
++    /// View heaps whose shaders read title slots through the view-remap
++    /// table (`victory_shader::emit::VIEW_REMAP`): a dword per title slot
++    /// below `REMAP_VIEWS`, its host slot (the last, null, for none); made
++    /// on first use, then kept as slots are taken and given back.
++    remap: std::sync::OnceLock<Option<(ID3D12Resource, usize)>>,
+     /// What the title slots view that title memory feeds (`crate::bindless`).
+     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
+ }
+@@ -157,6 +254,10 @@ impl HostHeap {
+     /// host makes unless it is `HEAP_VIEWS_MAX`.
+     fn sized(sampler: bool, count: u32, views: u32) -> Option<Self> {
+         let host = host()?;
++        let title_count = count;
++        // Title slots past the direct ones live in an overflow range,
++        // shaders reading them through the view-remap table.
++        let remap = !sampler && host.view_remap;
+         let kind = if sampler {
+             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
+         } else {
+@@ -221,7 +322,16 @@ impl HostHeap {
+             // Every slot a shader can come to exists, the null ones last;
+             // the title's slots that fit beside the dynamic ones and pairs.
+             let (title, dynamic, _) = capped_layout(views);
+-            if count > title {
++            if count > title && remap && !uncapped {
++                let overflow = overflow_slots(title);
++                tracing::info!(
++                    count,
++                    direct = title - overflow,
++                    overflow,
++                    dynamic,
++                    "host view heap capped at {views}: the title's slots past the direct ones are remapped into the overflow slots"
++                );
++            } else if count > title {
+                 // shortcut: the title's slots past the host's are left out
+                 // (shaders taking them from the heap itself read the null
+                 // last slot; tables reaching there are made afresh,
+@@ -233,8 +343,14 @@ impl HostHeap {
+             // this heap) shaders have no title bound: the dynamic slots
+             // follow the title's, as there.
+             let base = if uncapped { count.min(title) } else { title };
++            // With the remap, the overflow range ends at `title` (`base`).
++            let direct = if remap && !uncapped && count > title {
++                title - overflow_slots(title)
++            } else {
++                count.min(title)
++            };
+             match make(views) {
+-                Ok(heap) => (heap, count.min(title), dynamic, base),
++                Ok(heap) => (heap, direct, dynamic, base),
+                 Err(e) => {
+                     tracing::warn!(error = %e, count, views, "no host descriptor heap");
+                     return None;
+@@ -262,16 +378,20 @@ impl HostHeap {
+         // Where shaders translated for `views` read the null raw SRV, the
+         // null raw UAV below it (`victory_shader::emit::null_buffer_view`).
+         let null = views.saturating_sub(2);
++        // Title slots past the direct ones, up to `base` (the remap's).
++        let overflow = if remap && title_count > count { base.saturating_sub(count) } else { 0 };
+         let h = HostHeap {
+             heap,
+             cpu,
+             step,
+             count,
++            title_count,
++            overflow,
+             dynamic: extra,
+             base,
+             sampler,
+             views,
+-            made: Mutex::new(vec![0; count as usize]),
++            slots: Mutex::new(Slots::new(title_count, count, overflow)),
+             // Slots from `count` to `base` stay null and hold nothing.
+             kept: Mutex::new(vec![None; (base + extra) as usize]),
+             next: Mutex::new((0, vec![false; extra as usize])),
+@@ -284,6 +404,7 @@ impl HostHeap {
+             strides,
+             marks,
+             addresses: std::sync::OnceLock::new(),
++            remap: std::sync::OnceLock::new(),
+             viewed: Default::default(),
+         };
+         if !sampler {
+@@ -464,6 +585,11 @@ impl HostHeap {
+         self.count
+     }
+ 
++    /// Lowest physical index that can hold a freshly materialized root table.
++    pub(crate) fn first_dynamic(&self) -> u32 {
++        self.base
++    }
++
+     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
+     /// returned).
+     ///
+@@ -564,7 +690,7 @@ impl HostHeap {
+         self.set_stride(index, None);
+         self.set_mark(index, None);
+         self.note_address(index, None);
+-        if index < self.count {
++        if index < self.count + self.overflow {
+             self.viewed.set(index, None, false);
+         }
+     }
+@@ -614,6 +740,67 @@ impl HostHeap {
+         self.marks.as_ref().map(|(buffer, _)| buffer)
+     }
+ 
++    /// The view-remap table, for root SRV `VIEW_REMAP`
++    /// (`victory_shader::emit::Options::view_remap`), made on first use
++    /// from the slots taken so far: title slot `i` (below `REMAP_VIEWS`) to
++    /// its host slot, the heap's last (null) for one it has none for.
++    /// None for sampler heaps.
++    pub(crate) fn remap(&self) -> Option<&ID3D12Resource> {
++        if self.sampler {
++            return None;
++        }
++        if let Some(made) = self.remap.get() {
++            return made.as_ref().map(|(buffer, _)| buffer);
++        }
++        // Filled while the slots are locked: a slot taken or given back
++        // meanwhile either enters this snapshot or writes the mapped table.
++        let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
++        let made = self.remap.get_or_init(|| {
++            let len = victory_shader::emit::REMAP_VIEWS as usize;
++            let (buffer, data) = host()?.upload_buffer(len as u64 * 4)?;
++            crate::host::name(&buffer, || "view remap".into());
++            let null = self.views - 1;
++            // SAFETY: `len` dwords of our fresh mapping.
++            let table = unsafe { std::slice::from_raw_parts_mut(data.cast::<u32>(), len) };
++            let direct = (self.count as usize).min(len);
++            for (i, entry) in table[..direct].iter_mut().enumerate() {
++                *entry = i as u32;
++            }
++            table[direct..].fill(null);
++            for (&title, &phys) in &slots.to_phys {
++                if let Some(entry) = table.get_mut(title as usize) {
++                    *entry = phys;
++                }
++            }
++            Some((buffer, data as usize))
++        });
++        made.as_ref().map(|(buffer, _)| buffer)
++    }
++
++    /// Title slot `title` now lives in host slot `phys` (the heap's last,
++    /// null, for none) in the view-remap table, if it is made.
++    fn write_remap(&self, title: u32, phys: u32) {
++        if title < victory_shader::emit::REMAP_VIEWS
++            && let Some(Some((_, data))) = self.remap.get()
++        {
++            // SAFETY: a dword of the mapped table, which has `REMAP_VIEWS`.
++            unsafe { (*data as *mut u32).add(title as usize).write_volatile(phys) };
++        }
++    }
++
++    /// The title slot host slot `phys` holds: itself among the direct ones,
++    /// the one an overflow slot holds; none for a free overflow slot or a
++    /// host slot of the heap's own (dynamic, pairs, null).
++    pub(crate) fn title_slot(&self, phys: u32) -> Option<u32> {
++        if phys < self.count {
++            return Some(phys);
++        }
++        if phys >= self.count + self.overflow {
++            return None;
++        }
++        self.slots.lock().unwrap_or_else(|e| e.into_inner()).title_of(self.count, phys)
++    }
++
+     /// Slot `index` now views `resource` (or nothing of the host's).
+     fn keep(&self, index: u32, resource: Kept) {
+         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+@@ -648,7 +835,7 @@ impl HostHeap {
+         }
+         // Publish while the mirrored slots are still locked. A concurrent
+         // replacement either enters this snapshot or updates the mapped table.
+-        let slots = self.made.lock().unwrap_or_else(|e| e.into_inner());
++        let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+         let made = self.addresses.get_or_init(|| {
+             // The view is a root view, which has no bounds: an entry for
+             // every slot a table can lie in, the dynamic ones too (a table
+@@ -662,9 +849,14 @@ impl HostHeap {
+             // slots must read zero even if the allocator reused a buffer.
+             unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+             let data = data as usize;
+-            for (i, &key) in slots.iter().enumerate().filter(|(_, key)| **key != 0) {
+-                let view = view_at(key as u32, (key >> 32) as u32);
+-                write_address(data, i, view.as_ref());
++            // Entries by host slot: a title slot's where it lives.
++            for (i, &key) in slots.made.iter().enumerate().filter(|(_, key)| **key != 0) {
++                if let Some(phys) = slots.phys_of(self.count, i as u32)
++                    && phys < self.address_slots()
++                {
++                    let view = view_at(key as u32, (key >> 32) as u32);
++                    write_address(data, phys as usize, view.as_ref());
++                }
+             }
+             // Dynamic slots are entered as they are made ([`Self::make_at`],
+             // [`Self::make_null`], raw views); until then they read zero.
+@@ -785,10 +977,10 @@ impl HostHeap {
+             (first..last).map(|i| unsafe { (at(i) as *const [u32; 3]).read_unaligned() }).collect();
+         let current = views_current(&records);
+         let stale: Vec<u32> = {
+-            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
++            let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+             (first..last)
+                 .zip(records.iter().zip(current))
+-                .filter(|&(i, (&[_, view, generation], current))| match made.get(i as usize) {
++                .filter(|&(i, (&[_, view, generation], current))| match slots.made.get(i as usize) {
+                     Some(&m) if current => m != u64::from(generation) << 32 | u64::from(view),
+                     Some(&m) => m != 0,
+                     None => true,
+@@ -806,7 +998,10 @@ impl HostHeap {
+     /// views are made only for draws (`for_draw`), which also copy their
+     /// data: a host copy of a buffer is made on first use.
+     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+-        if index >= self.count {
++        if index >= self.title_count {
++            return None;
++        }
++        if index >= self.count && (self.overflow == 0 || index >= victory_shader::emit::REMAP_VIEWS) {
+             // A title slot the host heap has none for (a capped heap,
+             // NVIDIA): shaders taking it from the heap itself read the null
+             // last slot (`victory_shader::emit::title_views`), tables
+@@ -835,14 +1030,26 @@ impl HostHeap {
+         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+         // Generations start at 1, so a made slot's key is never 0.
+         let key = u64::from(generation) << 32 | u64::from(i);
+-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
++        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+         let Some(view) = view else {
+             // Not a view of ours (never written, or of a resource the
+-            // title released): nothing to read.
+-            if made[index as usize] != 0 {
+-                made[index as usize] = 0;
+-                self.make_null(index);
++            // title released): nothing to read. A title slot past the
++            // direct ones gives its overflow slot back, which shaders then
++            // stop reaching (the remap's null); what it viewed is retired
++            // with the work that may still read it (`keep`).
++            if slots.made[index as usize] != 0 {
++                slots.made[index as usize] = 0;
++                let phys = if index < self.count {
++                    Some(index)
++                } else {
++                    let freed = slots.free_overflow(self.count, index);
++                    self.write_remap(index, self.views - 1);
++                    freed
++                };
++                if let Some(phys) = phys {
++                    self.make_null(phys);
++                }
+             }
+             return None;
+         };
+@@ -850,11 +1057,16 @@ impl HostHeap {
+         // the slot through a table; until then the slot is not made again
+         // (heap syncs revisit it at every submission). Also re-mirror if a
+         // later unordered or renderable view upgraded the memory's HostTexture.
+-        let needs_remake = || {
++        let needs_remake = |phys: Option<u32>| {
++            // A title slot past the direct ones without an overflow slot
++            // yet (all were taken when it was made): try again.
++            let Some(phys) = phys else {
++                return true;
++            };
+             if !for_draw || !is_texture(&view) {
+                 return false;
+             }
+-            let held = self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize]
++            let held = self.kept.lock().unwrap_or_else(|e| e.into_inner())[phys as usize]
+                 .as_ref()
+                 .map(|(res, _)| windows::core::Interface::as_raw(res));
+             let Some(held) = held else {
+@@ -875,7 +1087,7 @@ impl HostHeap {
+                     })
+                 })
+         };
+-        if made[index as usize] == key && !needs_remake() {
++        if slots.made[index as usize] == key && !needs_remake(slots.phys_of(self.count, index)) {
+             return Some(view);
+         }
+         // Shaders index the heap itself (`crate::bindless`): buffer views
+@@ -889,20 +1101,44 @@ impl HostHeap {
+             // What the view needs (the texture it views, the copy of the
+             // memory) is made without the slot lock, which title threads
+             // binding and writing views wait on (run evict5).
+-            drop(made);
++            drop(slots);
+             prepare(&view);
+-            made = self.made.lock().unwrap_or_else(|e| e.into_inner());
++            slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+             // The title may have written another record there meanwhile (and
+             // another thread made it): that one is the slot's.
+             // SAFETY: as above.
+             if unsafe { (handle as *const [u32; 3]).read_unaligned() } != [tag, i, generation] {
+-                drop(made);
++                drop(slots);
+                 return self.mirror(index, handle, for_draw);
+             }
+-            if made[index as usize] == key && !needs_remake() {
++            if slots.made[index as usize] == key && !needs_remake(slots.phys_of(self.count, index)) {
+                 return Some(view);
+             }
+         }
++        // The host slot: the title slot itself, or past the direct ones an
++        // overflow slot, entered in the view-remap table when taken.
++        let index_title = index;
++        let index = if index < self.count {
++            index
++        } else {
++            let Some((phys, taken)) = slots.take_overflow(self.count, index) else {
++                static FULL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++                let n = FULL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++                if n.is_power_of_two() {
++                    tracing::warn!(
++                        index,
++                        overflow = self.overflow,
++                        n,
++                        "every overflow slot of the host view heap is taken: this title slot reads nothing (VICTORY_VIEW_OVERFLOW)"
++                    );
++                }
++                return None;
++            };
++            if taken {
++                self.write_remap(index, phys);
++            }
++            phys
++        };
+         {
+             self.set_stride(index, Some(&view));
+             self.note_address(index, Some(&view));
+@@ -910,7 +1146,7 @@ impl HostHeap {
+                 // Made once a shader reads it (`crate::shadow::take_reads`).
+                 crate::shadow::forget_read(index);
+             }
+-            made[index as usize] = key;
++            slots.made[index_title as usize] = key;
+             let (kept, mark) = if later {
+                 (None, None)
+             } else {
+@@ -933,10 +1169,15 @@ impl HostHeap {
+     /// a slot never made or left null.
+     #[cfg(feature = "diagnostics")]
+     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
+-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
++        let (key, phys) = {
++            let slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
++            (*slots.made.get(index as usize)?, slots.phys_of(self.count, index))
++        };
+         // A view the host could not make leaves a null view, its record
+         // noted all the same; it keeps no resource.
+-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(Option::is_some);
++        let kept = phys.is_some_and(|p| {
++            self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(p as usize).is_some_and(Option::is_some)
++        });
+         if key == 0 || (!kept && !self.sampler) {
+             return Some("null".into());
+         }
+@@ -971,16 +1212,21 @@ impl HostHeap {
+                 })
+                 .collect()
+         };
+-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
++        let made = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+         for index in slots {
+-            let key = made.get(index as usize).copied().unwrap_or(0);
++            // The record of the title slot this host slot holds.
++            let key = made
++                .title_of(self.count, index)
++                .filter(|_| index < self.count + self.overflow)
++                .and_then(|t| made.made.get(t as usize).copied())
++                .unwrap_or(0);
+             let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten();
+             match &view {
+                 Some(v) => null_for(v, self.cpu(index)),
+                 None => null_view(self.cpu(index)),
+             }
+             self.keep(index, None);
+-            if index < self.count {
++            if index < self.count + self.overflow {
+                 self.viewed.set(index, view.as_ref(), false);
+                 crate::shadow::forget_read(index);
+             }
+@@ -997,19 +1243,23 @@ impl HostHeap {
+             .collect()
+     }
+ 
+-    /// The view of slot `index` if it is a placed texture's left without a
+-    /// host view (made when read).
++    /// The view of host slot `index` if it is a placed texture's left
++    /// without a host view (made when read).
+     pub(crate) fn unmade_placed(&self, index: u32) -> Option<View> {
+-        let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
++        let title = self.title_slot(index)?;
++        let key = *self.slots.lock().unwrap_or_else(|e| e.into_inner()).made.get(title as usize)?;
+         let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten()?;
+         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some_and(Option::is_some);
+         (is_placed_texture(&view) && !kept).then_some(view)
+     }
+ 
+-    /// A shader read slot `index` through the heap: the texture it views
+-    /// was used now.
++    /// A shader read host slot `index` through the heap: the texture it
++    /// views was used now.
+     pub(crate) fn stamp_read(&self, index: u32) {
+-        let key = self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).copied().unwrap_or(0);
++        let Some(title) = self.title_slot(index) else {
++            return;
++        };
++        let key = self.slots.lock().unwrap_or_else(|e| e.into_inner()).made.get(title as usize).copied().unwrap_or(0);
+         let Some(view) = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten() else {
+             return;
+         };
+@@ -1021,16 +1271,24 @@ impl HostHeap {
+         }
+     }
+ 
+-    /// Whether slot `index` was made from a record (tests).
++    /// Whether title slot `index` was made from a record (tests).
+     #[cfg(test)]
+     pub(crate) fn made(&self, index: u32) -> bool {
+-        self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != 0
++        self.slots.lock().unwrap_or_else(|e| e.into_inner()).made.get(index as usize).is_some_and(|&key| key != 0)
+     }
+ 
+-    /// Whether slot `index` holds a host view of a resource (tests).
++    /// Whether title slot `index` holds a host view of a resource where it
++    /// lives (tests).
+     #[cfg(test)]
+     pub(crate) fn kept(&self, index: u32) -> bool {
+-        self.kept.lock().unwrap_or_else(|e| e.into_inner())[index as usize].is_some()
++        let phys = self.slots.lock().unwrap_or_else(|e| e.into_inner()).phys_of(self.count, index);
++        phys.is_some_and(|p| self.kept.lock().unwrap_or_else(|e| e.into_inner())[p as usize].is_some())
++    }
++
++    /// The host slot title slot `index` lives in (tests).
++    #[cfg(test)]
++    pub(crate) fn phys(&self, index: u32) -> Option<u32> {
++        self.slots.lock().unwrap_or_else(|e| e.into_inner()).phys_of(self.count, index)
+     }
+ }
+ 
+@@ -3079,4 +3337,129 @@ mod tests {
+         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+         assert_eq!(host.log_messages(), None);
+     }
++
++    #[test]
++    fn generation_records_cover_only_reachable_logical_slots() {
++        assert_eq!(Slots::new(4096, 16, 0).made.len(), 16);
++        assert_eq!(Slots::new(256, 16, 8).made.len(), 256);
++        let limit = victory_shader::emit::REMAP_VIEWS;
++        assert_eq!(Slots::new(limit + 8, 16, 8).made.len(), limit as usize);
++    }
++
++    #[test]
++    fn capped_view_heap_remaps_high_slots_and_recycles_overflow_entries() {
++        let Some(host) = host() else {
++            return; // no host GPU
++        };
++        if !host.view_remap {
++            return; // uncapped hosts keep every title slot direct
++        }
++        let null = std::ptr::null();
++        // 1,245,184 title view slots (> 1,000,000 `PORTABLE_VIEWS`).
++        let total_title_slots: u32 = 1_245_184;
++        let heap_desc: [u32; 8] = [0, total_title_slots, 1, 0, 0, 0, 0, 0];
++        let mut raw_heap = null;
++        assert_eq!(
++            crate::descriptor::create_heap(
++                null,
++                heap_desc.as_ptr().cast(),
++                &crate::descriptor::HEAP_IIDS[0],
++                &mut raw_heap
++            ),
++            crate::object::S_OK
++        );
++        let title_heap = crate::descriptor::heap(raw_heap);
++        let h = title_heap.host().expect("capped host view heap");
++        assert_eq!(h.count(), capped_layout(h.views).0 - overflow_slots(capped_layout(h.views).0));
++        assert_eq!(h.overflow, overflow_slots(capped_layout(h.views).0));
++        assert_eq!(h.dynamic, capped_layout(h.views).1);
++
++        // Initialize `remap` and `view_addresses` so live updates are verified too.
++        assert!(h.remap().is_some());
++        assert!(h.view_addresses().is_some());
++        let remap_ptr = h.remap.get().unwrap().as_ref().unwrap().1 as *const u32;
++        let stride_ptr = h.strides.as_ref().unwrap().1 as *const u32;
++
++        // Register a 64 KiB page of title memory so placed buffer views build real SRVs.
++        let pool = crate::watch::tests::pool(1);
++        let base_va = pool as u64;
++        crate::shadow::register(pool, base_va, crate::watch::PAGE as u64);
++
++        let mut buf_res = [0u32; 14];
++        (buf_res[0], buf_res[4]) = (1, 256);
++        let mut buf_desc = [0u32; 16];
++        (buf_desc[1], buf_desc[2], buf_desc[6], buf_desc[7]) =
++            (1, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 16, 16);
++        (buf_desc[10], buf_desc[11]) = (base_va as u32, (base_va >> 32) as u32);
++
++        let high_slots = [737_856u32, 950_000, 1_200_000];
++        let mut phys_assigned = Vec::new();
++        for &slot_idx in &high_slots {
++            let handle = title_heap.start + u64::from(slot_idx) * 32;
++            crate::descriptor::create_placed_srv(null, &buf_res, &buf_desc, handle);
++            assert!(h.made(slot_idx), "high slot {slot_idx} recorded");
++            assert!(h.kept(slot_idx), "high slot {slot_idx} holds host SRV");
++
++            // SAFETY: `slot_idx < REMAP_VIEWS` in mapped upload buffer.
++            let phys = unsafe { remap_ptr.add(slot_idx as usize).read_volatile() };
++            assert!(
++                phys >= h.count() && phys < h.count() + h.overflow,
++                "high slot {slot_idx} mapped to overflow slot {phys}"
++            );
++            assert_eq!(h.title_slot(phys), Some(slot_idx));
++            assert_eq!(h.phys(slot_idx), Some(phys));
++            assert_eq!(h.address_at(phys), Some(base_va));
++            // SAFETY: `phys < HEAP_VIEWS` in mapped stride table.
++            let stride = unsafe { stride_ptr.add(phys as usize).read_volatile() };
++            assert_eq!(stride, 16);
++            phys_assigned.push(phys);
++        }
++
++        // Placed texture in a high slot (`1,210,000`): deferred on `mirror(false)`,
++        // materialized when `make_read(&[phys])` runs with the physical overflow slot!
++        let tex_slot: u32 = 1_210_000;
++        let tex_va = placed_memory();
++        let tex_res = placed_tex_desc(4, 4, 28, 0);
++        let tex_desc = placed_tex_srv_desc(tex_va, 28);
++        let tex_handle = title_heap.start + u64::from(tex_slot) * 32;
++        crate::descriptor::create_placed_srv(null, &tex_res, &tex_desc, tex_handle);
++        assert!(h.made(tex_slot));
++        assert!(!h.kept(tex_slot), "placed texture deferred until read");
++        // SAFETY: `tex_slot < REMAP_VIEWS`.
++        let tex_phys = unsafe { remap_ptr.add(tex_slot as usize).read_volatile() };
++        assert_eq!(h.title_slot(tex_phys), Some(tex_slot));
++        crate::descriptor::make_read(&[tex_phys]);
++        assert!(h.kept(tex_slot), "make_read materialized high-slot placed texture");
++
++        // Clearing a high slot resets `remap[slot]` to `CAPPED_HEAP_VIEWS - 1` and returns
++        // its physical overflow slot to the free list for reuse.
++        let cleared = high_slots[1];
++        let freed_phys = phys_assigned[1];
++        let cleared_handle = title_heap.start + u64::from(cleared) * 32;
++        // SAFETY: valid descriptor slot in `title_heap`.
++        unsafe { std::ptr::write_bytes(cleared_handle as *mut u8, 0, 32) };
++        h.sync_slots(cleared, cleared + 1, title_heap.start, 32);
++        assert!(!h.made(cleared) && !h.kept(cleared));
++        // SAFETY: `cleared < REMAP_VIEWS`.
++        let unmapped = unsafe { remap_ptr.add(cleared as usize).read_volatile() };
++        assert_eq!(unmapped, h.views - 1);
++        assert_eq!(h.title_slot(freed_phys), None);
++
++        // Next high slot reuses `freed_phys` (LIFO free list).
++        let next_high: u32 = 1_220_000;
++        let next_handle = title_heap.start + u64::from(next_high) * 32;
++        crate::descriptor::create_placed_srv(null, &buf_res, &buf_desc, next_handle);
++        // SAFETY: `next_high < REMAP_VIEWS`.
++        let reused_phys = unsafe { remap_ptr.add(next_high as usize).read_volatile() };
++        assert_eq!(reused_phys, freed_phys);
++        assert_eq!(h.title_slot(reused_phys), Some(next_high));
++
++        // SAFETY: plain device check.
++        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
++
++        eprintln!("high texture descriptors mapped, materialized, cleared and reused on the capped adapter");
++        crate::descriptor::release(raw_heap);
++        crate::shadow::unregister(pool, base_va);
++        crate::watch::tests::free(pool);
++    }
+ }
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 209637f..6deecc2 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -806,15 +806,22 @@ impl State {
+             }
+             for (views, kind) in [(&stage.root_cbvs, 0), (&stage.root_srvs, 1), (&stage.root_uavs, 2)] {
+                 for &(slot, param) in views {
+-                    if kind == 1 && slot == victory_shader::emit::VIEW_STRIDES {
+-                        // The bound view heap's stride table; without one
+-                        // the shader would read an unbound root view.
++                    if kind == 1
++                        && matches!(slot, victory_shader::emit::VIEW_STRIDES | victory_shader::emit::VIEW_REMAP)
++                    {
++                        // The bound view heap's stride or remap table; without
++                        // one the shader would read an unbound root view.
+                         let heap = (self.heaps[0] != 0)
+                             .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+                             .flatten();
+-                        let Some(table) = heap.and_then(|h| h.strides()) else {
+-                            once!("a shader reads view strides without a view heap: dropped");
+-                            not_run("view strides without a view heap");
++                        let table = if slot == victory_shader::emit::VIEW_STRIDES {
++                            heap.and_then(|h| h.strides())
++                        } else {
++                            heap.and_then(|h| h.remap())
++                        };
++                        let Some(table) = table else {
++                            once!("a shader reads view strides or the view remap without a view heap: dropped");
++                            not_run("view strides or remap without a view heap");
+                             return false;
+                         };
+                         list.keep(table);
+@@ -1302,7 +1309,7 @@ impl State {
+             let Some(host) = heap.host() else {
+                 continue;
+             };
+-            let (start, end) = fresh_range(entries.iter().map(|u| u.table_offset_dwords / 8), host.count());
++            let (start, end) = fresh_range(entries.iter().map(|u| u.table_offset_dwords / 8), host.first_dynamic());
+             let n = end - start;
+             let metadata = view_addresses && entries.iter().any(|u| u.kind != ResourceType::Sampler);
+             if metadata && host.view_addresses().is_none() {
+@@ -2039,8 +2046,8 @@ const QUAD_STRIP: u32 = 20;
+ 
+ /// Entries mirrored into a fresh table. The first used offset cannot
+ /// exceed the lowest dynamic slot, since the root table base is unsigned.
+-fn fresh_range(entries: impl Iterator<Item = u32> + Clone, mirrored: u32) -> (u32, u32) {
+-    let start = entries.clone().min().unwrap_or(0).min(mirrored);
++fn fresh_range(entries: impl Iterator<Item = u32> + Clone, first_dynamic: u32) -> (u32, u32) {
++    let start = entries.clone().min().unwrap_or(0).min(first_dynamic);
+     let end = entries.max().map_or(1, |last| last + 1);
+     (start, end)
+ }
+@@ -3513,6 +3520,7 @@ void main(uint3 id : SV_DispatchThreadID) {
+             Options {
+                 view_marks: true,
+                 host_wave32: false,
++                view_remap: false,
+             },
+         )
+         .unwrap();
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index bfb486b..943537b 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -42,6 +42,15 @@ const RTV_RING: u32 = 1024;
+ pub(crate) struct Host {
+     pub(crate) device: ID3D12Device,
+     pub(crate) depth_bounds_supported: bool,
++    /// The device's view heaps are smaller than `HEAP_VIEWS_MAX` (1,000,000
++    /// on NVIDIA and resource binding tiers 1-2) and title view-heap slots
++    /// are remapped onto them: shaders read the slots they take from the
++    /// resource heap itself through the view-remap table
++    /// (`victory_shader::emit::Options::view_remap`), and a view heap keeps
++    /// the title's slots past its direct ones in an overflow range
++    /// (`crate::descriptor::host`). `VICTORY_VIEW_REMAP=0`: off (those slots
++    /// are left out, as before). After Marvisak/VIctory#3518.
++    pub(crate) view_remap: bool,
+     queue: ID3D12CommandQueue,
+     fence: ID3D12Fence,
+     /// The last value signalled on `fence`, behind the submission lock.
+@@ -250,6 +259,14 @@ fn create() -> windows::core::Result<Host> {
+             );
+         }
+         victory_shader::emit::set_view_heap(views, crate::descriptor::host::title_views(views));
++        let view_remap = views < victory_shader::emit::HEAP_VIEWS_MAX
++            && std::env::var_os("VICTORY_VIEW_REMAP").is_some_and(|v| v == "1");
++        if view_remap {
++            tracing::info!(
++                views,
++                "host view heaps capped: title view-heap slots past the direct ones are remapped (VICTORY_VIEW_REMAP=0: off)"
++            );
++        }
+         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
+         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
+         // host chooses (the RX 6700 XT does, WARP does not).
+@@ -263,6 +280,7 @@ fn create() -> windows::core::Result<Host> {
+         Ok(Host {
+             device,
+             depth_bounds_supported,
++            view_remap,
+             queue,
+             fence,
+             submitted: Mutex::new(0),
+diff --git a/crates/victory-gpu/src/pipeline/host.rs b/crates/victory-gpu/src/pipeline/host.rs
+index 3fb4fa3..3a0d970 100644
+--- a/crates/victory-gpu/src/pipeline/host.rs
++++ b/crates/victory-gpu/src/pipeline/host.rs
+@@ -486,6 +486,7 @@ impl HostPipeline {
+ 
+         // The root signature the translated shaders' bindings define.
+         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
++        let mut remap_param = None;
+         let mut samplers = Vec::new();
+         let mut bound = Vec::new();
+         for &(shader, visibility) in &stages {
+@@ -533,6 +534,16 @@ impl HostPipeline {
+                 ),
+             ] {
+                 for &slot in slots {
++                    // All stages read the same map for the bound CBV/SRV/UAV heap.
++                    // Each stage records its binding, but the signature pays for one root SRV.
++                    let shared_remap = kind == D3D12_ROOT_PARAMETER_TYPE_SRV && slot == victory_shader::emit::VIEW_REMAP;
++                    if shared_remap {
++                        if let Some(index) = remap_param {
++                            out.push((slot, index));
++                            continue;
++                        }
++                        remap_param = Some(params.len() as u32);
++                    }
+                     out.push((slot, params.len() as u32));
+                     params.push(D3D12_ROOT_PARAMETER1 {
+                         ParameterType: kind,
+@@ -543,7 +554,7 @@ impl HostPipeline {
+                                 Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                             },
+                         },
+-                        ShaderVisibility: visibility,
++                        ShaderVisibility: if shared_remap { D3D12_SHADER_VISIBILITY_ALL } else { visibility },
+                     });
+                 }
+             }
+diff --git a/crates/victory-gpu/src/shader_cache.rs b/crates/victory-gpu/src/shader_cache.rs
+index 3608c2d..badf657 100644
+--- a/crates/victory-gpu/src/shader_cache.rs
++++ b/crates/victory-gpu/src/shader_cache.rs
+@@ -56,9 +56,17 @@ fn options() -> Options {
+     Options {
+         view_marks: true,
+         host_wave32: host_wave32(),
++        view_remap: view_remap(),
+     }
+ }
+ 
++/// Whether translations read title view-heap slots through the view-remap
++/// table: the host GPU's view heaps are capped below the title's and the
++/// remap is on (`crate::host::Host::view_remap`); none without a device.
++fn view_remap() -> bool {
++    crate::host::host().is_some_and(|h| h.view_remap)
++}
++
+ /// Whether translations are for a host of 32-lane waves: the host GPU's
+ /// (made here if it is not yet: the cache belongs to the GPU it was filled
+ /// on, as the pipeline library does); none without one.
+@@ -97,9 +105,11 @@ fn key(translator: &str, encoding: &[u8], limit: u32, options: Options) -> [u8;
+     let Options {
+         view_marks,
+         host_wave32,
++        view_remap,
+     } = options;
+     h.update(&[u8::from(view_marks)]);
+     h.update(&[u8::from(host_wave32)]);
++    h.update(&[u8::from(view_remap)]);
+     *h.finalize().as_bytes()
+ }
+ 
+@@ -555,6 +565,7 @@ mod tests {
+         const OPTIONS: Options = Options {
+             view_marks: true,
+             host_wave32: false,
++            view_remap: false,
+         };
+         let k = key("0123456789abcdef", b"encoding", 1 << 20, OPTIONS);
+         assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, OPTIONS));
+@@ -594,6 +605,17 @@ mod tests {
+             },
+         );
+         assert_ne!(k, wave32);
++        let remapped = key(
++            "0123456789abcdef",
++            b"encoding",
++            1 << 20,
++            Options {
++                view_remap: true,
++                ..OPTIONS
++            },
++        );
++        assert_ne!(k, remapped, "the view remap makes other translations");
++        assert_eq!(options().view_remap, view_remap());
+         // Heap caps and wave width key separately (below): neither stands
+         // in for the other.
+         // Each view heap size a device makes has entries of its own.
+diff --git a/crates/victory-shader/src/emit/bvh_tests.rs b/crates/victory-shader/src/emit/bvh_tests.rs
+index 1b32df7..fa1c8e3 100644
+--- a/crates/victory-shader/src/emit/bvh_tests.rs
++++ b/crates/victory-shader/src/emit/bvh_tests.rs
+@@ -593,6 +593,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
+         prims: Vec::new(),
+         mesh_stride: 0,
+         host_wave32: false,
++        view_remap: false,
+         view_marks: false,
+     })
+     .expect("lower");
+diff --git a/crates/victory-shader/src/emit/crosslane_tests.rs b/crates/victory-shader/src/emit/crosslane_tests.rs
+index 61a9f61..cadf9b6 100644
+--- a/crates/victory-shader/src/emit/crosslane_tests.rs
++++ b/crates/victory-shader/src/emit/crosslane_tests.rs
+@@ -411,6 +411,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
+         prims: Vec::new(),
+         mesh_stride: 0,
+         host_wave32: false,
++        view_remap: false,
+         view_marks: false,
+     })
+     .expect("lower");
+diff --git a/crates/victory-shader/src/emit/g16_tests.rs b/crates/victory-shader/src/emit/g16_tests.rs
+index 724e6ef..8afcace 100644
+--- a/crates/victory-shader/src/emit/g16_tests.rs
++++ b/crates/victory-shader/src/emit/g16_tests.rs
+@@ -203,6 +203,7 @@ fn build(words: &[u32]) -> Result<HostShader, ShaderError> {
+         mesh_stride: 0,
+         view_marks: false,
+         host_wave32: false,
++        view_remap: false,
+     })?;
+     let shader = HostShader {
+         stage: HwStage::Cs,
+diff --git a/crates/victory-shader/src/emit/halves_tests.rs b/crates/victory-shader/src/emit/halves_tests.rs
+index f634110..f5904d2 100644
+--- a/crates/victory-shader/src/emit/halves_tests.rs
++++ b/crates/victory-shader/src/emit/halves_tests.rs
+@@ -142,6 +142,7 @@ fn lowered(
+         mesh_stride: 0,
+         view_marks: false,
+         host_wave32,
++        view_remap: false,
+     })
+ }
+ 
+diff --git a/crates/victory-shader/src/emit/host.rs b/crates/victory-shader/src/emit/host.rs
+index e6b4dfd..f214d98 100644
+--- a/crates/victory-shader/src/emit/host.rs
++++ b/crates/victory-shader/src/emit/host.rs
+@@ -988,6 +988,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
+         prims: Vec::new(),
+         mesh_stride: 0,
+         host_wave32: false,
++        view_remap: false,
+         view_marks: false,
+     })?;
+     Ok(HostShader {
+diff --git a/crates/victory-shader/src/emit/image_store_tests.rs b/crates/victory-shader/src/emit/image_store_tests.rs
+index ec0d6f1..ee8a316 100644
+--- a/crates/victory-shader/src/emit/image_store_tests.rs
++++ b/crates/victory-shader/src/emit/image_store_tests.rs
+@@ -128,6 +128,7 @@ fn lower(native: &NativeProgram) -> Result<HostShader, ShaderError> {
+         mesh_stride: 0,
+         view_marks: false,
+         host_wave32: false,
++        view_remap: false,
+     })?;
+     Ok(HostShader {
+         stage: HwStage::Cs,
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 059bdf4..074b7da 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -11,7 +11,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+ use super::UserData;
+ use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
+ use super::container::SigElement;
+-use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
++use super::shader::{
++    REMAP_VIEWS, Shader, VIEW_INTEGER, VIEW_REMAP, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags,
++};
+ use crate::ShaderError;
+ use crate::gfx10::{Dpp, Fields, NULL, Operand};
+ use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
+@@ -94,6 +96,9 @@ pub(crate) struct Parts<'a> {
+     pub view_marks: bool,
+     /// The host's waves have at most 32 lanes (`emit::Options::host_wave32`).
+     pub host_wave32: bool,
++    /// Heap indices from the resource heap itself go through the view-remap
++    /// table (`emit::Options::view_remap`).
++    pub view_remap: bool,
+ }
+ 
+ enum Stop {
+@@ -5090,7 +5095,12 @@ impl<'a> Lower<'a> {
+             "a descriptor's dword 7 read as data",
+         ];
+         let a = *self.scalar.get(&site).ok_or("a descriptor read only as data")?;
+-        let limit = match self.x.native.layout.get(a.param).map(|p| p.root) {
++        let root = self.x.native.layout.get(a.param).map(|p| p.root);
++        // Through the view-remap table a title slot's entry is its host
++        // slot's (`Options::view_remap`), any of the heap's.
++        let remap = self.x.view_remap && root == Some(RootType::ResourceHeap);
++        let limit = match root {
++            Some(RootType::ResourceHeap) if remap => super::heap_views(),
+             Some(RootType::ResourceHeap) => super::title_views(),
+             Some(RootType::Table) => super::heap_views(),
+             _ => return Err(OTHER),
+@@ -5102,6 +5112,7 @@ impl<'a> Lower<'a> {
+             let word = (a.offset / 4 + k) % 8;
+             let val = if word < 4 {
+                 let index = self.heap_index(site, k as u8, false)?;
++                let index = if remap { self.remapped(index) } else { index };
+                 let c = self.cur;
+                 // A root SRV carries no length. Use a valid slot for the
+                 // memory access and return zero outside this index space.
+@@ -5540,10 +5551,16 @@ impl<'a> Lower<'a> {
+         {
+             return Err(WHY);
+         }
++        // The stride table has an entry per host slot: through the
++        // view-remap table, a title slot's host slot's.
++        let remap = self.x.view_remap;
+         let index = match src {
+-            Source::Loaded { load, first } => self.heap_index(*load, *first, false)?,
++            Source::Loaded { load, first } => {
++                let index = self.heap_index(*load, *first, false)?;
++                if remap { self.title_guard(*load, index, false) } else { index }
++            }
+             Source::Phi { .. } => return Err(WHY),
+-            _ => self.lane_heap_index(src, false, false)?,
++            _ => self.lane_heap_index(src, false, remap)?,
+         };
+         let c = self.cur;
+         let four = self.s.m.i32(4);
+@@ -5946,6 +5963,22 @@ impl<'a> Lower<'a> {
+         }
+     }
+ 
++    /// The host slot of title view-heap slot `index` (an index a shader
++    /// takes from the resource heap itself), from the view-remap table
++    /// (`t`[`VIEW_REMAP`], `Options::view_remap`): its last entry, which
++    /// names the heap's null last slot, for an index past [`REMAP_VIEWS`].
++    /// After Marvisak/VIctory#3518.
++    fn remapped(&mut self, index: V) -> V {
++        let c = self.cur;
++        let last = self.s.m.i32(REMAP_VIEWS - 1);
++        let over = self.s.m.cmp(c, pred::IUGT, index, last);
++        let index = self.s.m.select(c, over, last, index);
++        let two = self.s.m.i32(2);
++        let at = self.s.m.bin(c, Bin::Shl, index, two);
++        let table = self.s.root_srv_handle(VIEW_REMAP);
++        self.raw_dword(table, at)
++    }
++
+     /// A heap index `index` read through the descriptor load at `load`,
+     /// bounded where the load is from the resource heap itself (`emit`,
+     /// "Title slots"): at or past [`super::title_views`] it reads the
+@@ -5956,15 +5989,19 @@ impl<'a> Lower<'a> {
+     /// heaps mirror every title slot below the clamp.
+     fn title_guard(&mut self, load: Site, index: V, sampler: bool) -> V {
+         let (views, title) = (super::heap_views(), super::title_views());
+-        if sampler || title >= views {
+-            return index;
+-        }
+         let heap = self
+             .scalar
+             .get(&load)
+             .and_then(|a| self.x.native.layout.get(a.param))
+             .is_some_and(|p| p.root == RootType::ResourceHeap);
+-        if !heap {
++        if sampler || !heap {
++            return index;
++        }
++        // A title slot the host keeps anywhere in its heap: its host slot.
++        if self.x.view_remap {
++            return self.remapped(index);
++        }
++        if title >= views {
+             return index;
+         }
+         let c = self.cur;
+diff --git a/crates/victory-shader/src/emit/lower/tests.rs b/crates/victory-shader/src/emit/lower/tests.rs
+index 675d776..18bd8a9 100644
+--- a/crates/victory-shader/src/emit/lower/tests.rs
++++ b/crates/victory-shader/src/emit/lower/tests.rs
+@@ -63,6 +63,7 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+         prims: vec![],
+         mesh_stride: 0,
+         host_wave32: false,
++        view_remap: false,
+         view_marks: false,
+     })
+     .map(|_| ())
+@@ -114,6 +115,7 @@ fn lowers_cs(
+         prims: vec![],
+         mesh_stride: 0,
+         host_wave32: false,
++        view_remap: false,
+         view_marks: false,
+     })
+ }
+@@ -261,6 +263,7 @@ fn lower_wave(
+         mesh_stride: 0,
+         view_marks: false,
+         host_wave32: false,
++        view_remap: false,
+     })
+ }
+ 
+@@ -481,6 +484,7 @@ fn perm_features(selector: u32) -> u64 {
+         prims: vec![],
+         mesh_stride: 0,
+         host_wave32: false,
++        view_remap: false,
+         view_marks: false,
+     })
+     .unwrap();
+@@ -1405,6 +1409,7 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
+             mesh_stride: 0,
+             view_marks: false,
+             host_wave32: false,
++            view_remap: false,
+         })
+         .unwrap();
+         assert!(lowered.wave_ops);
+diff --git a/crates/victory-shader/src/emit/memory_tests.rs b/crates/victory-shader/src/emit/memory_tests.rs
+index 64f78f2..14c530f 100644
+--- a/crates/victory-shader/src/emit/memory_tests.rs
++++ b/crates/victory-shader/src/emit/memory_tests.rs
+@@ -195,6 +195,7 @@ fn program() -> HostShader {
+         prims: Vec::new(),
+         mesh_stride: 0,
+         host_wave32: false,
++        view_remap: false,
+         view_marks: false,
+     })
+     .expect("lower");
+@@ -429,6 +430,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
+         prims: Vec::new(),
+         mesh_stride: 0,
+         host_wave32: false,
++        view_remap: false,
+         view_marks: false,
+     })
+     .expect("lower");
+@@ -572,6 +574,7 @@ fn writes_through_views_mark_their_pages() {
+         prims: Vec::new(),
+         mesh_stride: 0,
+         host_wave32: false,
++        view_remap: false,
+         view_marks: true,
+     })
+     .expect("lower");
+@@ -689,6 +692,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
+             prims: Vec::new(),
+             mesh_stride: 0,
+             host_wave32: false,
++            view_remap: false,
+             view_marks: true,
+         })
+         .expect("lower")
+@@ -814,6 +818,7 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
+         prims: Vec::new(),
+         mesh_stride: 0,
+         host_wave32: false,
++        view_remap: false,
+         view_marks: false,
+     })
+     .expect("lower");
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index d97a710..e0b23ca 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -248,6 +248,8 @@ mod sampler;
+ mod semantics_tests;
+ mod shader;
+ #[cfg(all(test, windows))]
++mod remap_tests;
++#[cfg(all(test, windows))]
+ mod stride_tests;
+ #[cfg(all(test, windows))]
+ mod synthetic_tests;
+@@ -269,6 +271,7 @@ pub use shader::{
+     HEAP_SAMPLERS, HEAP_VIEWS_MAX, HEAP_VIEWS_PORTABLE, MEMORY_SPACE, ROOT_CBV_SPACE,
+     SAMPLER_SPACE, USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS, VIEW_READS,
+     VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES, heap_views,
++    REMAP_VIEWS, VIEW_REMAP,
+     null_buffer_view, set_heap_views, set_view_heap, title_views, view_heap, with_heap_views, with_view_heap,
+ };
+ 
+@@ -412,6 +415,15 @@ pub struct Options {
+     /// 32, and is refused where it reads across them (`lower::halves`).
+     /// The translation differs, so the shader cache keys on it.
+     pub host_wave32: bool,
++    /// The host's view heaps are smaller than the title's (a capped heap,
++    /// 1,000,000 on NVIDIA): a heap index a shader takes from the resource
++    /// heap itself (not through a table) is a title slot, read through the
++    /// view-remap table (`t`[`VIEW_REMAP`]) for the host slot that holds it
++    /// (module notes, "Title slots"); without it such indices at or past
++    /// [`title_views`] read the heap's last slot. After
++    /// Marvisak/VIctory#3518. The translation differs, so the shader cache
++    /// keys on it.
++    pub view_remap: bool,
+ }
+ 
+ /// Combined vertex + primitive output byte size of an emitted mesh shader
+@@ -772,6 +784,7 @@ fn emit_pruned(
+         mesh_stride,
+         view_marks: options.view_marks,
+         host_wave32: options.host_wave32,
++        view_remap: options.view_remap,
+     };
+     let l = match lower::lower_pruned(&parts(st, res), keep) {
+         // Discarded lanes kept on as helpers can read what no surviving
+@@ -1517,6 +1530,7 @@ mod tests {
+         let marks = Options {
+             view_marks: true,
+             host_wave32: false,
++            view_remap: false,
+         };
+         for stage in [HwStage::Vs, HwStage::Ms] {
+             let (out, sfi0, flags) = translate_stage(stage, marks);
+@@ -2684,6 +2698,7 @@ mod tests {
+         let options = Options {
+             view_marks: true,
+             host_wave32: false,
++            view_remap: false,
+         };
+         let alone_ms = translate_with(&ms, options).unwrap();
+         let alone_ps = translate_with(&ps, options).unwrap();
+@@ -2727,6 +2742,7 @@ mod tests {
+         let options = Options {
+             view_marks: true,
+             host_wave32: false,
++            view_remap: false,
+         };
+         let all: Vec<(u8, u8)> = (0..16u8).flat_map(|k| [(k, 0), (k, 3)]).collect();
+         let greedy = fixture::reading_pixel(16, &all, false);
+diff --git a/crates/victory-shader/src/emit/permlane_tests.rs b/crates/victory-shader/src/emit/permlane_tests.rs
+index 291d51b..dd770fc 100644
+--- a/crates/victory-shader/src/emit/permlane_tests.rs
++++ b/crates/victory-shader/src/emit/permlane_tests.rs
+@@ -98,6 +98,7 @@ fn lower_rows(native: &NativeProgram, host_wave32: bool) -> Result<lower::Lowere
+         mesh_stride: 0,
+         view_marks: false,
+         host_wave32,
++        view_remap: false,
+     })
+ }
+ 
+diff --git a/crates/victory-shader/src/emit/remap_tests.rs b/crates/victory-shader/src/emit/remap_tests.rs
+new file mode 100644
+index 0000000..8301078
+--- /dev/null
++++ b/crates/victory-shader/src/emit/remap_tests.rs
+@@ -0,0 +1,201 @@
++//! GPU and lowering tests for [`super::VIEW_REMAP`] virtual-to-physical
++//! resource-heap remapping above [`super::HEAP_VIEWS`].
++
++use crate::dxbc::Container;
++use crate::native::{ComputeIo, HwStage, NativeProgram, RootParam, RootType, StageIo};
++use crate::{io, ir, resource, structure};
++
++use super::host::{Dispatch, Host, Root, Stride, View, view_strides};
++use super::{HEAP_VIEWS_PORTABLE, Options, REMAP_VIEWS, VIEW_REMAP, VIEW_STRIDES, emit_with};
++
++fn param(root: RootType, user_data: u8, slot: u8, sgprs: u8) -> RootParam {
++    RootParam {
++        root,
++        table_offset_dwords: 0,
++        sgprs: u32::from(sgprs),
++        base_register: 0,
++        user_data,
++        slot,
++    }
++}
++
++/// Builds a compute shader reading a structured buffer SRV at virtual
++/// `ResourceDescriptorHeap[s0 >> 5]` (element `tid.x`, stride from `VIEW_STRIDES`)
++/// and writing the result into a raw UAV at virtual `ResourceDescriptorHeap[s1 >> 5]`.
++fn build_remapped_cs(capped_heap: bool) -> super::HostShader {
++    // s0 = root constant 0 (byte offset of SRV in virtual heap)
++    // s1 = root constant 1 (byte offset of UAV in virtual heap)
++    // s2..s3 = resource heap base (user_data 2, 0)
++    // v0 = tid.x
++    let words: &[u32] = &[
++        0xBE83_0380, // s_mov_b32 s3, 0
++        0xF408_0101,
++        0x0000_0000, // s_load_dwordx4 s[4:7], s[2:3], s0
++        0xF408_0201,
++        0x0200_0000, // s_load_dwordx4 s[8:11], s[2:3], s1
++        0xE030_2000,
++        0x8001_0100, // buffer_load_dword v1, v0, s[4:7], 0 idxen
++        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
++        0xE070_1000,
++        0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
++        0xBF81_0000, // s_endpgm
++    ];
++    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
++    let native = NativeProgram {
++        stage: HwStage::Cs,
++        io: StageIo::Cs(ComputeIo {
++            rsrc2: 4 << 1,
++            threads: [4, 1, 1],
++        }),
++        vgprs: 4,
++        wave64: false,
++        layout: vec![
++            param(RootType::Constants, 0, 0, 2),
++            param(RootType::ResourceHeap, 2, 1, 1),
++        ],
++        used: Vec::new(),
++        code,
++    };
++    let p = ir::build(&native.code, false, native.vgprs).expect("ir");
++    let st = structure::structure(&p).expect("structured");
++    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resources");
++    let raised = io::raise(&p, &native).expect("io");
++    let bytes = crate::dxbc::build(&[]);
++    let empty = Container::parse(&bytes).expect("container");
++    emit_with(
++        &empty,
++        &native,
++        &p,
++        &st,
++        &raised,
++        &res,
++        Options {
++            view_marks: false,
++            view_remap: capped_heap,
++            ..Default::default()
++        },
++    )
++    .expect("emitted")
++}
++
++#[test]
++fn remapped_high_heap_indices_execute_above_portable_views_limit() {
++    let _one = super::valu_tests::ONE_AT_A_TIME
++        .lock()
++        .unwrap_or_else(|error| error.into_inner());
++    super::with_view_heap(HEAP_VIEWS_PORTABLE, 721_469, || {
++        let without = build_remapped_cs(false);
++        assert_eq!(without.root_srvs, [VIEW_STRIDES]);
++
++        let shader = build_remapped_cs(true);
++        assert!(shader.root_srvs.contains(&VIEW_REMAP));
++        assert!(shader.root_srvs.contains(&VIEW_STRIDES));
++
++        // Virtual console slots well above `HEAP_VIEWS_PORTABLE` (1,000,000), mapped
++        // into physical slots 3 (SRV, stride 8 -> elements [101, 202, 303, 404]) and 4 (UAV).
++        let virt_srv: u32 = 1_150_000;
++        let virt_uav: u32 = 1_500_000;
++        let virt_unmapped: u32 = 1_800_000;
++        assert!(virt_srv > HEAP_VIEWS_PORTABLE && virt_unmapped < REMAP_VIEWS);
++
++        let srv_words: [u32; 8] = [101, 999, 202, 999, 303, 999, 404, 999];
++        let views = [
++            View::RawUav(1),
++            View::RawUav(1),
++            View::RawUav(1),
++            View::Buffer {
++                data: &srv_words,
++                stride: Stride::Raw,
++            },
++            View::RawUav(4),
++            View::NullBuffers,
++        ];
++        let mut strides = view_strides(&views);
++        strides.resize(HEAP_VIEWS_PORTABLE as usize, 0);
++        strides[3] = 8;
++
++        let mut remap: Vec<u32> = vec![HEAP_VIEWS_PORTABLE - 1; REMAP_VIEWS as usize];
++        for (i, slot) in remap.iter_mut().take(3).enumerate() {
++            *slot = i as u32;
++        }
++        remap[virt_srv as usize] = 3;
++        remap[virt_uav as usize] = 4;
++
++        // `root_signature_for` sorts `root_srvs` ascending: param 0 = user constants,
++        // param 1 = VIEW_REMAP (254), param 2 = VIEW_STRIDES (255).
++        for warp in [false, true] {
++            let Ok(host) = Host::new(warp) else {
++                assert!(!warp, "WARP must be available");
++                continue;
++            };
++            let (root, pso) = host.compute_pipeline(&shader).expect("compute PSO");
++
++            // 1) Mapped virtual slots 1,150,000 -> phys 3 and 1,500,000 -> phys 4.
++            let out = host
++                .dispatch(
++                    &root,
++                    &pso,
++                    &Dispatch {
++                        roots: vec![
++                            (0, Root::Constants(vec![virt_srv * 32, virt_uav * 32, 0, 0])),
++                            (
++                                1,
++                                Root::View {
++                                    srv: true,
++                                    data: remap.clone(),
++                                },
++                            ),
++                            (
++                                2,
++                                Root::View {
++                                    srv: true,
++                                    data: strides.clone(),
++                                },
++                            ),
++                        ],
++                        views: &views,
++                        samplers: &[],
++                        groups: [1, 1, 1],
++                    },
++                )
++                .expect("dispatch mapped high slots");
++            assert_eq!(out[3], [101, 202, 303, 404], "warp={warp}");
++
++            // 2) Unmapped high slot 1,800,000 resolves to `HEAP_VIEWS - 1` (stride 0 ->
++            // `NULL_BUFFER_VIEW`) and reads zeros without faulting.
++            let out_null = host
++                .dispatch(
++                    &root,
++                    &pso,
++                    &Dispatch {
++                        roots: vec![
++                            (
++                                0,
++                                Root::Constants(vec![virt_unmapped * 32, virt_uav * 32, 0, 0]),
++                            ),
++                            (
++                                1,
++                                Root::View {
++                                    srv: true,
++                                    data: remap.clone(),
++                                },
++                            ),
++                            (
++                                2,
++                                Root::View {
++                                    srv: true,
++                                    data: strides.clone(),
++                                },
++                            ),
++                        ],
++                        views: &views,
++                        samplers: &[],
++                        groups: [1, 1, 1],
++                    },
++                )
++                .expect("dispatch unmapped high slot");
++            assert_eq!(out_null[3], [0, 0, 0, 0], "warp={warp}");
++            eprintln!("remapped high SRV/UAV and null slot matched on warp={warp}");
++        }
++    });
++}
+diff --git a/crates/victory-shader/src/emit/semantics_tests.rs b/crates/victory-shader/src/emit/semantics_tests.rs
+index 6c7ef90..ab3c801 100644
+--- a/crates/victory-shader/src/emit/semantics_tests.rs
++++ b/crates/victory-shader/src/emit/semantics_tests.rs
+@@ -293,6 +293,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
+         prims: Vec::new(),
+         mesh_stride: 0,
+         host_wave32: false,
++        view_remap: false,
+         view_marks: false,
+     })
+     .map_err(e)?;
+diff --git a/crates/victory-shader/src/emit/shader.rs b/crates/victory-shader/src/emit/shader.rs
+index e016597..9f2cdf3 100644
+--- a/crates/victory-shader/src/emit/shader.rs
++++ b/crates/victory-shader/src/emit/shader.rs
+@@ -18,6 +18,14 @@ pub const ROOT_CBV_SPACE: u32 = 1;
+ /// the buffer view at view-heap index `i` ([`VIEW_STRIDE_BITS`]), with
+ /// [`VIEW_INTEGER`] and [`VIEW_SIGNED`] for typed views of integer formats.
+ pub const VIEW_STRIDES: u8 = 255;
++/// The root SRV slot (`t254` in [`ROOT_CBV_SPACE`], past every title root
++/// parameter) of the view-remap table ([`super::Options::view_remap`]):
++/// dword `i` (below [`REMAP_VIEWS`]) is the host heap slot of the title's
++/// view-heap slot `i`, the heap's last slot (null) for one it has none for.
++pub const VIEW_REMAP: u8 = 254;
++/// Title view-heap slots the view-remap table covers ([`VIEW_REMAP`]): the
++/// console's view heap limit (2^21); an index past it reads the last entry.
++pub const REMAP_VIEWS: u32 = 1 << 21;
+ /// The bits of a view-stride table dword holding the stride.
+ pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
+ /// In a view-stride table dword: a typed buffer view of an integer format
+diff --git a/crates/victory-shader/src/emit/stride_tests.rs b/crates/victory-shader/src/emit/stride_tests.rs
+index d2a2f02..5626786 100644
+--- a/crates/victory-shader/src/emit/stride_tests.rs
++++ b/crates/victory-shader/src/emit/stride_tests.rs
+@@ -199,6 +199,7 @@ fn build(
+         prims: Vec::new(),
+         mesh_stride: 0,
+         host_wave32: false,
++        view_remap: false,
+         view_marks: false,
+     })
+     .expect("lower");
+diff --git a/crates/victory-shader/src/emit/synthetic_tests.rs b/crates/victory-shader/src/emit/synthetic_tests.rs
+index 5873185..5c01c78 100644
+--- a/crates/victory-shader/src/emit/synthetic_tests.rs
++++ b/crates/victory-shader/src/emit/synthetic_tests.rs
+@@ -143,6 +143,7 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
+         prims: Vec::new(),
+         mesh_stride: 0,
+         host_wave32: false,
++        view_remap: false,
+         view_marks: false,
+     })
+ }
+@@ -893,6 +894,7 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
+             prims: Vec::new(),
+             mesh_stride: 0,
+             host_wave32: false,
++            view_remap: false,
+             view_marks: false,
+         })
+         .expect("lower");
+diff --git a/crates/victory-shader/src/emit/valu_tests.rs b/crates/victory-shader/src/emit/valu_tests.rs
+index cbd73a7..5451875 100644
+--- a/crates/victory-shader/src/emit/valu_tests.rs
++++ b/crates/victory-shader/src/emit/valu_tests.rs
+@@ -156,6 +156,7 @@ fn lower_valu_cs(native: &NativeProgram) -> Result<HostShader, crate::ShaderErro
+         prims: Vec::new(),
+         mesh_stride: 0,
+         host_wave32: false,
++        view_remap: false,
+         view_marks: false,
+     })?;
+ 
+@@ -1760,6 +1761,7 @@ fn lower_cs32(words: &[u32], used: &[(u8, ResourceType, u32, u8)], validate: boo
+         prims: Vec::new(),
+         mesh_stride: 0,
+         host_wave32: false,
++        view_remap: false,
+         view_marks: false,
+     })
+     .expect("lower");
+diff --git a/crates/victory-shader/src/emit/waterfall_tests.rs b/crates/victory-shader/src/emit/waterfall_tests.rs
+index c2c5f68..5710b48 100644
+--- a/crates/victory-shader/src/emit/waterfall_tests.rs
++++ b/crates/victory-shader/src/emit/waterfall_tests.rs
+@@ -70,6 +70,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
+         prims: Vec::new(),
+         mesh_stride: 0,
+         host_wave32: false,
++        view_remap: false,
+         view_marks: false,
+     })
+     .expect("lower");
