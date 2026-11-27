@@ -1,0 +1,143 @@
+diff --git a/crates/victory-gpu/src/pipeline/host.rs b/crates/victory-gpu/src/pipeline/host.rs
+index 3a0d970..fcef199 100644
+--- a/crates/victory-gpu/src/pipeline/host.rs
++++ b/crates/victory-gpu/src/pipeline/host.rs
+@@ -1522,7 +1522,113 @@ mod tests {
+         );
+     }
+
++    #[test]
++    #[ignore = "requires an isolated physical GPU session and VICTORY_CACHE_DIR"]
++    #[cfg(feature = "diagnostics")]
++    fn indirect_mesh_reuses_cached_pipeline() {
++        use crate::{draw::State, pipeline, shader_cache, shadow, watch};
++        use std::time::{Duration, Instant};
++        use victory_shader::native::fixture;
++        use windows::Win32::Graphics::Dxgi::{
++            CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1,
++            IDXGIFactory4,
++        };
++
++        let cache = std::path::PathBuf::from(std::env::var_os("VICTORY_CACHE_DIR").unwrap());
++        pipeline::use_pipeline_cache(cache.join("pipelines"));
++        shader_cache::use_shader_cache(cache.join("shaders")).expect("the fixture shader cache");
++
++        let host = host().expect("a Direct3D 12 device");
++        assert!(host.mesh_shaders(), "the adapter must support mesh shaders");
++        // SAFETY: this queries the adapter associated with the live device.
++        let adapter = unsafe {
++            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
++            factory
++                .EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid())
++                .unwrap()
++                .GetDesc1()
++                .unwrap()
++        };
++        assert_eq!(adapter.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0);
++        let adapter_name = String::from_utf16_lossy(&adapter.Description);
++
++        let mesh = Arc::new(Shader::new("mesh", &fixture::wide_mesh(128, 128, 128)));
++        let channels = [(0, 0), (0, 1), (15, 2), (15, 3)];
++        let pixel = Arc::new(Shader::new("pixel", &fixture::reading_pixel(16, &channels, true)));
++        let mut graphics = GraphicsState::default();
++        graphics.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
++        graphics.depth.DepthEnable = false.into();
++        graphics.depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
++        graphics.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
++        graphics.targets = targets(&[DXGI_FORMAT_R32G32B32A32_FLOAT]);
++
++        let mut title_pipeline = std::ptr::null();
++        assert_eq!(
++            pipeline::hand_out(
++                vec![mesh, pixel],
++                Some(Box::new(graphics)),
++                &pipeline::PIPELINE_IIDS[0],
++                &mut title_pipeline,
++            ),
++            windows_sys::Win32::Foundation::S_OK,
++        );
++        let start = Instant::now();
++        while pipeline::host_pipeline(title_pipeline).is_none() {
++            assert!(start.elapsed() < Duration::from_secs(10), "mesh pipeline never became ready");
++            std::thread::sleep(Duration::from_millis(10));
++        }
++
++        let args = watch::tests::pool(1);
++        let groups = [1u32, 1, 1];
++        // SAFETY: the write-watched page is ours and holds all three words.
++        unsafe { std::ptr::copy_nonoverlapping(groups.as_ptr(), args as *mut u32, groups.len()) };
++        shadow::register(args, args as u64, watch::PAGE as u64);
++        let pixels = render_16x16(host, |list| {
++            let mut state = State::default();
++            state.set_pipeline(title_pipeline);
++            assert!(state.execute_indirect(list, (10, 12, 1), args as u64, None));
++        });
++        shadow::unregister(args, args as u64);
++        watch::tests::free(args);
++        crate::object::release(title_pipeline);
++        pipeline::save_pipeline_cache();
++
++        assert_eq!(pixels.len(), 256);
++        assert!(pixels.iter().all(|pixel| *pixel == [1.0, 0.5, 0.25, 1.0]));
++        let (made, loaded) = pipeline::pipeline_counts();
++        assert_eq!(made + loaded, 1);
++        eprintln!(
++            "indirect mesh readback on {} matched 256 pixels. Pipeline library made={made}, loaded={loaded}",
++            adapter_name.trim_end_matches('\0')
++        );
++    }
++
+     fn readback_16x16(host: &crate::host::Host, made: &HostPipeline) -> Vec<[f32; 4]> {
++        render_16x16(host, |list| {
++            // SAFETY: an open list with live roots and a live pipeline.
++            unsafe {
++                list.list.SetGraphicsRootSignature(&made.root);
++                list.list.SetPipelineState(&made.pso);
++                for stage in &made.stages {
++                    if let Some((param, dwords)) = stage.user_data {
++                        let zeros = vec![0u32; dwords as usize];
++                        list.list.SetGraphicsRoot32BitConstants(param, dwords, zeros.as_ptr().cast(), 0);
++                    }
++                }
++                if made.mesh {
++                    list.list.cast::<ID3D12GraphicsCommandList6>().unwrap().DispatchMesh(1, 1, 1);
++                } else {
++                    list.list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++                    list.list.DrawInstanced(3, 1, 0, 0);
++                }
++            }
++        })
++    }
++
++    fn render_16x16(
++        host: &crate::host::Host,
++        draw: impl FnOnce(&crate::host::HostList),
++    ) -> Vec<[f32; 4]> {
+         let (width, height) = (16u32, 16u32);
+         let color = {
+             let heap = D3D12_HEAP_PROPERTIES {
+@@ -1599,20 +1705,10 @@ mod tests {
+             list.list.OMSetRenderTargets(1, Some(&rtv), false, None);
+             list.list.RSSetViewports(&[viewport]);
+             list.list.RSSetScissorRects(&[rect]);
+-            list.list.SetGraphicsRootSignature(&made.root);
+-            list.list.SetPipelineState(&made.pso);
+-            for stage in &made.stages {
+-                if let Some((param, dwords)) = stage.user_data {
+-                    let zeros = vec![0u32; dwords as usize];
+-                    list.list.SetGraphicsRoot32BitConstants(param, dwords, zeros.as_ptr().cast(), 0);
+-                }
+-            }
+-            if made.mesh {
+-                list.list.cast::<ID3D12GraphicsCommandList6>().unwrap().DispatchMesh(1, 1, 1);
+-            } else {
+-                list.list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+-                list.list.DrawInstanced(3, 1, 0, 0);
+-            }
++        }
++        draw(&list);
++        // SAFETY: an open list and live render target and readback buffer.
++        unsafe {
+             list.list.ResourceBarrier(&[crate::host::transition(
+                 &color,
+                 D3D12_RESOURCE_STATE_RENDER_TARGET,
