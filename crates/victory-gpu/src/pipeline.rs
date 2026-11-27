@@ -64,6 +64,8 @@ pub(crate) struct Shader {
     pub(crate) hash: String,
     container: Vec<u8>,
     #[cfg(windows)]
+    walks_bvh: OnceLock<bool>,
+    #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
 
@@ -93,6 +95,8 @@ impl Shader {
             stage,
             hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
             container: bytes.to_vec(),
+            #[cfg(windows)]
+            walks_bvh: OnceLock::new(),
             #[cfg(windows)]
             translated: OnceLock::new(),
         }
@@ -228,6 +232,7 @@ impl Shader {
             stage,
             hash,
             container: Vec::new(),
+            walks_bvh: OnceLock::new(),
             translated: cell,
         })
     }
@@ -355,6 +360,14 @@ struct Pipeline {
     /// (by a worker: the title may release the pipeline meanwhile).
     #[cfg(windows)]
     host: Arc<make::Pending>,
+    /// Whether it is one of the title's acceleration-structure builder's
+    /// ([`builder`]).
+    #[cfg(windows)]
+    builder: bool,
+    /// Whether one of its programs walks the builder's structures
+    /// (`image_bvh*_intersect_ray`, [`builder::built`]).
+    #[cfg(windows)]
+    walks_bvh: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -391,6 +404,68 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// A builder dispatch depends on its whole pipeline group. A traversal also
+/// waits for a completed producer command from an earlier frame.
+#[cfg(windows)]
+pub(crate) fn held_back(this: This) -> Option<&'static str> {
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    if p.builder && !builder::runs() {
+        return Some("the BVH builder is waiting for its pipelines or a dropped dispatch");
+    }
+    if p.walks_bvh && !builder::built() {
+        return Some("a BVH walk is waiting for its builder");
+    }
+    None
+}
+
+#[cfg(windows)]
+fn walks_bvh(container: &[u8]) -> bool {
+    use victory_shader::{Container, FourCC};
+    let Ok(c) = Container::parse(container) else { return false };
+    c.part(FourCC::DXIL)
+        .or_else(|| c.part(FourCC::ACCC))
+        .and_then(|part| victory_shader::native_programs(part.data).ok())
+        .is_some_and(|programs| programs.iter().any(|p| code_walks_bvh(&p.patched_code())))
+}
+
+#[cfg(windows)]
+fn code_walks_bvh(code: &[u8]) -> bool {
+    victory_shader::gfx10::decode(code).is_ok_and(|instructions| {
+        instructions.iter().any(|i| matches!(
+            i.name(), Some("image_bvh_intersect_ray" | "image_bvh64_intersect_ray")
+        ))
+    })
+}
+
+/// Registers the producer's first successful submission before consumers
+/// may begin traversing its structures.
+#[cfg(windows)]
+pub(crate) fn builder_submitted(this: This, list: &crate::host::HostList) {
+    if !this.is_null() && pipeline(this).builder {
+        builder::submitted(list);
+    }
+}
+
+/// A dispatch with the title pipeline was not run on the host (`why`): one
+/// of the acceleration-structure builder's holds the builder back
+/// ([`builder::dropped`]).
+#[cfg(windows)]
+pub(crate) fn not_dispatched(this: This, why: &str) {
+    if !this.is_null() && pipeline(this).builder {
+        builder::dropped(&pipeline(this).host, why);
+    }
+}
+
+/// A title DLL was mapped at `base`, `size` bytes (the acceleration-
+/// structure builder's pipelines are known by its image).
+#[cfg(windows)]
+pub fn note_title_dll(file: &str, base: usize, size: usize) {
+    builder::note_title_dll(file, base, size);
 }
 
 /// Host pipelines queued and not made yet.
@@ -545,13 +620,24 @@ fn code_of(code: &Bytecode) -> Option<*const [u8]> {
         .then(|| std::ptr::slice_from_raw_parts(code.code, code.size))
 }
 
+/// `code`: the title's bytecode pointers (by which a pipeline of the
+/// acceleration-structure builder is known, [`builder`]).
 fn hand_out(
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    code: &[*const u8],
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
+    #[cfg(windows)]
+    let builder = !code.is_empty() && builder::created_by_builder(code);
+    #[cfg(windows)]
+    let walks_bvh = !builder && shaders.iter().any(|shader|
+        *shader.walks_bvh.get_or_init(|| walks_bvh(&shader.container))
+    );
+    #[cfg(not(windows))]
+    let _ = code;
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(
         shaders.clone(),
@@ -561,11 +647,19 @@ fn hand_out(
     ));
     #[cfg(windows)]
     make::early(&host);
+    #[cfg(windows)]
+    if builder {
+        builder::note(&host);
+    }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],
         #[cfg(windows)]
         host,
+        #[cfg(windows)]
+        builder,
+        #[cfg(windows)]
+        walks_bvh,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -589,6 +683,7 @@ pub(crate) extern "system" fn create_graphics(
         shaders,
         #[cfg(windows)]
         None,
+        &[],
         iid,
         out,
     )
@@ -609,6 +704,7 @@ pub(crate) extern "system" fn create_compute(
         copy("compute", &desc.stage).into_iter().collect(),
         #[cfg(windows)]
         None,
+        &[desc.stage.code],
         iid,
         out,
     )
@@ -688,6 +784,7 @@ pub(crate) extern "system" fn create_stream(
         shaders,
         #[cfg(windows)]
         Some(Box::new(graphics)),
+        &[],
         iid,
         out,
     )
@@ -755,6 +852,8 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+#[cfg(windows)]
+mod builder;
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]
@@ -919,6 +1018,171 @@ mod tests {
             .iter()
             .map(|s| (s.stage, s.container.clone()))
             .collect()
+    }
+
+    /// A compute pipeline the acceleration-structure builder creates (its
+    /// bytecode in the builder's image) is known as the builder's, and its
+    /// dispatches are held back while its host pipeline is not made: here
+    /// never, as its bytes are no shader container. Pipelines of other
+    /// code are never held back.
+    #[cfg(windows)]
+    #[test]
+    fn builder_dispatches_wait_for_every_builder_pipeline() {
+        let _one = builder::test_lock();
+        let code = [0xB0u8; 64];
+        let create = |code: &[u8]| {
+            let desc = ComputeHead {
+                root: std::ptr::null(),
+                stage: Bytecode {
+                    code: code.as_ptr(),
+                    size: code.len(),
+                },
+            };
+            let mut p: This = std::ptr::null();
+            assert_eq!(
+                create_compute(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+                S_OK
+            );
+            p
+        };
+        builder::note_title_dll("xboxbvhbuilder.DLL", code.as_ptr() as usize, code.len());
+        let p = create(&code);
+        let other_code = [0xC0u8; 64];
+        let other = create(&other_code);
+        builder::note_title_dll("XboxBvhBuilder.dll", 0, 0);
+        assert!(
+            pipeline(p).builder,
+            "its bytecode is in the builder's image"
+        );
+        assert!(!pipeline(other).builder);
+        // Its host pipeline is started at once and refused.
+        let refused = (0..500).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            make::state(&pipeline(p).host).is_some()
+        });
+        assert!(refused, "the builder's pipeline was started");
+        assert_eq!(make::state(&pipeline(p).host), Some(false));
+        assert!(
+            held_back(p).is_some(),
+            "one builder pipeline missing: the builder waits"
+        );
+        assert_eq!(held_back(other), None);
+        for q in [p, other] {
+            slot::<extern "system" fn(This) -> u32>(q, 0x10)(q);
+        }
+    }
+
+    /// A compute shader that only ends (`s_endpgm`), translated.
+    #[cfg(windows)]
+    fn ending_shader() -> Arc<Shader> {
+        use victory_shader::native::{ComputeIo, NativeProgram, StageIo};
+        use victory_shader::{Container, HwStage, emit, io, ir, resource, structure};
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code: 0xBF81_0000u32.to_le_bytes().to_vec(),
+        };
+        let c = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let host = emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        Shader::for_test(
+            "compute",
+            Translated {
+                host,
+                used: native.used,
+            },
+        )
+    }
+
+    /// A dispatch of a made builder pipeline that is dropped all the same
+    /// (as `State::bind` drops one whose root view offset it cannot place)
+    /// holds the builder back at once and in later frames, until the title
+    /// releases that pipeline.
+    #[cfg(windows)]
+    #[test]
+    fn a_dropped_builder_dispatch_holds_the_builder() {
+        let _one = builder::test_lock();
+        let image = [0xB0u8; 64];
+        builder::note_title_dll("XboxBvhBuilder.dll", image.as_ptr() as usize, image.len());
+        let mut p: This = std::ptr::null();
+        assert_eq!(
+            hand_out(
+                vec![ending_shader()],
+                None,
+                &[image.as_ptr()],
+                &PIPELINE_IIDS[0],
+                &mut p
+            ),
+            S_OK
+        );
+        builder::note_title_dll("XboxBvhBuilder.dll", 0, 0);
+        let release = || slot::<extern "system" fn(This) -> u32>(p, 0x10)(p);
+        assert!(pipeline(p).builder);
+        let made = (0..500).find_map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            make::state(&pipeline(p).host)
+        });
+        if made != Some(true) {
+            release();
+            return; // no host GPU here
+        }
+        assert!(
+            held_back(p).is_none(),
+            "every builder pipeline made: the builder runs"
+        );
+        not_dispatched(
+            p,
+            "a root view's offset: no root view, or outside title buffers",
+        );
+        assert!(held_back(p).is_some(), "held back for the rest of the frame");
+        builder::forget_decision();
+        assert!(held_back(p).is_some(), "and in later frames");
+        release();
+        builder::forget_decision();
+        assert!(builder::runs(), "the pipeline released: the hold is lifted");
+    }
+
+    /// Programs with `image_bvh_intersect_ray` or its 64-bit form walk the
+    /// builder's structures; others do not.
+    #[cfg(windows)]
+    #[test]
+    fn programs_that_intersect_rays_walk_the_structures() {
+        let code = |words: &[u32]| words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        const S_ENDPGM: u32 = 0xBF81_0000;
+        // Result v[20:23], descriptor s[12:15] (as in victory-shader's BVH tests).
+        let rest = 20 << 8 | 3 << 16;
+        let narrow = code(&[0xF198_9F01, rest | 2, S_ENDPGM]);
+        // NSA: pointer v2, v13, then the ray from v3 to v12.
+        let wide = code(&[0xF19C_9F07, rest | 2, 0x0504_030D, 0x0908_0706, 0x000C_0B0A, S_ENDPGM]);
+        assert!(code_walks_bvh(&narrow), "image_bvh_intersect_ray");
+        assert!(code_walks_bvh(&wide), "image_bvh64_intersect_ray");
+        assert!(!code_walks_bvh(&code(&[S_ENDPGM])));
+    }
+
+    /// What walks the structures waits until the builder has run whole: in a
+    /// title with the builder, not before; in a title without it, at once.
+    #[cfg(windows)]
+    #[test]
+    fn walks_wait_for_the_builder_to_run_whole() {
+        let _one = builder::test_lock();
+        builder::note_title_dll("XboxBvhBuilder.dll", 0x1000, 0x1000);
+        assert!(!builder::built(), "a title with the builder: not built yet");
+        builder::note_title_dll("XboxBvhBuilder.dll", 0, 0);
+        assert!(builder::built(), "a title without the builder: walks run");
     }
 
     #[test]

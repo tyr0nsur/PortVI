@@ -335,6 +335,13 @@ impl Shader {
         g
     }
 
+    /// More thread-group shared memory beside [`Shader::lds`]: `[dwords x
+    /// i32]` in address space 3, named `name`.
+    pub fn shared(&mut self, name: &str, dwords: u32) -> V {
+        let arr = self.m.array(dwords, self.t.i32);
+        self.m.global(name, arr, 3)
+    }
+
     /// Calls `dx.op.<name>` (class and overload) with `opcode` and `args`.
     pub fn op(
         &mut self,

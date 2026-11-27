@@ -1567,6 +1567,7 @@ mod tests {
             pipeline::hand_out(
                 vec![mesh, pixel],
                 Some(Box::new(graphics)),
+                &[],
                 &pipeline::PIPELINE_IIDS[0],
                 &mut title_pipeline,
             ),

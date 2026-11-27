@@ -1,5 +1,11 @@
 # Native runtime engineering review
 
+## Ray-builder shaders on the desktop RTX 4060
+
+PortVI updated its native Wave64 translation to the split-wave implementation in VIctory PR #2633. It preserves PortVI’s root bindings, memory tracking and descriptor remapping. The GPU exchanges values across two 32-lane waves in the supported branches and loops. Group-shared memory ordering also covers the tested larger thread groups. Castyan’s paired-wave implementation provided an independent comparison. [chippy01’s implementation](https://github.com/chippy01/VIctory/commit/b32cef72554981f89fad00fecc8358699518da8a) · [Castyan’s comparison](https://github.com/DexNom/VIctory/pull/64)
+
+On a desktop RTX 4060 with driver 621.14, all nine compute programs previously refused by the acceleration-structure builder passed Microsoft’s DXIL validator and D3D12 pipeline creation with descriptor remapping enabled and disabled. Three source-authored GPU tests checked lane exchange, shared memory and divergent loops against their expected values. In the shared-memory test all lanes matched for groups of 64, 128, 256 and 512 threads. Scene fidelity is tracked against visible geometry, materials, textures and lighting at a matching camera position. [Rendering milestone](https://github.com/tyr0nsur/PortVI/issues/26)
+
 ## Direct resource indexing on capped descriptor heaps
 
 Some D3D12 adapters cap shader-visible resource heaps at one million descriptors. A program with a larger logical heap can use `VICTORY_VIEW_REMAP=1` to map its active high indices into available physical descriptors. PortVI preserves the ranges reserved for dynamic tables and paired views. All shader stages read the same map through one root SRV. [Upstream descriptor remapping](https://github.com/Marvisak/VIctory/pull/3518)
@@ -13,6 +19,12 @@ The option defaults to off. An experimental RTX 4060 scene run with the mapper e
 PortVI preserves both words of a wide node pointer when a compute shader traces a ray using a root descriptor. A small test buffer maps nodes 4 GiB and 32 GiB above the virtual base. With the high word discarded, the 32 GiB case read the lower alias and returned a different intersection on the RTX 4060. With the fix, all 16 traversal tests passed. Hardware and WARP matched the CPU reference for box and triangle hits. [64-bit offsets](https://github.com/Marvisak/VIctory/pull/2501) · [High pointer word](https://github.com/Marvisak/VIctory/pull/2467)
 
 The instruction decoder also uses the fixed four-register result and four-register resource descriptor for BVH intersections. An open compute fixture with the optional image modifier bits clear returned the expected child ID on the desktop RTX 4060. These checks cover traversal and decoding. Scene lighting and reflection coverage require a separate image comparison. [Decoder work](https://github.com/Marvisak/VIctory/pull/3316) · [PortVI implementation and fixtures](history/patches/0038-ray-intersection-addresses-and-operands.patch)
+
+## Ray builder on the desktop RTX 4060
+
+On Windows with NVIDIA driver 621.14, PortVI tested two revisions of chippy01’s Wave64 translator. At `b32cef7`, the RTX 4060 created each of the nine previously refused compute pipelines with descriptor remapping enabled and disabled. In a local Series X profile run with full mip chains and remapping enabled, the builder reported 53 of 53 pipelines created at frame 3894. The last successful present was frame 3893. D3D12 reported `DXGI_ERROR_DEVICE_HUNG` before the first world capture. The trace did not identify a failing command. An earlier build reported 44 of 53 and presented subtitles over a black image. [Rendering experiment](https://github.com/tyr0nsur/PortVI/pull/29) · [Earlier build](https://github.com/tyr0nsur/PortVI/pull/24)
+
+Revision `1b1ef21` fixes how a wave carries active lanes into a reduction and how scalar register values survive branches and loops. The desktop RTX 4060 executed all three source-authored cases. Across 26 readbacks, all 2,400 lane values matched their references. The nine previously refused shader programs also passed Microsoft’s DXIL validator in both descriptor modes. Castyan’s independent implementation provided an earlier hardware comparison. [Wave64 changes](https://github.com/Marvisak/VIctory/pull/2633) · [Independent comparison](https://github.com/DexNom/VIctory/pull/64)
 
 ## Texture copy order and shader masks on 27 November 2026
 
