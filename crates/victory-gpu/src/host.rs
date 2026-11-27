@@ -42,6 +42,8 @@ const RTV_RING: u32 = 1024;
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds_supported: bool,
+    pub(crate) native_bgra4_rtv: bool,
+    pub(crate) native_bgra4_uav: bool,
     /// The device's view heaps are smaller than `HEAP_VIEWS_MAX` (1,000,000
     /// on NVIDIA and resource binding tiers 1-2) and title view-heap slots
     /// are remapped onto them: shaders read the slots they take from the
@@ -204,6 +206,7 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let (native_bgra4_rtv, native_bgra4_uav) = crate::twin::bgra4_caps(&device);
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
         let depth_bounds_supported = device
             .CheckFeatureSupport(
@@ -280,6 +283,8 @@ fn create() -> windows::core::Result<Host> {
         Ok(Host {
             device,
             depth_bounds_supported,
+            native_bgra4_rtv,
+            native_bgra4_uav,
             view_remap,
             queue,
             fence,
@@ -1932,10 +1937,13 @@ impl HostList {
         // give it up meanwhile; this list then holds it).
         let copy = crate::resource::host_copy(resource)?;
         let texture = copy.texture.clone();
-        if let Some(Some(twin)) = copy.twin.get()
-            && crate::twin::route(self, &copy, twin, wanted)
-        {
-            return None;
+        if let Some(Some(twin)) = copy.twin.get() {
+            if twin.bgra4 && !copy.host_written.load(Ordering::Relaxed) {
+                crate::texture::upload(self, resource, &texture);
+            }
+            if crate::twin::route(self, &copy, twin, wanted) {
+                return None;
+            }
         }
         let wanted = legal_state(&texture, wanted);
         self.track(&copy, wanted).map(|before| (texture, before))
@@ -3027,6 +3035,7 @@ fn display_format(d: &D3D12_RESOURCE_DESC, title: Option<DXGI_FORMAT>, castable:
     }
     let swap = match declared {
         DXGI_FORMAT_R11G11B10_FLOAT | DXGI_FORMAT_R9G9B9E5_SHAREDEXP => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        DXGI_FORMAT_B4G4R4A4_UNORM => DXGI_FORMAT_R8G8B8A8_UNORM,
         other => swap_format(other)?,
     };
     let source = if d.Flags.contains(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) {
@@ -3034,7 +3043,7 @@ fn display_format(d: &D3D12_RESOURCE_DESC, title: Option<DXGI_FORMAT>, castable:
     } else {
         match declared.0 {
             9 | 23 | 27 | 90 => Some(swap), // A typeless plane needs a concrete view.
-            10 | 11 | 13 | 24 | 26 | 28 | 29 | 31 | 67 | 87 | 91 => Some(declared),
+            10 | 11 | 13 | 24 | 26 | 28 | 29 | 31 | 67 | 87 | 91 | 115 => Some(declared),
             _ => None, // An integer texture cannot be sampled with Texture2D<float4>.
         }
     };

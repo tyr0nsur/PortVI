@@ -48,7 +48,30 @@ const RESOLVE_DEST: u32 = 0x1000;
 /// line (either way, within lists and at submission).
 pub(crate) static COPIES: AtomicU64 = AtomicU64::new(0);
 
+/// B4G4R4A4 is 16 bits with B in bits 0..3 and A in bits 12..15.
+pub(crate) const BGRA4: u32 = 115;
+pub(crate) const RGBA8: u32 = 28;
+
+pub(crate) fn bgra4_caps(device: &ID3D12Device) -> (bool, bool) {
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(BGRA4 as i32), ..Default::default()
+    };
+    // SAFETY: same feature and structure, from a live device.
+    if unsafe { device.CheckFeatureSupport(
+        D3D12_FEATURE_FORMAT_SUPPORT, (&raw mut support).cast(), size_of_val(&support) as u32,
+    ) }.is_err() {
+        return (false, false);
+    }
+    let rt = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 | D3D12_FORMAT_SUPPORT1_BLENDABLE.0;
+    (support.Support1.0 & rt == rt,
+     support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+         && support.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 != 0)
+}
+
 pub(crate) struct Twin {
+    pub(crate) bgra4: bool,
+    /// Host states served by the writable surface rather than the packed resource.
+    pub(crate) write_states: u32,
     /// The colour texture of each plane the depth texture has (depth, then
     /// stencil), shader-writable.
     pub(crate) planes: Vec<Arc<HostTexture>>,
@@ -106,15 +129,24 @@ fn plane_formats(console: u32) -> Option<&'static [u32]> {
 
 /// The twin of the depth texture `depth`, whose title resource has format
 /// `console`; `None` if the host makes none.
-fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
+pub(crate) fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
     let host = host()?;
-    let Some(formats) = plane_formats(console) else {
+    let bgra4 = console == BGRA4;
+    let formats = if bgra4 { Some(&[RGBA8][..]) } else { plane_formats(console) };
+    let Some(formats) = formats else {
         once(console, 0, 0, "a depth texture of this format gets no writable twin: its unordered writes are dropped");
         return None;
     };
     // SAFETY: a live resource.
     let dd = unsafe { depth.GetDesc() };
-    let subs = u32::from(dd.MipLevels) * u32::from(dd.DepthOrArraySize).max(1);
+    if bgra4 && (dd.SampleDesc.Count != 1 || converter().is_none()) {
+        return None;
+    }
+    let subs = u32::from(dd.MipLevels) * if dd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        1
+    } else {
+        u32::from(dd.DepthOrArraySize).max(1)
+    };
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -123,7 +155,11 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
     for &f in formats {
         let desc = D3D12_RESOURCE_DESC {
             Format: DXGI_FORMAT(f as i32),
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            Flags: if bgra4 {
+                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+            } else {
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+            },
             Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
             Alignment: 0,
             ..dd
@@ -173,7 +209,7 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
                 let twin = place(tf[s as usize], trows[s as usize]);
                 Route { plane: p, twin_sub: s, depth_sub: d as u32, twin, depth: Some(place(df[d], drows[d])) }
             };
-            if route.depth.is_some() && (td.Format != DXGI_FORMAT_R16_TYPELESS || df[d].Footprint.Format != DXGI_FORMAT_R32_TYPELESS) {
+            if route.depth.is_some() && !bgra4 && (td.Format != DXGI_FORMAT_R16_TYPELESS || df[d].Footprint.Format != DXGI_FORMAT_R32_TYPELESS) {
                 once(console, td.Format.0 as u32, df[d].Footprint.Format.0 as u32, "a depth twin plane with no conversion to the host's: not made");
                 return None;
             }
@@ -182,7 +218,10 @@ fn make(console: u32, depth: &ID3D12Resource) -> Option<Twin> {
     }
     let scratch = shared_scratch(at)?;
     tracing::debug!(console, width = dd.Width, height = dd.Height, planes = planes.len(), "a writable twin for a depth texture");
-    Some(Twin { planes, newer: AtomicU8::new(DEPTH), routes, scratch })
+    let write_states = if bgra4 {
+        u32::from(!host.native_bgra4_rtv) * RENDER_TARGET | u32::from(!host.native_bgra4_uav) * UNORDERED_ACCESS
+    } else { UNORDERED_ACCESS };
+    Some(Twin { bgra4, write_states, planes, newer: AtomicU8::new(DEPTH), routes, scratch })
 }
 
 /// Scratch buffers shared by the twins, one per power-of-two size: a
@@ -320,8 +359,12 @@ fn integer(format: u32) -> bool {
 /// unordered access the twin's planes are moved there and true returned:
 /// the depth texture itself is not used.
 pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, wanted: u32) -> bool {
-    let side = if wanted & UNORDERED_ACCESS != 0 { TWIN } else { DEPTH };
-    let writes = side == TWIN || wanted & (DEPTH_WRITE | RENDER_TARGET | COPY_DEST | RESOLVE_DEST) != 0;
+    let side = if wanted & twin.write_states != 0 { TWIN } else { DEPTH };
+    let writes = side == TWIN || wanted & (DEPTH_WRITE | RENDER_TARGET | UNORDERED_ACCESS | COPY_DEST | RESOLVE_DEST) != 0;
+    if twin.bgra4 && writes && !depth.host_written.load(Relaxed) {
+        let copy = depth.clone();
+        list.defer_host(move || copy.host_written.store(true, Relaxed));
+    }
     if let Some(to_depth) = list.twin_use(depth, side, writes)
         && twin.copy(&list.list, depth, to_depth, &mut |t, w| list.move_texture(t, w))
     {
@@ -330,7 +373,7 @@ pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, want
     if side == DEPTH {
         return false;
     }
-    let barriers: Vec<_> = twin.planes.iter().filter_map(|p| list.move_texture(p, UNORDERED_ACCESS)).collect();
+    let barriers: Vec<_> = twin.planes.iter().filter_map(|p| list.move_texture(p, wanted)).collect();
     if !barriers.is_empty() {
         // SAFETY: an open list and live textures.
         unsafe { list.list.ResourceBarrier(&barriers) };
@@ -346,7 +389,13 @@ impl Use {
     /// A later use in the list needing `side`: whether a copy must be
     /// recorded first (true: into the depth texture).
     pub(crate) fn again(&mut self, side: u8, writes: bool) -> Option<bool> {
-        again(self.first, &mut self.last, side, writes)
+        let copy = again(self.first, &mut self.last, side, writes);
+        // Packing RGBA8 rounds its channels. A later render pass must start
+        // from those quantized destination colours when it blends.
+        if copy == Some(true) && self.depth.twin.get().is_some_and(|t| t.as_ref().is_some_and(|t| t.bgra4)) {
+            self.last = Some(DEPTH);
+        }
+        copy
     }
 }
 
@@ -388,7 +437,10 @@ pub(crate) fn at_submission<'a>(uses: impl Iterator<Item = &'a Use>) -> Vec<(Arc
     let mut copies = Vec::new();
     for u in uses {
         let Some(Some(twin)) = u.depth.twin.get() else { continue };
-        let (to_depth, after) = submitted(u.first, u.last, twin.newer.load(Relaxed));
+        let (to_depth, mut after) = submitted(u.first, u.last, twin.newer.load(Relaxed));
+        if twin.bgra4 && to_depth == Some(true) && u.last.is_none() {
+            after = DEPTH;
+        }
         twin.newer.store(after, Relaxed);
         if let Some(to_depth) = to_depth {
             copies.push((u.depth.clone(), to_depth));
@@ -447,9 +499,13 @@ impl Twin {
                 for r in &self.routes {
                     let Some(d) = r.depth else { continue };
                     let (t, d) = (r.twin.Footprint, d);
-                    let constants = [t.Width, t.Height, t.RowPitch, r.twin.Offset as u32, d.Footprint.RowPitch, d.Offset as u32, u32::from(to_depth), 0];
+                    let constants = if self.bgra4 {
+                        [t.Width, t.Height, d.Footprint.RowPitch, d.Offset as u32, t.RowPitch, r.twin.Offset as u32, u32::from(!to_depth), 1]
+                    } else {
+                        [t.Width, t.Height, t.RowPitch, r.twin.Offset as u32, d.Footprint.RowPitch, d.Offset as u32, u32::from(to_depth), 0]
+                    };
                     l.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
-                    l.Dispatch(t.Width.div_ceil(2).div_ceil(64), t.Height, 1);
+                    l.Dispatch(t.Width.div_ceil(2).div_ceil(64), t.Height, t.Depth);
                 }
                 l.ResourceBarrier(&[uav_barrier(), state(UNORDERED_ACCESS as i32, COPY_SOURCE as i32)]);
                 converted = true;
@@ -487,26 +543,36 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 /// that very float and test it EQUAL), and a float back the nearest `u`.
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=8, b0), UAV(u0)"
-cbuffer C : register(b0) { uint width; uint height; uint pitch16; uint at16; uint pitch32; uint at32; uint toDepth; uint unused; };
+cbuffer C : register(b0) { uint width; uint height; uint pitch16; uint at16; uint pitch32; uint at32; uint expand; uint bgra4; };
 RWByteAddressBuffer buf : register(u0);
 uint depth(uint u) { return asuint((float)u * asfloat(0x37800080)); }
 uint u16(uint d) { return (uint)(saturate(asfloat(d)) * 65535.0 + 0.5); }
+uint unpack4444(uint v) {
+    uint4 rgba = (v >> uint4(8, 4, 0, 12)) & 15;
+    rgba *= 17;
+    return rgba.r | (rgba.g << 8) | (rgba.b << 16) | (rgba.a << 24);
+}
+uint pack4444(uint v) {
+    uint4 rgba = (((v >> uint4(0, 8, 16, 24)) & 255) + 8) / 17;
+    return rgba.b | (rgba.g << 4) | (rgba.r << 8) | (rgba.a << 12);
+}
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint x = id.x * 2;
     uint y = id.y;
     if (x >= width || y >= height) return;
-    uint a = at16 + y * pitch16 + x * 2;
-    uint b = at32 + y * pitch32 + x * 4;
+    uint row = y + id.z * height;
+    uint a = at16 + row * pitch16 + x * 2;
+    uint b = at32 + row * pitch32 + x * 4;
     bool two = x + 1 < width;
-    if (toDepth != 0) {
+    if (expand != 0) {
         uint pair = buf.Load(a);
-        buf.Store(b, depth(pair & 0xffff));
-        if (two) buf.Store(b + 4, depth(pair >> 16));
+        buf.Store(b, bgra4 ? unpack4444(pair & 0xffff) : depth(pair & 0xffff));
+        if (two) buf.Store(b + 4, bgra4 ? unpack4444(pair >> 16) : depth(pair >> 16));
     } else {
-        uint lo = u16(buf.Load(b));
-        uint hi = two ? u16(buf.Load(b + 4)) : 0;
+        uint lo = bgra4 ? pack4444(buf.Load(b)) : u16(buf.Load(b));
+        uint hi = two ? (bgra4 ? pack4444(buf.Load(b + 4)) : u16(buf.Load(b + 4))) : 0;
         buf.Store(a, lo | hi << 16);
     }
 }

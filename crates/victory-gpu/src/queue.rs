@@ -541,6 +541,26 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         // SAFETY: the title passes the plane descriptions.
         let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
+        // Present can read a target immediately after its last draw, without
+        // any shader-read barrier. Commit pending packed colours first.
+        let mut sync = None;
+        for plane in slice {
+            if plane.count == 0 || plane.resources.is_null() { continue; }
+            // SAFETY: an active plane supplies at least its leading resource.
+            let resource = unsafe { *plane.resources };
+            let Some(copy) = crate::resource::made_copy(resource) else { continue };
+            if !copy.twin.get().and_then(Option::as_ref)
+                .is_some_and(|t| t.bgra4 && t.newer.load(std::sync::atomic::Ordering::Relaxed) == crate::twin::TWIN) {
+                continue;
+            }
+            if sync.is_none() { sync = host.new_list().ok(); }
+            if let Some(list) = &sync {
+                let prior = copy.state.load(std::sync::atomic::Ordering::Relaxed);
+                crate::list::ensure_state(list, resource, COPY_SOURCE);
+                crate::list::ensure_state(list, resource, prior);
+            }
+        }
+        if let Some(list) = sync { list.close(); host.execute(&[&list]); }
         let mut resources: Vec<(This, std::sync::Arc<crate::resource::HostTexture>, u32, bool)> =
             Vec::with_capacity(slice.len());
         for plane in slice {

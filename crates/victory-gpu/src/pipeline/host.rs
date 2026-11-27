@@ -31,6 +31,7 @@ pub(crate) struct GraphicsState {
     strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
     pub(crate) topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE,
     pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
+    bgra4_targets: u8,
     depth_format: DXGI_FORMAT,
     samples: DXGI_SAMPLE_DESC,
 }
@@ -82,6 +83,7 @@ impl Default for GraphicsState {
             strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
             topology: D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED,
             targets: D3D12_RT_FORMAT_ARRAY::default(),
+            bgra4_targets: 0,
             depth_format: DXGI_FORMAT_UNKNOWN,
             samples: DXGI_SAMPLE_DESC {
                 Count: 1,
@@ -151,6 +153,17 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
 }
 
 impl GraphicsState {
+    /// Expanded targets whose next draw can read the previous draw's colour
+    /// as its blend destination. Repack those to the four-bit grid first.
+    pub(crate) fn bgra4_blends(&self) -> u8 {
+        let separate = self.blend.IndependentBlendEnable.as_bool();
+        (0..self.targets.NumRenderTargets.min(8) as usize).fold(0, |bits, i| {
+            if self.blend.RenderTarget[if separate { i } else { 0 }].BlendEnable.as_bool() {
+                bits | (self.bgra4_targets & (1 << i))
+            } else { bits }
+        })
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -218,8 +231,13 @@ impl GraphicsState {
                 }
                 15 => {
                     self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned();
-                    for f in &mut self.targets.RTFormats {
-                        f.0 = crate::resource::pc_format(f.0 as u32) as i32;
+                    self.bgra4_targets = 0;
+                    for (slot, f) in self.targets.RTFormats.iter_mut().enumerate() {
+                        let format = crate::resource::pc_format(f.0 as u32);
+                        f.0 = if format == crate::twin::BGRA4 && !crate::host::host().is_some_and(|h| h.native_bgra4_rtv) {
+                            self.bgra4_targets |= 1 << slot;
+                            crate::twin::RGBA8
+                        } else { format } as i32;
                     }
                 }
                 16 => {
@@ -363,6 +381,7 @@ impl Stage {
 pub(crate) struct HostPipeline {
     /// A compute pipeline (else graphics).
     pub(crate) compute: bool,
+    pub(crate) bgra4_blends: u8,
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
     pub(crate) pso: ID3D12PipelineState,
@@ -664,6 +683,7 @@ impl HostPipeline {
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: true,
+                bgra4_blends: 0,
                 mesh: false,
                 pso,
                 root,
@@ -712,6 +732,7 @@ impl HostPipeline {
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
+                bgra4_blends: g.bgra4_blends(),
                 mesh: true,
                 pso,
                 root,
@@ -814,6 +835,7 @@ impl HostPipeline {
         );
         Some(HostPipeline {
             compute: false,
+            bgra4_blends: g.bgra4_blends(),
             mesh: false,
             pso,
             root,
