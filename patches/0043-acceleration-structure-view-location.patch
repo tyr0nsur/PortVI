@@ -1,0 +1,45 @@
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -1456,9 +1456,16 @@
+ /// buffer descriptor fields ([`BufferView::words`]), zeros for anything
+ /// else (and for a buffer view whose range the host cannot tell).
+ fn write_address(data: usize, index: usize, view: Option<&View>) {
+-    let words = view
+-        .and_then(|v| texture_words(v).or_else(|| buffer_view(v).map(|b| b.words())))
+-        .unwrap_or([0; 4]);
++    let words = match view {
++        // An acceleration-structure SRV carries its location in the description.
++        Some(View::Shader(_, Some(desc)))
++            if desc[1] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32 =>
++        {
++            [desc[4], desc[5] & 0xffff, 0, 0]
++        }
++        Some(v) => texture_words(v).or_else(|| buffer_view(v).map(|b| b.words())).unwrap_or([0; 4]),
++        None => [0; 4],
++    };
+     // SAFETY: the mapped view addresses hold 16 bytes per shader-visible
+     // and dynamic slot (below `address_slots`).
+     unsafe { ((data + 16 * index) as *mut [u32; 4]).write_unaligned(words) };
+@@ -2877,6 +2884,21 @@
+     /// structured ones, 0 for raw ones. Neither field changes the other, nor
+     /// the byte range and record count.
+     #[test]
++    fn acceleration_structure_slots_store_and_clear_their_location() {
++        let mut desc = [0u32; 10];
++        desc[1] = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32;
++        desc[4] = 0x2468_9a00;
++        desc[5] = 0x001f;
++        let sentinel = [0xcccc_ccccu32; 4];
++        let mut slots = [sentinel; 3];
++        let data = slots.as_mut_ptr() as usize;
++        write_address(data, 1, Some(&View::Shader(0, Some(desc))));
++        assert_eq!(slots, [sentinel, [0x2468_9a00, 0x001f, 0, 0], sentinel]);
++        write_address(data, 1, None);
++        assert_eq!(slots, [sentinel, [0; 4], sentinel]);
++    }
++
++    #[test]
+     fn descriptor_word_1_holds_the_high_address_and_the_stride() {
+         let mut resource = [0; 14];
+         resource[0] = 1;
