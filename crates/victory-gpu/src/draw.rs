@@ -179,18 +179,14 @@ fn dropped(list: &HostList, pipeline: usize, kind: &str) {
     }
 }
 
-#[cfg(feature = "diagnostics")]
 thread_local! {
     /// Why the draw or dispatch this thread last prepared cannot run.
     static NOT_RUN: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
 }
 
-/// Notes why the draw or dispatch being prepared cannot run (diagnostics).
+/// Notes why the draw or dispatch being prepared cannot run.
 fn not_run(why: &'static str) {
-    #[cfg(feature = "diagnostics")]
     NOT_RUN.with(|w| w.set(why));
-    #[cfg(not(feature = "diagnostics"))]
-    let _ = why;
 }
 
 /// Dispatches run on the host so far.
@@ -770,7 +766,7 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
-                        None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
+                        None if is_root_view_offset(u) => {
                             // Where the root address lies in the copy its view shows.
                             let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
                                 Some(&Root::View(address)) => crate::shadow::find(address, 1)
@@ -1109,22 +1105,33 @@ impl State {
             dropped(list, self.pipeline, "dispatch");
             return;
         }
+        if let Some(reason) = crate::pipeline::held_back(self.pipeline as This) {
+            once!(reason, "a dispatch held back");
+            not_run(reason);
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            dropped(list, self.pipeline, "dispatch");
+            return;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::not_dispatched(self.pipeline as This, "no host pipeline");
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
+            crate::pipeline::not_dispatched(self.pipeline as This, "a graphics pipeline");
             return;
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            crate::pipeline::not_dispatched(self.pipeline as This, NOT_RUN.with(|w| w.get()));
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;
@@ -1135,6 +1142,9 @@ impl State {
         self.probe_small(list, true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        if x != 0 && y != 0 && z != 0 {
+            crate::pipeline::builder_submitted(self.pipeline as This, list);
+        }
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1734,15 +1744,20 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
-        #[cfg(feature = "diagnostics")]
         let pipeline = self.pipeline as This;
         #[cfg(feature = "diagnostics")]
-        let why = |what: &str| {
+        let note = |what: &str| {
             crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
             list.note_op(|| format!("DROPPED indirect kind {kind} max {max} ({what}) {}", crate::pipeline::shaders_of(pipeline)));
         };
         #[cfg(not(feature = "diagnostics"))]
-        let why = |_: &str| {};
+        let note = |_: &str| {};
+        // Not run: one of the BVH builder's holds the builder back
+        // (`pipeline::builder`).
+        let why = |what: &str| {
+            crate::pipeline::not_dispatched(pipeline, what);
+            note(what);
+        };
         // A call with no host pipeline cannot run, and that is the common
         // case while the world builds its pipelines: #400 measures 1 400-1 750
         // indirect calls a frame dropped this way. Drop it here, before the
@@ -1750,6 +1765,11 @@ impl State {
         // the arguments and dispatch a compute shader for records nothing
         // reads. Same order as the `is_skipped` check above, for the same
         // reason.
+        if let Some(reason) = crate::pipeline::held_back(self.pipeline as This) {
+            once!(reason, "an indirect call held back");
+            note(reason);
+            return false;
+        }
         if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_indirect_pipeline_drop(kind, self.pipeline as This);
@@ -1805,10 +1825,12 @@ impl State {
         };
         if !ran {
             crate::indirect::done(list, &clamped);
-            #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
+                    crate::pipeline::not_dispatched(pipeline, "no host pipeline");
+                    #[cfg(feature = "diagnostics")]
                     crate::pipeline::note_drop(self.pipeline as This);
+                    #[cfg(feature = "diagnostics")]
                     list.note_op(|| format!("DROPPED indirect kind {kind} (no host pipeline) {}", crate::pipeline::shaders_of(pipeline)));
                 }
                 Some(p) => why(&format!(
@@ -1836,6 +1858,9 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        if kind == DISPATCH && max != 0 {
+            crate::pipeline::builder_submitted(pipeline, list);
+        }
         // A listed frame, or any frame for a traced shader: what the records
         // held (after the clamp).
         #[cfg(feature = "diagnostics")]
@@ -2032,6 +2057,12 @@ fn is_root_view(u: &victory_shader::emit::UserData) -> bool {
     u.root == RootType::Descriptor && u.dword >= victory_shader::emit::ROOT_SRV_VIEW
 }
 
+/// Whether `u` is a root view's offset in the copy its view shows: a root
+/// descriptor's dword 4. A root constant's dword 4 is a value.
+fn is_root_view_offset(u: &victory_shader::emit::UserData) -> bool {
+    u.root == RootType::Descriptor && u.dword == victory_shader::emit::ROOT_VIEW_OFFSET
+}
+
 /// Whether a shader reads root views through views the host makes.
 fn has_root_views(t: &victory_shader::emit::HostShader) -> bool {
     t.user_data.iter().any(is_root_view)
@@ -2079,6 +2110,22 @@ mod tests {
     use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
     use windows::Win32::Graphics::Direct3D::ID3DBlob;
     use windows::core::s;
+
+    /// A root constant's dword 4 is a value: only a root descriptor's dword
+    /// 4 names its view's offset.
+    #[test]
+    fn only_a_root_descriptors_dword_four_is_a_view_offset() {
+        let u = |root, dword| victory_shader::emit::UserData {
+            index: 0,
+            slot: 0,
+            root,
+            dword,
+        };
+        let offset = victory_shader::emit::ROOT_VIEW_OFFSET;
+        assert!(is_root_view_offset(&u(RootType::Descriptor, offset)));
+        assert!(!is_root_view_offset(&u(RootType::Constants, offset)));
+        assert!(!is_root_view_offset(&u(RootType::Table, offset)));
+    }
 
     /// Reads 16 dwords 64 bytes apart from `offset` past the root view
     /// (heap index in the table) as the translated shaders do: the root
@@ -3455,8 +3502,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             0xF000_0108,
             0x0002_0200, // image_load v2, v[0:1], s[8:15] dmask:0x1 dim:2D
             0xBF8C_3F70, // s_waitcnt vmcnt(0)
-            0x7E06_02FF,
-            0x0001_0010, // v_mov_b32 v3, 0x10010
+            0x7E06_0218, // v_mov_b32 v3, s24 (word 4 of the constants in s[20:24])
             0xE070_1000,
             0x8004_0203, // buffer_store_dword v2, v3, s[16:19], 0 offen
             0xBF81_0000, // s_endpgm
@@ -3487,17 +3533,27 @@ void main(uint3 id : SV_DispatchThreadID) {
             stage: HwStage::Cs,
             wave64: false,
             vgprs: 8,
-            layout: vec![RootParam {
-                root: RootType::Table,
-                table_offset_dwords: 0,
-                sgprs: 1,
-                base_register: 0,
-                user_data: 0,
-                slot: 0,
-            }],
+            layout: vec![
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 5,
+                    base_register: 0,
+                    user_data: 20,
+                    slot: 1,
+                },
+            ],
             used: used_entries.clone(),
             io: StageIo::Cs(ComputeIo {
-                rsrc2: 3 << 1,
+                rsrc2: 25 << 1,
                 threads: [1, 1, 1],
             }),
             code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
@@ -3525,6 +3581,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         )
         .unwrap();
         assert!(host_shader.view_marks);
+        assert!(host_shader.user_data.iter().any(|u|
+            u.root == RootType::Constants && u.slot == 1 && u.dword == 4
+        ));
         let shader = crate::pipeline::Shader::for_test(
             "compute",
             crate::pipeline::Translated {
@@ -3596,6 +3655,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         let mut state = State::default();
         state.set_heaps(&[heap]);
         state.set_table(true, 0, title_heap.start);
+        // The shader takes its output byte offset from word 4 of this parameter.
+        state.set_constants(true, 1, &[0x1_0010], 4);
         assert!(state.bind(&list, &hp, true));
         assert!(
             crate::twin::COPIES.load(Ordering::Relaxed) > copies_before,

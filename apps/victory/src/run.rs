@@ -119,6 +119,7 @@ pub fn run(
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
+        victory_gpu::pipeline::note_title_dll(name, dll.base(), dll.info().size_of_image as usize);
     }
     let imported: Vec<&str> = image
         .info()
@@ -386,6 +387,11 @@ impl LateDlls {
                     );
                     show(name, dll.bind_imports(&resolver, self.policy)?);
                     set_image_path(dll.base(), &self.title_dir.join(name));
+                    victory_gpu::pipeline::note_title_dll(
+                        name,
+                        dll.base(),
+                        dll.info().size_of_image as usize,
+                    );
                 }
                 // Visible before their `DllMain`s run, which may load more.
                 mapped.extend(new.iter().cloned());

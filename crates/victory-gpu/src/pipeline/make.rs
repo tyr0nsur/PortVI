@@ -218,6 +218,19 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     p.made.get()?.as_ref()
 }
 
+/// Starts making `p` now, without waiting for it.
+pub(crate) fn begin(p: &Arc<Pending>) {
+    if !p.shaders.is_empty() {
+        start(p, false);
+    }
+}
+
+/// Whether `p`'s host pipeline is made (`Some(true)`), refused or not
+/// translated (`Some(false)`), or not yet (`None`); never waits.
+pub(crate) fn state(p: &Pending) -> Option<bool> {
+    p.made.get().map(Option::is_some)
+}
+
 /// Queues `p` for the workers: once, and once more ahead of the early
 /// starts if a draw waits for it (`now`) while it is still queued.
 fn start(p: &Arc<Pending>, now: bool) {
