@@ -185,12 +185,21 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
         let (mut written, mut first) = (0u64, None);
         let mut patched = Instant::now();
+        let mut pcm = Vec::new();
         loop {
             std::thread::sleep(Duration::from_millis(10));
             let ended = WaitForSingleObject(target, 0) == WAIT_OBJECT_0;
             while capture.GetNextPacketSize()? > 0 {
                 let (mut data, mut frames, mut flags, mut qpc) = (std::ptr::null_mut(), 0, 0, 0);
                 capture.GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc))?;
+                let silent = flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0;
+                pcm.clear();
+                if !silent && frames != 0 {
+                    let bytes = std::slice::from_raw_parts(data, frames as usize * FRAME_BYTES);
+                    pcm.extend_from_slice(bytes);
+                }
+                // A slow disk or a long timestamp gap must not keep a WASAPI packet checked out.
+                capture.ReleaseBuffer(frames)?;
                 // Where this packet belongs, from its time stamp (100 ns).
                 let at = (qpc - *first.get_or_insert(qpc)) * u64::from(RATE) / 10_000_000;
                 if at > written + u64::from(RATE / 500) {
@@ -203,16 +212,15 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                     written = at;
                 }
                 let bytes = frames as usize * FRAME_BYTES;
-                if flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
+                if silent {
                     file.write_all(&vec![0u8; bytes])?;
                 } else {
-                    file.write_all(std::slice::from_raw_parts(data, bytes))?;
+                    file.write_all(&pcm)?;
                 }
                 if flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0 && written > 0 {
                     tracing::debug!("audio capture: discontinuity");
                 }
                 written += u64::from(frames);
-                capture.ReleaseBuffer(frames)?;
             }
             if ended || patched.elapsed() >= Duration::from_secs(1) {
                 // Valid sizes at any time: runs end by being killed.
