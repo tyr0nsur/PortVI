@@ -3171,7 +3171,10 @@ float4 ps3(float4 p : SV_Position) : SV_Target { return nibbles(p, 0x5a5au); }
     }
 
     /// Source-authored packed texels, a partial RTV clear, a float SRV and an
-    /// R16_UINT placed view exercise the same allocation end to end.
+    /// R16_UINT placed view exercise the same allocation end to end. With a
+    /// native B4G4R4A4 render target (WARP) the texture is a render target
+    /// the host owns, never brought up from title memory: a full clear
+    /// stands in for the authored texels there.
     #[test]
     fn bgra4_color_target_preserves_alpha_channel_order_and_packed_aliases() {
         use windows::Win32::Foundation::RECT;
@@ -3215,17 +3218,26 @@ float4 ps3(float4 p : SV_Position) : SV_Target { return nibbles(p, 0x5a5au); }
         assert_eq!(unsafe { copy.texture.GetDesc() }.Format.0, 115);
         assert_eq!(unsafe { render.GetDesc() }.Format.0, if host.native_bgra4_rtv { 115 } else { 28 });
         let rect = RECT { left: 3, top: 4, right: 59, bottom: 51 };
+        let native = host.native_bgra4_rtv;
         let expected = |round, x, y| {
-            if round == 1 && (3..59).contains(&x) && (4..51).contains(&y) { 0xd36a } else { pattern(x, y) }
+            if round == 1 && (3..59).contains(&x) && (4..51).contains(&y) { 0xd36a }
+            else if native { 0x014f } else { pattern(x, y) }
         };
         for round in 0..2 {
             table.make(0, &view);
             let list = host.new_list().unwrap();
-            if round == 1 {
+            if round == 1 || native {
                 crate::list::ensure_state(&list, object, 0x4);
                 let rtv = host.rtv(&render, desc.as_ref());
                 // SAFETY: valid live target and an in-bounds rectangle.
-                unsafe { list.list.ClearRenderTargetView(rtv, &[0.21, 0.42, 0.69, 0.84], Some(&[rect])) };
+                unsafe {
+                    if round == 0 {
+                        // Word 0x014f: R 1, G 4, B 15, A 0.
+                        list.list.ClearRenderTargetView(rtv, &[1.0 / 15.0, 4.0 / 15.0, 1.0, 0.0], None);
+                    } else {
+                        list.list.ClearRenderTargetView(rtv, &[0.21, 0.42, 0.69, 0.84], Some(&[rect]));
+                    }
+                }
             }
             readable(&list, &used(ResourceType::Srv), &view, false);
             run(&list, &table, &read, 0, Some(&out), (8, 8));
@@ -3252,7 +3264,8 @@ float4 ps3(float4 p : SV_Position) : SV_Target { return nibbles(p, 0x5a5au); }
             assert_eq!(pixel[0], u32::from(expected(1, x, y)), "R16_UINT alias {x},{y}");
         }}
         unsafe { host.device.GetDeviceRemovedReason() }.unwrap();
-        eprintln!("B4G4R4A4 3591 initial texels, 3591 after partial clear, 3591 packed alias words");
+        eprintln!("B4G4R4A4 3591 {} texels, 3591 after partial clear, 3591 packed alias words",
+            if native { "cleared" } else { "title-authored" });
     }
 
     /// A title's null shader view (CreateShaderResourceView with no resource
