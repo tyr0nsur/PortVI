@@ -354,6 +354,37 @@ pub(crate) struct Plane {
     _rest: [u64; 6],
 }
 const _: () = assert!(std::mem::size_of::<Plane>() == 0x48);
+
+/// PresentX names its scene first. An overlay cannot become the scene when
+/// the primary fails to resolve (VIctory-NVIDIA's queue::present).
+#[cfg(windows)]
+fn visit_display_planes(planes: &[Plane], mut resolve: impl FnMut(This) -> bool) {
+    let source = |plane: &Plane| {
+        if plane.count == 0 || plane.resources.is_null() {
+            return None;
+        }
+        // SAFETY: PresentX passes an array of count resource pointers.
+        let resource = unsafe { *plane.resources };
+        (!resource.is_null()).then_some(resource)
+    };
+    let Some((primary, overlays)) = planes.split_first() else { return };
+    let Some(base) = source(primary) else { return };
+    if !resolve(base) {
+        return;
+    }
+    for overlay in overlays {
+        let Some(resource) = source(overlay) else { continue };
+        // Distinct logical aliases may have different views of the same
+        // storage. Only omit an exact repeat of the single-resource base,
+        // including placement, color-space, options and frame token.
+        if resource == base && primary.count == 1 && overlay.count == 1
+            && primary.token == overlay.token && primary._rest == overlay._rest
+        {
+            continue;
+        }
+        resolve(resource);
+    }
+}
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -543,25 +574,20 @@ extern "system" fn present(
         let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
         let mut resources: Vec<(This, std::sync::Arc<crate::resource::HostTexture>, u32, bool)> =
             Vec::with_capacity(slice.len());
-        for plane in slice {
-            if plane.count == 0 || plane.resources.is_null() {
-                continue;
-            }
-            // SAFETY: the plane lists `count` resources.
-            let resource = unsafe { *plane.resources };
-            if let Some(texture) = crate::resource::host_copy(resource) {
-                // Distinct title resources may refer to one host texture.
-                // Keep its original state for every plane and restore it once.
-                let prior = resources.iter().find_map(|(_, earlier, state, _)| {
-                    (earlier.texture.as_raw() == texture.texture.as_raw()).then_some(*state)
-                });
-                let state = prior.unwrap_or_else(|| {
-                    crate::resource::host_transition(resource, COPY_SOURCE)
-                        .map_or(COPY_SOURCE, |(_, before)| before)
-                });
-                resources.push((resource, texture, state, prior.is_none()));
-            }
-        }
+        visit_display_planes(slice, |resource| {
+            let Some(texture) = crate::resource::host_copy(resource) else { return false };
+            // Distinct title resources may refer to one host texture.
+            // Keep its original state for every plane and restore it once.
+            let prior = resources.iter().find_map(|(_, earlier, state, _)| {
+                (earlier.texture.as_raw() == texture.texture.as_raw()).then_some(*state)
+            });
+            let state = prior.unwrap_or_else(|| {
+                crate::resource::host_transition(resource, COPY_SOURCE)
+                    .map_or(COPY_SOURCE, |(_, before)| before)
+            });
+            resources.push((resource, texture, state, prior.is_none()));
+            true
+        });
         if !resources.is_empty() {
             let sources: Vec<_> = resources
                 .iter()
@@ -762,6 +788,63 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[cfg(windows)]
+    fn display_plane(resource: &This) -> Plane {
+        Plane { token: 7, count: 1, resources: resource, _rest: [0; 6] }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn display_selection_missing_base_keeps_the_previous_pixel() {
+        let ids = [0u8, 1];
+        let [scene, hud] = ids.each_ref().map(|id| std::ptr::from_ref(id).cast());
+        let mut pixel = [19, 30, 40];
+        let pair = [display_plane(&scene), display_plane(&hud)];
+        visit_display_planes(&pair, |resource| {
+            if resource == scene { return false; }
+            pixel = [255; 3]; // The opaque caption on the available HUD.
+            true
+        });
+        assert_eq!(pixel, [19, 30, 40]);
+        let no_source = std::ptr::null();
+        for first in [
+            Plane { count: 0, ..display_plane(&scene) },
+            Plane { resources: std::ptr::null(), ..display_plane(&scene) },
+            display_plane(&no_source),
+        ] {
+            visit_display_planes(&[first, display_plane(&hud)], |_| panic!("missing primary"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn display_selection_repeated_base_blends_only_once() {
+        let scene = std::ptr::from_ref(&0u8).cast();
+        let pair = [display_plane(&scene), display_plane(&scene)];
+        // A premultiplied red pixel (0.5, 0, 0, 0.5) shown a second time
+        // would have red 0.75 rather than its original 0.5.
+        let mut red = 0.0;
+        visit_display_planes(&pair, |_| { red = 0.5 + red * 0.5; true });
+        assert_eq!(red, 0.5);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn display_selection_preserves_single_planes_aliases_and_distinct_placements() {
+        let ids = [1u8, 2, 3];
+        let [scene, alias, hud] = ids.each_ref().map(|id| std::ptr::from_ref(id).cast());
+        let accepted = |planes: &[Plane]| {
+            let mut result = Vec::new();
+            visit_display_planes(planes, |resource| { result.push(resource); true });
+            result
+        };
+        assert_eq!(accepted(&[display_plane(&scene)]), [scene]);
+        let mut placed = display_plane(&scene);
+        placed._rest[1] = 1; // Different destination information for the same source.
+        assert_eq!(accepted(&[display_plane(&scene), placed, display_plane(&alias),
+            display_plane(&hud), display_plane(&hud)]), [scene, scene, alias, hud, hud]);
+    }
 
     /// Distinct title resources can name the same host texture. Presenting
     /// both planes must preserve that texture's original rendering state.
