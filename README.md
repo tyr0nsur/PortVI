@@ -13,6 +13,7 @@
 
 <p align="center">
   <a href="https://portvi-runtime.round-gnat-8815.chatgpt.site/">Project site</a> ·
+  <a href="#roadmap">Roadmap</a> ·
   <a href="docs/project-status.md">Project status</a> ·
   <a href="#development-dashboard">Dashboard</a> ·
   <a href="#build-and-run">Build and run</a> ·
@@ -20,7 +21,13 @@
   <a href="docs/engineering-review.md">Engineering notes</a>
 </p>
 
-PortVI builds on Marvisak’s VIctory to bring native Windows x64 compatibility to the desktop GeForce RTX 4060 with 8 GB of VRAM. Our first visual milestone is a reproducible in-game view with the scene geometry, materials, full-detail textures and ray-traced lighting visible. We are targeting 1080p and comparing the same view with the console reference. The performance target for that same scene is 30 rendered frames per second. [Upstream engine](https://github.com/Marvisak/VIctory) · [1080p rendering milestone](https://github.com/tyr0nsur/PortVI/issues/26)
+PortVI is a community compatibility project built on Marvisak’s VIctory. Our long-term goal is to make Grand Theft Auto VI playable on most current Windows PCs. The desktop GeForce RTX 4060 with 8 GB of VRAM is our first reference configuration. [Upstream engine](https://github.com/Marvisak/VIctory)
+
+## Roadmap
+
+**Stabilize PortVI.** Our first visual milestone is a reproducible in-game view with geometry, materials, full-detail textures and ray-traced lighting visible. We use the console as the visual reference and are targeting 30 rendered frames per second at 1080p in the same scene. [1080p rendering milestone](https://github.com/tyr0nsur/PortVI/issues/26)
+
+**Start SixM.** We plan to begin multiplayer development once PortVI reaches a stable gameplay baseline. The SixM repository is already open to contributors who want to propose designs, prepare test fixtures or join the effort. [SixM repository](https://github.com/tyr0nsur/SixM)
 
 **What runs today.** On the RTX 4060, PortVI has verified high-index resource bindings and 64-bit ray-intersection tests. Earlier scene captures showed partial geometry. A recent experimental build ran for 110 seconds after entering the scene, but its captures showed subtitles on black. The RTX 4060 has since created all nine previously refused ray-builder pipelines with Castyan’s candidate translator. Scene lighting still needs verification in PortVI. [Resource bindings](https://github.com/tyr0nsur/PortVI/pull/23) · [Ray-intersection tests](https://github.com/tyr0nsur/PortVI/pull/22) · [Scene result](https://github.com/tyr0nsur/PortVI/pull/24) · [Candidate hardware results](https://github.com/tyr0nsur/PortVI/issues/26#issuecomment-7226052967)
 
