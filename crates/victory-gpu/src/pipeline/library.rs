@@ -129,6 +129,9 @@ static NAMES: Names = Names::new();
 
 const LIBRARY_FILE: &str = "host-pipelines.bin";
 const EARLY_FILE: &str = "early-pipelines.txt";
+const HOT_MESH_FILE: &str = "early-mesh-priority.txt";
+const HOT_MESH_MAX: usize = 32;
+const HOT_MESH_MIN_MISSES: u64 = 16;
 const PREBUILT_FILE: &str = "prebuilt-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
@@ -304,12 +307,11 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// Writes changed pipeline caches and prewarm history after the save interval.
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -317,6 +319,8 @@ pub(crate) fn save(now: bool) {
         }
         *last = Some(std::time::Instant::now());
     }
+    save_hot_mesh(dir);
+    let Some(library) = library() else { return };
     let (blob, prebuilt) = {
         let mut l = library.state.lock().unwrap_or_else(|e| e.into_inner());
         if l.added == 0 && !l.prebuilt_changed && !USED_CHANGED.swap(false, Ordering::Relaxed) {
@@ -370,6 +374,22 @@ pub(crate) fn save(now: bool) {
             "host pipeline library saved"
         ),
         Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+    }
+}
+
+/// Saves mesh history without serializing the D3D12 pipeline library.
+fn save_hot_mesh(dir: &std::path::Path) {
+    static SAVING: Mutex<()> = Mutex::new(());
+    let _saving = SAVING.lock().unwrap_or_else(|e| e.into_inner());
+    if !HOT_MESH_CHANGED.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let list = used().as_ref().map(Used::hot_mesh_list).unwrap_or_default();
+    let written = std::fs::create_dir_all(dir)
+        .and_then(|()| write_atomically(&dir.join(HOT_MESH_FILE), list.join("\n").as_bytes()));
+    if let Err(e) = written {
+        HOT_MESH_CHANGED.store(true, Ordering::Relaxed);
+        tracing::warn!(error = %e, "mesh pipeline history not saved");
     }
 }
 
@@ -427,6 +447,9 @@ struct Used {
     /// kept most recent run first, so a lower place is a more recent run.
     before: HashMap<String, usize>,
     now: HashSet<String>,
+    hot_mesh_before: Vec<String>,
+    hot_mesh_started: HashSet<String>,
+    mesh_misses: HashMap<String, u64>,
 }
 
 impl Used {
@@ -437,7 +460,40 @@ impl Used {
         for (place, key) in listed.lines().filter(|l| !l.is_empty()).enumerate() {
             before.entry(key.to_owned()).or_insert(place);
         }
-        Used { before, now: HashSet::new() }
+        Used { before, ..Self::default() }
+    }
+
+    fn read_hot_mesh(&mut self, listed: &str) {
+        let mut seen = HashSet::new();
+        self.hot_mesh_before = listed
+            .lines()
+            .filter(|key| key.len() == 32 && key.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .filter(|key| seen.insert(*key))
+            .take(HOT_MESH_MAX)
+            .map(str::to_owned)
+            .collect();
+    }
+
+    /// Whether the key prewarms and whether it gets its one priority job.
+    fn early_mesh_priority(&mut self, key: &str, prioritize: bool) -> Option<bool> {
+        let hot = self.hot_mesh_before.iter().any(|candidate| candidate == key);
+        (hot || self.before.contains_key(key)).then(|| {
+            hot && prioritize && !self.hot_mesh_started.contains(key)
+                && self.hot_mesh_started.insert(key.to_owned())
+        })
+    }
+
+    fn hot_mesh_list(&self) -> Vec<String> {
+        let mut observed: Vec<_> = self.mesh_misses.iter()
+            .filter(|&(_, &misses)| misses >= HOT_MESH_MIN_MISSES)
+            .collect();
+        observed.sort_unstable_by_key(|&(key, &misses)| (std::cmp::Reverse(misses), key));
+        let picked: HashSet<_> = observed.iter().map(|&(key, _)| key).collect();
+        observed.into_iter().map(|(key, _)| key)
+            .chain(self.hot_mesh_before.iter().filter(|key| !picked.contains(key)))
+            .take(HOT_MESH_MAX)
+            .cloned()
+            .collect()
     }
 
     /// The list to keep: this run's keys, then earlier runs' others, most
@@ -452,6 +508,7 @@ impl Used {
 
 static USED: Mutex<Option<Used>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
+static HOT_MESH_CHANGED: AtomicBool = AtomicBool::new(false);
 
 fn used() -> std::sync::MutexGuard<'static, Option<Used>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
@@ -460,7 +517,10 @@ fn used() -> std::sync::MutexGuard<'static, Option<Used>> {
             .get()
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
-        let read = Used::read(&listed);
+        let mut read = Used::read(&listed);
+        if let Some(hot) = DIR.get().and_then(|d| std::fs::read_to_string(d.join(HOT_MESH_FILE)).ok()) {
+            read.read_hot_mesh(&hot);
+        }
         tracing::info!(pipelines = read.before.len(), "title pipelines to start early");
         *used = Some(read);
     }
@@ -478,6 +538,22 @@ pub(crate) fn wanted_early(key: &str) -> bool {
     used().as_ref().is_some_and(|u| u.before.contains_key(key))
 }
 
+/// Returns whether to prewarm a pipeline and whether it gets the hot mesh lane.
+pub(crate) fn early_mesh_priority(key: &str, prioritize: bool) -> Option<bool> {
+    used().get_or_insert_with(Used::default).early_mesh_priority(key, prioritize)
+}
+
+/// Credits geometry work missed while a pipeline was pending.
+pub(crate) fn note_mesh_misses(key: &str, count: u64) {
+    let mut state = used();
+    let hits = state.get_or_insert_with(Used::default).mesh_misses
+        .entry(key.to_owned()).or_default();
+    *hits = hits.saturating_add(count);
+    if *hits >= HOT_MESH_MIN_MISSES {
+        HOT_MESH_CHANGED.store(true, Ordering::Relaxed);
+    }
+}
+
 /// The title pipeline with `key` was drawn or dispatched with.
 pub(crate) fn note_used(key: &str) {
     if used().get_or_insert_with(Used::default).now.insert(key.to_owned()) {
@@ -488,6 +564,26 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hot_mesh_history_ranks_misses_and_promotes_once_per_key() {
+        let a = "00000000000000000000000000000001";
+        let b = "00000000000000000000000000000002";
+        let c = "00000000000000000000000000000003";
+        let mut current = Used::default();
+        current.mesh_misses.insert(a.to_owned(), 64);
+        current.mesh_misses.insert(b.to_owned(), 1024);
+        current.mesh_misses.insert(c.to_owned(), 1);
+        let list = current.hot_mesh_list();
+        assert_eq!(list, [b, a]);
+        let mut restored = Used::read(c);
+        restored.read_hot_mesh(&list.join("\n"));
+        assert_eq!(restored.early_mesh_priority(b, false), Some(false));
+        assert_eq!(restored.early_mesh_priority(b, true), Some(true));
+        assert_eq!(restored.early_mesh_priority(b, true), Some(false));
+        assert_eq!(restored.early_mesh_priority(c, true), Some(false));
+        assert_eq!(restored.early_mesh_priority("unknown", true), None);
+    }
 
     /// A size the host cannot give is refused, not fatal; others are zeros.
     #[test]
@@ -513,7 +609,7 @@ mod tests {
     fn the_early_list_keeps_this_run_first() {
         let keys = |r: std::ops::Range<usize>| r.map(|i| format!("{i:032x}")).collect::<HashSet<_>>();
         let before = keys(0..EARLY_MAX).into_iter().enumerate().map(|(i, k)| (k, i)).collect();
-        let used = Used { before, now: keys(EARLY_MAX - 10..EARLY_MAX + 10) };
+        let used = Used { before, now: keys(EARLY_MAX - 10..EARLY_MAX + 10), ..Used::default() };
         let list = used.list();
         assert_eq!(list.len(), EARLY_MAX);
         assert!(used.now.iter().all(|k| list.contains(k)));

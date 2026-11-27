@@ -11,8 +11,8 @@
 //! frame, so the cheap ones (menus, one-off passes such as a colour-grading
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
-//! Pipelines a draw waits for go ahead of those started early (at the
-//! title's creation, because an earlier run drew them).
+//! Pipelines a draw waits for go first. When enabled, a bounded set of mesh
+//! pipelines missed on an earlier run goes before the other early starts.
 //!
 //! shortcut: the budget (half a second of waiting per title frame) is a
 //! guess; a pass the title runs only once and whose pipeline takes longer
@@ -32,7 +32,7 @@ pub(crate) struct Pending {
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queued: AtomicBool,
     /// Whether it went into the queue of pipelines a draw waits for, and
-    /// whether a worker took it (it may be in both queues).
+    /// whether a worker took it (it may also be in an early queue).
     now: AtomicBool,
     taken: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
@@ -42,6 +42,7 @@ pub(crate) struct Pending {
     /// whether a draw has used it yet.
     pub(crate) key: String,
     used: AtomicBool,
+    mesh_misses: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -81,15 +82,23 @@ impl Pending {
             #[cfg(feature = "diagnostics")]
             skipped_shader,
             used: AtomicBool::new(false),
+            mesh_misses: AtomicU64::new(0),
         }
     }
 
     fn make(&self) {
         self.made.get_or_init(|| {
             let (started, cpu) = (Instant::now(), super::thread_cpu());
+            #[cfg(feature = "diagnostics")]
+            log("worker-start", &self.key, || waiting().to_string());
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             #[cfg(feature = "diagnostics")]
-            log_built(&self.key);
+            {
+                log_built(&self.key);
+                log("worker-finish", &self.key, || {
+                    format!("{}\t{}", if made.is_some() { "ready" } else { "failed" }, started.elapsed().as_micros())
+                });
+            }
             let (user, kernel) = super::thread_cpu_since(cpu);
             tracing::debug!(
                 shaders = ?self.shaders,
@@ -218,31 +227,76 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     p.made.get()?.as_ref()
 }
 
-/// Queues `p` for the workers: once, and once more ahead of the early
-/// starts if a draw waits for it (`now`) while it is still queued.
-fn start(p: &Arc<Pending>, now: bool) {
-    if let Some(now) = enqueue(p, now) {
-        queue(p.clone(), now);
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+enum Lane {
+    Demand,
+    HotMesh,
+    Early,
 }
 
-/// Which queue `p` goes into now (true: the one draws wait for), if any.
-fn enqueue(p: &Pending, now: bool) -> Option<bool> {
+/// Allows a draw's first request to promote a pending early start once.
+fn start(p: &Arc<Pending>, now: bool) {
+    if p.taken.load(Ordering::Relaxed)
+        || (now && p.now.load(Ordering::Relaxed))
+        || (!now && p.queued.load(Ordering::Relaxed))
+    {
+        return;
+    }
+    queue(p.clone(), if now { Lane::Demand } else { Lane::Early });
+}
+
+/// Called under the queue lock before publishing a worker entry.
+fn enqueue(p: &Pending, lane: Lane) -> Option<Lane> {
     let first = !p.queued.swap(true, Ordering::Relaxed);
     if first {
         PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
     }
-    let ahead = now && !p.now.swap(true, Ordering::Relaxed);
-    (first || ahead && !p.taken.load(Ordering::Relaxed)).then_some(ahead)
+    let ahead = lane == Lane::Demand && !p.now.swap(true, Ordering::Relaxed);
+    (first || ahead && !p.taken.load(Ordering::Relaxed)).then_some(lane)
 }
 
-/// At the title's creation of a pipeline: starts it at once if an earlier
-/// run drew with it (during loading, so the world's first frames find it).
+/// `1` opts into mesh prewarming and `0` runs its FIFO comparison control.
+fn mesh_prewarm_priority() -> Option<bool> {
+    static PRIORITY: OnceLock<Option<bool>> = OnceLock::new();
+    *PRIORITY.get_or_init(|| match std::env::var("VICTORY_MESH_PREWARM_PRIORITY").as_deref() {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    })
+}
+
+/// Credits pending mesh calls in batches of 1, 1, 2, 4, ... so a frequently
+/// requested pipeline need not lock the history for every missed dispatch.
+pub(super) fn note_mesh_miss(p: &Pending) {
+    if mesh_prewarm_priority().is_some() && p.made.get().is_none() {
+        let hits = p.mesh_misses.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        if hits.is_power_of_two() {
+            super::library::note_mesh_misses(&p.key, (hits / 2).max(1));
+        }
+    }
+}
+
+/// At creation, start pipelines used before. A bounded set of mesh keys with
+/// recurring misses from the preceding run prewarms ahead of speculative work.
 pub(crate) fn early(p: &Arc<Pending>) {
     super::library::note_created(&p.key);
-    if p.made.get().is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.made.get().is_some() || p.shaders.is_empty() {
+        return;
+    }
+    let priority = match mesh_prewarm_priority() {
+        Some(prioritize) => super::library::early_mesh_priority(&p.key, prioritize),
+        None => super::library::wanted_early(&p.key).then_some(false),
+    };
+    if let Some(hot) = priority {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p, false);
+        if hot {
+            #[cfg(feature = "diagnostics")]
+            log("prewarm-priority", &p.key, String::new);
+            queue(p.clone(), Lane::HotMesh);
+        } else {
+            start(p, false);
+        }
     }
 }
 
@@ -267,14 +321,23 @@ fn wait(p: &Pending, frame: u64) {
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// Pipelines for the workers: those draws wait for, then those started
-/// early.
-static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
-    (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
+/// Demand, previously missed mesh work, then the remaining prewarms.
+type WorkQueues = [VecDeque<Arc<Pending>>; 3];
+static QUEUES: (Mutex<WorkQueues>, Condvar) =
+    (Mutex::new([const { VecDeque::new() }; 3]), Condvar::new());
+
+fn take_work(queues: &mut WorkQueues) -> Option<Arc<Pending>> {
+    while let Some(p) = queues.iter_mut().find_map(VecDeque::pop_front) {
+        if !p.taken.swap(true, Ordering::Relaxed) {
+            return Some(p);
+        }
+    }
+    None
+}
 
 /// Hands `p` to the workers (half the logical processors, 2 to 8), started
 /// on first use.
-fn queue(p: Arc<Pending>, now: bool) {
+fn queue(p: Arc<Pending>, lane: Lane) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
         let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
@@ -290,7 +353,13 @@ fn queue(p: Arc<Pending>, now: bool) {
             })
             .count()
     });
+    let (lock, work) = &QUEUES;
+    let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(lane) = enqueue(&p, lane) else {
+        return;
+    };
     if workers == 0 {
+        drop(queues);
         // No worker: made here instead.
         if !p.taken.swap(true, Ordering::Relaxed) {
             p.make();
@@ -298,8 +367,7 @@ fn queue(p: Arc<Pending>, now: bool) {
         }
         return;
     }
-    let (lock, work) = &QUEUES;
-    lock.lock().unwrap_or_else(|e| e.into_inner())[usize::from(!now)].push_back(p);
+    queues[lane as usize].push_back(p);
     work.notify_one();
 }
 
@@ -317,7 +385,7 @@ fn work() {
         let p = {
             let mut queues = lock.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if let Some(p) = queues.iter_mut().find_map(VecDeque::pop_front) {
+                if let Some(p) = take_work(&mut queues) {
                     break p;
                 }
                 let (held, waited) = work
@@ -331,9 +399,6 @@ fn work() {
                 }
             }
         };
-        if p.taken.swap(true, Ordering::Relaxed) {
-            continue; // its other queue entry
-        }
         p.make();
         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
             drained();
@@ -375,29 +440,51 @@ mod tests {
             #[cfg(feature = "diagnostics")]
             &[],
         );
-        assert_eq!(enqueue(&p, false), Some(false));
-        assert_eq!(enqueue(&p, false), None);
-        assert_eq!(enqueue(&p, true), Some(true));
-        assert_eq!(enqueue(&p, true), None);
+        assert_eq!(enqueue(&p, Lane::Early), Some(Lane::Early));
+        assert_eq!(enqueue(&p, Lane::Early), None);
+        assert_eq!(enqueue(&p, Lane::Demand), Some(Lane::Demand));
+        assert_eq!(enqueue(&p, Lane::Demand), None);
         let q = Pending::new(
             Vec::new(),
             None,
             #[cfg(feature = "diagnostics")]
             &[],
         );
-        assert_eq!(enqueue(&q, false), Some(false));
+        assert_eq!(enqueue(&q, Lane::Early), Some(Lane::Early));
         q.taken.store(true, Ordering::Relaxed);
-        assert_eq!(enqueue(&q, true), None);
+        assert_eq!(enqueue(&q, Lane::Demand), None);
         let r = Pending::new(
             Vec::new(),
             None,
             #[cfg(feature = "diagnostics")]
             &[],
         );
-        assert_eq!(enqueue(&r, true), Some(true));
-        assert_eq!(enqueue(&r, false), None);
+        assert_eq!(enqueue(&r, Lane::Demand), Some(Lane::Demand));
+        assert_eq!(enqueue(&r, Lane::Early), None);
         // Counted as waiting by `enqueue`, never handed to a worker.
         WAITING.fetch_sub(3, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn previously_missed_mesh_jobs_overtake_speculative_prewarms() {
+        let mut queues = [const { VecDeque::new() }; 3];
+        let job = || Arc::new(Pending::new(
+            Vec::new(),
+            None,
+            #[cfg(feature = "diagnostics")]
+            &[],
+        ));
+        let demand = job();
+        let hot_first = job();
+        let hot_second = job();
+        let ordinary = job();
+        queues[Lane::Early as usize].push_back(ordinary.clone());
+        queues[Lane::HotMesh as usize].extend([demand.clone(), hot_first.clone(), hot_second.clone()]);
+        queues[Lane::Demand as usize].push_back(demand.clone());
+        for expected in [&demand, &hot_first, &hot_second, &ordinary] {
+            assert!(Arc::ptr_eq(&take_work(&mut queues).unwrap(), expected));
+        }
+        assert!(take_work(&mut queues).is_none());
     }
 
     /// A first use queues the pipeline and, within the budget, gets the
